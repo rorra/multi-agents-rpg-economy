@@ -1,0 +1,5 @@
+# Install into the already-active interpreter (pyenv-virtualenv `rpg-economy`
+# locally, the CI-provided interpreter in GitHub Actions) instead of letting
+# Poetry manage a second, nested virtualenv.
+[virtualenvs]
+create = false

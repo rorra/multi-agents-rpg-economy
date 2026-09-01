@@ -1,0 +1,82 @@
+[project]
+name = "rpg-economy"
+version = "0.1.0"
+description = "Centralized vs. decentralized LLM multi-agent orchestration in a simulated RPG economy (experimental design v1.0)"
+authors = [{ name = "Rodrigo Dominguez" }]
+readme = "README.md"
+requires-python = ">=3.14,<3.15"
+dependencies = [
+    "pydantic (>=2.9,<3.0)",
+    "pyyaml (>=6.0,<7.0)",
+]
+
+[project.optional-dependencies]
+# Analysis and figures. Not required by the engine, which stays offline and
+# dependency-light (see IMPLEMENTATION.md section 3).
+analysis = [
+    "numpy (>=2.0)",
+    "pandas (>=2.2)",
+    "scipy (>=1.14)",
+    "matplotlib (>=3.9)",
+]
+# Network-facing provider client. Imported only by rpg_economy.llm.client.
+llm = [
+    "openai (>=1.50)",
+    "python-dotenv (>=1.0)",
+]
+
+[project.scripts]
+rpg-economy = "rpg_economy.cli:main"
+
+[tool.poetry]
+packages = [{ include = "rpg_economy", from = "src" }]
+
+[tool.poetry.group.dev.dependencies]
+pytest = ">=8.0"
+ruff = ">=0.6"
+
+[build-system]
+requires = ["poetry-core>=2.0"]
+build-backend = "poetry.core.masonry.api"
+
+# ---------------------------------------------------------------------------
+# Lint
+# ---------------------------------------------------------------------------
+[tool.ruff]
+line-length = 100
+target-version = "py314"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "E", "W",    # pycodestyle
+    "F",         # pyflakes
+    "I",         # isort
+    "UP",        # pyupgrade
+    "B",         # bugbear
+    "C4",        # comprehensions
+    "SIM",       # simplify
+    "RUF",       # ruff-specific
+]
+ignore = [
+    "E501",      # line length is handled by the formatter
+]
+
+[tool.ruff.lint.per-file-ignores]
+# RUF059: tests unpack multi-part fixtures and legitimately ignore some parts.
+"tests/*" = ["B011", "RUF059"]
+
+[tool.ruff.format]
+quote-style = "double"
+
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-q --strict-markers"
+markers = [
+    "invariant: enforces a binding invariant of design v1.0",
+    "provider_client: may construct OpenAIClient around a fake SDK; the real SDK stays blocked",
+]
