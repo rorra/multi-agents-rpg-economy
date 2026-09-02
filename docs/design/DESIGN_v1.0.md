@@ -455,3 +455,225 @@ Subconjunto de la pérdida de liquidez: los agentes afectados se especifican exp
 
 Fase de medición: la volatilidad, los stockouts y el volumen primarios se miden sobre la fase de shock, que es donde la arquitectura tiene que responder; promediarlos sobre toda la corrida diluiría el efecto con fases base y de recuperación idénticas entre condiciones. El tiempo de recuperación se mide desde la reversión del shock, como se define arriba.
 
+## 11.2 Métricas de coordinación y sistema
+
+| **Métrica**                           | **Definición**                                                                                                                                                                       |
+|---------------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| Llamadas LLM                          | Total y por actor/ciclo.                                                                                                                                                             |
+| Tokens                                | Entrada/salida: agentes, Director y boletín.                                                                                                                                         |
+| Mensajes                              | Por tipo y canal.                                                                                                                                                                    |
+| Latencia                              | Ticks entre trigger/TASK y acción trazable.                                                                                                                                          |
+| Activación desperdiciada              | WAIT (incluida la salida inválida tras el reintento), o activación sin operación aceptada por el motor y sin mensaje emitido. Una orden válida que luego vence sin ejecutarse no se considera desperdiciada. |
+| Solicitud no atendida                 | REQUEST sin respuesta compatible (OFFER, ACK o REJECT del destinatario sobre el mismo bien) dentro de D ticks.                                                                                                                                  |
+| Eficiencia de coordinación            | (activaciones totales − desperdiciadas) / activaciones totales.                                                                                                                      |
+| Errores y dependencia del coordinador | Solo A: tasa de TASKs inválidas, reintentos, cierres por agotamiento de K+1, activaciones desperdiciadas originadas por TASK y concentración de activaciones por agente.             |
+| Tasa de K agotado                     | Fracción de macrociclos en que se usaron las K activaciones. Muestra si K fue una restricción efectiva en cada condición.                                                                                                   |
+| Tick de agotamiento                   | Solo Experimento 2: tick en el que se agota el presupuesto; si no se agota, fracción del presupuesto consumida al finalizar.                                                         |
+| Desempeño en horizonte activo común   | Solo Experimento 2, análisis secundario: métricas económicas recalculadas desde el inicio hasta el primer agotamiento del trío A/B/C; si ninguno se agota, usa la duración completa. |
+
+## 11.3 Agregación por corrida — regla pre-registrada
+
+La unidad estadística es la corrida, por lo que cada métrica primaria debe producir un único valor por semilla y condición antes de aplicar contrastes. Para evitar seleccionar agregaciones después de observar resultados, se fija la siguiente regla:
+
+- Cada escenario de shock tiene un blanco primario pre-registrado (tabla de blancos, más abajo) sobre el cual se calculan sus métricas económicas primarias. Esto garantiza un único valor primario por corrida en todos los escenarios y evita combinar arbitrariamente distintos niveles de la cadena de suministro.
+
+- La propagación del shock hacia el producto terminado principal se analiza como resultado secundario pre-registrado. El mapeo recurso → producto determina qué producto se utiliza para este análisis de propagación y se fija antes de las corridas finales.
+
+Blanco primario por escenario de shock (pre-registrado; fijado antes de las corridas finales). La regla "sobre el bien directamente afectado" solo define un blanco de manera unívoca para la escasez de recurso; esta tabla la extiende a todos los escenarios:
+
+| Escenario              | Blanco primario                                                                                                                                                | Métricas primarias del escenario                                                                                                                                        |
+|------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| Escasez de recurso     | El recurso cuya tasa de aparición se reduce: las hierbas, el recurso que más recolectan los agentes LLM.                                                                                             | Volatilidad, stockouts y tiempo de recuperación sobre ese recurso.                                                                                                      |
+| Aumento de demanda     | El producto del que cada expedición gasta más unidades: poción de salud. Con menos unidades que las necesarias, la poción suma una parte proporcional de su bonus. | Volatilidad, stockouts y tiempo de recuperación sobre ese producto.                                                                                                     |
+| Caída de productividad | El producto terminado principal de la especialización artesanal afectada, según el mapeo recurso → producto (p. ej., herrería → arma cuerpo a cuerpo).         | Volatilidad, stockouts y tiempo de recuperación sobre ese producto.                                                                                                     |
+| Pérdida de liquidez    | No hay un bien único afectado: el blanco es la actividad agregada del mercado.                                                                                 | Volumen total transado (valor) por ventana y su tiempo de recuperación a la banda de fase base; volatilidad y stockouts pasan a métricas secundarias en este escenario. |
+
+Mapeo pre-registrado recurso → producto terminado principal (usado por el análisis de propagación y por el escenario de caída de productividad; fijado antes de las corridas finales):
+
+| Materia prima  | Producto terminado principal | Justificación breve                                                                             |
+|----------------|------------------------------|-------------------------------------------------------------------------------------------------|
+| Hierro         | Arma cuerpo a cuerpo         | Cadena principal del hierro; la armadura se conserva como análisis secundario adicional.        |
+| Madera         | Arco/equipo de exploración   | Consumidor principal de madera con demanda recurrente por durabilidad.                          |
+| Cuero          | Armadura                     | El cuero participa en varias recetas; la armadura se fija como cadena de propagación principal. |
+| Hierbas        | Poción de salud              | Producto que consume exclusivamente hierbas y ofrece una cadena de interpretación directa.      |
+| Cristal arcano | Bastón/foco mágico           | Cadena arcana principal; la poción de maná queda como análisis secundario adicional.            |
+
+- Nota: el mapeo puede ajustarse una única vez al cierre del piloto si la calibración de recetas o demanda demuestra que la cadena principal prevista no es representativa. Una vez iniciadas las corridas finales, no puede modificarse.
+
+- Para métricas secundarias que involucren varios bienes equivalentes y no estén asociadas a un shock dirigido, primero se normaliza cada bien por su valor de fase base y luego se utiliza la mediana entre bienes como valor agregado de la corrida. Para los stockouts la normalización es una diferencia (proporción de ticks sin oferta en la fase de shock menos la de la fase base), no un cociente, para no descartar el bien que nunca faltó en la fase base, que es justo el que una escasez puede vaciar.
+
+- Tokens, llamadas, mensajes y activaciones se agregan como totales por corrida; eficiencia de coordinación se calcula sobre todas las activaciones económicas de la corrida.
+
+- Las métricas por bien adicionales se conservan como análisis secundarios/exploratorios y no sustituyen la métrica primaria pre-registrada.
+
+- Datos faltantes: una métrica sin datos suficientes es faltante, nunca cero. Un valor faltante elimina el par de semillas de los contrastes emparejados; no se imputa. Los contrastes reportan los pares usados y descartados, y la mensurabilidad por condición se informa junto a las medianas.
+
+- Faltantes causados por el tratamiento: un mercado demasiado delgado para formar precio es un efecto de la arquitectura. Si la mensurabilidad de la volatilidad por ventanas difiere entre condiciones, ese contraste se suprime (registrando el motivo), la mensurabilidad se reporta como resultado propio con la misma prueba binaria emparejada que la recuperación, y la comparación de volatilidad se sostiene con la volatilidad de fase. El precio del producto de propagación y la volatilidad de todos los bienes reciben el mismo tratamiento: su mensurabilidad se reporta por condición como resultado acompañante, y el contraste de un par se suprime cuando la mensurabilidad difiere entre sus dos condiciones. El tiempo de recuperación también: si su mensurabilidad difiere entre las dos condiciones de un par en alguna semilla, la prueba binaria emparejada y el log-rank de ese par se retienen, no se muestran sus medianas ni sus curvas, y la mensurabilidad se prueba con McNemar exacta. La familia de Holm sigue siendo de m = 3.
+
+## 11.4 Diseño estadístico
+
+1.  Los contrastes se realizan por escenario de perturbación. Los valores primarios de shocks distintos no se mezclan en una única prueba global; cualquier síntesis entre escenarios se reporta como análisis secundario.
+
+- Cada semilla produce un trío A/B/C con agentes, dotaciones, shocks y aleatoriedad del motor equivalentes.
+
+- Contraste principal: A vs. B con Wilcoxon de rangos con signo sobre valores por semilla, en el escenario primario (escasez de recurso). Para el tiempo de recuperación, si existe censura relevante, el Wilcoxon no se aplica directamente a observaciones censuradas como si fueran tiempos efectivos; se reportan la proporción de corridas recuperadas, los tiempos observados y la tasa de censura. El contraste primario del tiempo de recuperación es la prueba binaria emparejada de "recuperó dentro del horizonte" (McNemar exacta sobre los pares discordantes), que respeta el emparejamiento y no se ve afectada por la censura. Como análisis secundario se usa un log-rank estratificado por semilla y curvas de Kaplan–Meier por condición. El tiempo de recuperación no entra en el Wilcoxon.
+
+- Contrastes secundarios: A vs. C y B vs. C en el escenario primario, y los tres contrastes en los escenarios secundarios; corrección de Holm por métrica dentro de cada escenario. La familia de Holm son los tres contrastes (A–B, A–C, B–C) de una misma métrica en un mismo escenario, incluido el contraste principal A vs. B; no se corrige entre métricas ni entre escenarios. Un contraste retenido por la supresión por mensurabilidad sigue en la familia (m = 3); solo un contraste sin pares medibles no es una prueba y queda fuera de ella. Las solicitudes sin respuesta se contrastan solo entre B y C: A no tiene mensajes entre pares, así que su valor es siempre 0 y se reporta como descriptivo.
+
+- Reportar tamaño del efecto emparejado (correlación rango-biserial) y diferencia de medianas, además de p-valores.
+
+- Piloto: 8–10 semillas exclusivas para calibración y estimación de variabilidad. Estas semillas no se reutilizan en las corridas finales ni forman parte del análisis inferencial. El piloto tiene dos etapas: calibración, con horizonte reducido y fases escaladas en proporción (solo pueden cambiar el horizonte y las longitudes de fase, y cada fase debe seguir siendo medible), y derivación del presupuesto, que corre al horizonte completo de las corridas finales en el escenario primario.
+
+- Fase de cada corrida: cada corrida registra su fase (pilot, final o adhoc). La inferencia admite solo corridas finales; con --include-pilot admite también las del piloto, y el informe lo indica como exploración, no inferencia. derive-budget exige corridas del piloto. El informe exige que cada trío admitido haya pasado el control de integridad (integrity.json) y contrasta el horizonte activo común registrado allí con el que calcula a partir de los registros.
+
+- Corridas finales, escenario primario: mínimo aceptable de 10 semillas por condición y objetivo de 15 o más si el presupuesto lo permite, en ambos experimentos. Escenarios secundarios: mínimo 8 semillas por condición, solo Experimento 1 (jerarquía de la sección 10). El número final por escenario se fija antes de iniciar el análisis. Las mismas semillas finales se utilizan en los Experimentos 1 y 2 para conservar el emparejamiento. Configuración adoptada: primario 12 semillas × 3 condiciones × 2 experimentos = 72 corridas; secundario (aumento de demanda) 8 × 3 = 24 corridas; total 96 corridas finales, más el piloto.
+
+- Complementar inferencia con intervalos de confianza/bootstrap emparejado cuando sea viable; no basar las conclusiones únicamente en significación estadística.
+
+- Fijar temperatura y semilla del proveedor cuando exista; reportar no determinismo residual. La temperatura se fija en el valor por defecto del proveedor (1.0), el único que admite el modelo elegido; es idéntica en todas las condiciones y experimentos, y el no determinismo residual se absorbe con el diseño emparejado por semilla. Un reintento reenvía el mismo prompt con la semilla corrida en uno, igual en todas las condiciones.
+
+# 12. Controles para una comparación justa
+
+- mismos agentes, IDs, rasgos y dotaciones en tríos emparejados
+
+- mismo modelo/version y parámetros
+
+- mismas recetas, probabilidades, capacidades y durabilidad
+
+- mismos shocks y semillas del motor
+
+- misma topología de contactos
+
+- mismos triggers y scheduler entre B y C
+
+- mismo K de activaciones económicas por macrociclo en ambos experimentos; en el Experimento 2 se añade el presupuesto común de tokens a nivel de corrida
+
+- mismo presupuesto máximo de tokens LLM en el Experimento 2, fijado mediante la mediana agrupada del consumo piloto de A/B/C del escenario primario de escasez de recurso bajo Experimento 1; las mismas semillas finales se reutilizan entre Experimentos 1 y 2
+
+- Director sin capacidades económicas directas y con límite K + 1 de llamadas LLM por macrociclo, incluidos reintentos
+
+- boletín C calculado con el mismo formato y estado global que la vista de A
+
+- cada corrida final contiene una única perturbación principal; shocks distintos se ejecutan y analizan en corridas separadas, según la jerarquía pre-registrada de escenarios (10)
+
+- mismo horizonte temporal planificado aun si una condición agota tokens; además se calcula un horizonte activo común por trío como análisis secundario del Experimento 2
+
+- toda acción y mensaje registrado
+
+- verificación estructural de cada trío al ejecutarse: tokens del Director mayores a cero solo en A, sin tokens P2P en A, boletín solo en C y los tres registros distintos entre sí; un trío que no la supera se rechaza, porque esas propiedades se siguen de la definición de las condiciones y su violación siempre indica un defecto
+
+# 13. Parámetros iniciales para pilotos
+
+| **Parámetro**   | **Piloto**                                   | **Escala extendida**                                            |
+|-----------------|----------------------------------------------|-----------------------------------------------------------------|
+| Aventureros     | 6 (2/subclase)                               | 12–18                                                           |
+| Artesanos       | 6 (2/especialización)                        | 6–9                                                             |
+| Director        | 1 solo A                                     | 1                                                               |
+| Materias primas | 5                                            | 5                                                               |
+| Productos       | 6                                            | 6                                                               |
+| Riesgo          | 3 niveles                                    | 3                                                               |
+| K               | 6; calibrar                                  | recalibrar                                                      |
+| Duración        | 340 ticks: base 100 + shock 90 + recup. 150  | igual                                                           |
+| Semillas        | 8 exclusivas del piloto; no se reutilizan    | Finales: primario 12; secundario 8                              |
+| Modelo LLM      | gpt-5-nano, reasoning_effort bajo, temp. 1.0 | igual                                                           |
+
+Con un solo artesano por especialización, cada recurso tiene un único comprador y el mercado no tiene profundidad para medir la escasez; con dos se permanece dentro del rango de la escala extendida. K = 6 sobre 12 agentes busca que el límite de activaciones sea una restricción efectiva en las tres condiciones: con K cercano al número de agentes, el scheduler casi nunca prioriza y el Director casi no tiene a quién elegir. La fracción de macrociclos en que K se agota se mide de nuevo en el piloto con esta población y se reporta por condición. La duración del shock (90 ticks) garantiza suficientes transacciones del bien objetivo para medir su trayectoria de precio.
+
+# 14. Elementos fuera de la primera versión
+
+- Gobernador/regulador económico
+
+- Director + P2P como ablación adicional
+
+- descubrimiento dinámico de contactos
+
+- creación/destrucción de recursos por LLM
+
+- combate detallado y mapa complejo
+
+- muerte permanente/reproducción
+
+- bancos, crédito e intereses
+
+- múltiples monedas/comercio exterior
+
+- relaciones sociales sin función económica
+
+- chat libre ilimitado
+
+- misiones LLM que cambien reglas
+
+# 15. Reglas de implementación y reproducibilidad
+
+- registrar observación, TASK/mensaje, salida estructurada y acción final
+
+- registrar origen/destinatario/tipo de mensajes
+
+- registrar solicitudes de activación, atendidas/diferidas y activaciones efectivas
+
+- registrar cada disparo de trigger T1–T5 por agente/tick; el boletín no genera trigger
+
+- registrar cada llamada del Director, incluidos reintentos, el RESULT que motivó la siguiente inferencia y el consumo acumulado del límite K + 1
+
+- registrar cada RESULT estructurado completo y su relación causal con la TASK que lo originó; validar status, action_taken, outcome, needs, offers y observations
+
+- registrar la observación entregada completa en cada activación, no un hash, antes de construir el prompt: incluye los mensajes recibidos y, en C, el boletín
+
+- conservar modelo, versión, parámetros y prompts; el modelo (con su snapshot) y sus parámetros de inferencia son los mismos en todas las condiciones y experimentos
+
+- registrar el texto crudo de cada respuesta del modelo, y la versión de la vista global en los metadatos de la corrida
+
+- registrar en los metadatos de la corrida un resumen criptográfico del código fuente (code_digest). Cubre solo los módulos que determinan el comportamiento de una corrida (__init__.py, agents, cli_support.py, config, domain, engine, llm, logging_, messaging, orchestration y runner) y se calcula una vez por proceso; lo mismo vale para los hashes de los prompts
+
+- el hash de la configuración deja fuera las semillas y la sección de campaña, y también el presupuesto en las celdas del Experimento 1: agregar semillas a una campaña conserva los tríos ya terminados. Los parámetros de métricas que solo usa el análisis (X, M, T, D) también quedan fuera del hash, y sus valores se registran en results.json junto con el informe; W sigue en el hash porque la vista global lo usa durante la corrida
+
+- el control de integridad de un trío exige además que A, B y C compartan code_digest, hashes de prompts, versión de Python y hash de setup, y que los tres registros sean todos del cliente simulado sin conexión o todos reales. integrity.json registra el horizonte activo común, el tick de agotamiento de cada condición y los ticks mecánicos posteriores al agotamiento
+
+- al reanudar una campaña, rechazar los logs escritos con otra versión de prompts, otra versión de la vista global, otra versión de Python u otro código; mientras una corrida usa un directorio de salida, ese directorio queda bloqueado. Un flock libre alcanza para tomar un bloqueo. Con el bloqueo tomado, el lote tiene que coincidir con el que se confirmó
+
+- interrupción en dos niveles: el primer Ctrl-C no inicia nada nuevo; cada trío en curso termina la condición en la que está y no empieza la siguiente, lo ya pagado se conserva y al reanudar se corren solo las condiciones que faltan. Un segundo Ctrl-C aborta en el próximo macrociclo; la corrida abortada registra su gasto (run_aborted lleva los totales de tokens) y billing.json cuenta las corridas sin terminar. El bloqueo del directorio se mantiene hasta que todo se detuvo. Un tercer Ctrl-C sale de inmediato: el bloqueo se libera al terminar el proceso, y las corridas sin terminar conservan su gasto y se vuelven a correr al reanudar
+
+- derivar el presupuesto de tokens del Experimento 2 solo de tríos que pasaron el control de integridad y fueron escritos por el mismo código; un presupuesto derivado de corridas con el cliente simulado sin conexión queda marcado (budget.derived_from_mock) y las corridas reales de campaña lo rechazan; solo se admiten corridas cuyas llamadas facturó todas el proveedor, y el presupuesto registra el código con que se derivó: una corrida real rechaza un presupuesto sin ese registro o derivado con otro código
+
+- semillas para toda aleatoriedad del motor y scheduler
+
+- estado canónico separado de memoria textual
+
+- validación de salidas con un reintento y luego WAIT
+
+- un error de invariante del motor detiene la corrida; nunca se registra como una acción rechazada
+
+- validación de TASKs del Director: un único reintento si queda presupuesto de inferencias; cada intento cuenta dentro de K + 1; luego descarte/cierre según la política de 3.1
+
+- versionar y fijar reglas, umbrales, escenarios de shock y su jerarquía, blancos primarios por escenario, regla de censura del tiempo de recuperación, agregación de métricas, mapeo recurso→producto, regla y valor del presupuesto total de tokens del Experimento 2 y número de semillas por escenario antes de las corridas finales
+
+- separar tokens de agentes económicos, Director, comunicación P2P y boletín; el boletín solo suma tokens cuando entra en un prompt efectivo
+
+- usar conjuntos de semillas disjuntos para piloto y corridas finales; las semillas finales se reutilizan entre Experimentos 1 y 2 para emparejamiento
+
+- en el Experimento 2, registrar consumo acumulado de tokens y tick de agotamiento; tras agotarse, registrar los ticks mecánicos restantes hasta el final planificado y el horizonte activo común del trío A/B/C
+
+# 16. Hipótesis y resultados posibles
+
+No se asume superioridad de ninguna arquitectura. El Director podría reducir redundancia y acelerar respuestas, pero introduce overhead y dependencia de una política central. La descentralización puede requerir más mensajes y activaciones, pero ofrecer adaptabilidad o robustez. C permite distinguir coordinación de observabilidad.
+
+| **Resultado**                     | **Interpretación**                                    |
+|-----------------------------------|-------------------------------------------------------|
+| A mejora economía y coste         | Coordinación global aporta eficiencia neta.           |
+| A mejora economía pero cuesta más | Trade-off calidad/coste.                              |
+| B iguala con menor coste          | Director agrega complejidad sin beneficio suficiente. |
+| B supera bajo shocks              | Autonomía local favorece resiliencia.                 |
+| C ≈ A \> B                        | Ventaja principalmente informacional.                 |
+| A \> C ≈ B                        | Ventaja principalmente de coordinación.               |
+| A \> C \> B                       | Información y coordinación aportan por separado.      |
+| Depende del shock                 | No existe arquitectura universalmente superior.       |
+
+# 17. Resumen de la arquitectura experimental
+
+A — Centralizada: Estado global → Director (≤ K + 1 llamadas LLM por macrociclo, incluidos reintentos) → selecciona agente → TASK estructurada → agente decide → motor ejecuta → RESULT → nueva inferencia del Director si corresponde.
+
+B — Descentralizada: Observación local → trigger mecánico → scheduler neutral → agente decide → P2P/mercado → motor ejecuta → nuevas observaciones.
+
+C — Descentralizada + boletín: Boletín pasivo + observación local → trigger independiente → scheduler → agente decide → P2P/mercado → motor ejecuta. El boletín no activa agentes; sus tokens se contabilizan solo cuando se incorporan a una llamada efectiva.
+
+Experimento 2: A, B y C mantienen el mismo K por macrociclo y comparten un presupuesto máximo de tokens por corrida. Si una condición lo agota, sus llamadas LLM cesan pero el motor completa el horizonte; adicionalmente se compara el trío sobre un horizonte activo común hasta el primer agotamiento.
