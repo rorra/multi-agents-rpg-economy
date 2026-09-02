@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # No test may reach the network. The engine is offline by construction and the
+  # LLM layer runs against the deterministic mock client.
+  SIM_LOCALE: en
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Single supported version: 3.14 is part of the experiment's fixed
+      # environment, and the exact 3.14.x patch is recorded in run metadata.
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Record interpreter version
+        run: python -c "import sys; print(sys.version)"
+
+      - name: Install Poetry
+        run: pipx install poetry
+
+      - name: Install dependencies
+        # The llm extra installs the SDK, so the SDK-level provider guard tests run
+        # instead of being skipped. They block the SDK; nothing reaches the network.
+        run: poetry install --with dev --extras "analysis llm"
+
+      - name: Lint
+        run: poetry run ruff check .
+
+      - name: Format check
+        run: poetry run ruff format --check .
+
+      - name: Tests
+        run: poetry run pytest
