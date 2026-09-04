@@ -20,6 +20,8 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from rpg_economy.domain import (
     AdventurerSubclass,
     ArtisanSpecialization,
+    Condition,
+    ExperimentRegime,
     Product,
     Resource,
     RiskLevel,
@@ -912,5 +914,254 @@ class CampaignConfig(StrictModel):
             raise ValueError(
                 "campaign.secondary_scenarios has duplicates: "
                 + ", ".join(s.value for s in duplicates)
+            )
+        return self
+
+
+class SeedConfig(StrictModel):
+    """Seed sets (design v1.0 s11.4). Pilot and final must be disjoint."""
+
+    pilot: list[int] = Field(default_factory=list)
+    final: list[int] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _disjoint(self) -> SeedConfig:
+        for name, seeds in (("pilot", self.pilot), ("final", self.final)):
+            duplicates = _duplicates(seeds)
+            if duplicates:
+                raise ValueError(f"seeds.{name} has duplicates: {duplicates}")
+        overlap = set(self.pilot) & set(self.final)
+        if overlap:
+            raise ValueError(
+                f"pilot and final seed sets must be disjoint; shared seeds: {sorted(overlap)}"
+            )
+        return self
+
+
+# ---------------------------------------------------------------------------
+# Run selection
+# ---------------------------------------------------------------------------
+class RunConfig(StrictModel):
+    """What this particular run is. Varies across a trio; everything else does not."""
+
+    condition: Condition
+    scenario: Scenario
+    experiment: ExperimentRegime
+    seed: int
+    phase: Literal["pilot", "final", "adhoc"] = Field(
+        default="adhoc",
+        description="Which stage of the workflow this run belongs to. The campaign "
+        "sets pilot or final on the cells it plans; any other run is adhoc. Only "
+        "final runs may enter inference.",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Root
+# ---------------------------------------------------------------------------
+class SimulationConfig(StrictModel):
+    """Root configuration object."""
+
+    schema_version: str
+    design_version: str = Field(description="Design document version this config targets.")
+
+    run: RunConfig
+    time: TimeConfig
+    phases: PhaseConfig
+    population: PopulationConfig
+    agents: AgentsConfig
+    economy: EconomyConfig
+    market: MarketConfig
+    observability: ObservabilityConfig
+    expeditions: ExpeditionConfig
+    shocks: ShockConfig
+    triggers: TriggerConfig
+    metrics: MetricsConfig
+    llm: LLMConfig
+    budget: BudgetConfig
+    seeds: SeedConfig
+    campaign: CampaignConfig
+
+    def for_cell(
+        self,
+        *,
+        scenario: Scenario,
+        experiment: ExperimentRegime,
+        seed: int,
+        phase: Literal["pilot", "final", "adhoc"] | None = None,
+    ) -> SimulationConfig:
+        """Derive this configuration for one cell of the campaign matrix.
+
+        The counterpart to :meth:`for_condition`, and type-checked for the same
+        reason: ``model_copy`` does not validate, so a bare string here would
+        produce a config whose scenario never matches any identity check.
+        ``phase``, when given, sets ``run.phase``; otherwise it is kept.
+        """
+        if not isinstance(scenario, Scenario):
+            raise TypeError(
+                f"scenario must be a Scenario enum member, got {type(scenario).__name__} "
+                f"{scenario!r}; a bare string silently fails every identity check"
+            )
+        if not isinstance(experiment, ExperimentRegime):
+            raise TypeError(
+                f"experiment must be an ExperimentRegime enum member, got "
+                f"{type(experiment).__name__} {experiment!r}"
+            )
+        payload = self.model_dump(mode="python")
+        payload["run"] = {
+            **payload["run"],
+            "scenario": scenario,
+            "experiment": experiment,
+            "seed": seed,
+            **({} if phase is None else {"phase": phase}),
+        }
+        return SimulationConfig.model_validate(payload)
+
+    def for_condition(self, condition: Condition, *, seed: int | None = None) -> SimulationConfig:
+        """Derive this configuration for one condition of a trio.
+
+        The supported way to vary the condition. ``model_copy`` performs no
+        validation, so a bare string passed through it produces a config whose
+        ``condition`` never matches any ``is Condition.X`` check, and the three
+        runs of a trio would execute identically. This method type-checks and
+        revalidates.
+        """
+        if not isinstance(condition, Condition):
+            raise TypeError(
+                f"condition must be a Condition enum member, got {type(condition).__name__} "
+                f"{condition!r}; a bare string silently fails every identity check"
+            )
+        run: dict[str, object] = {"condition": condition}
+        if seed is not None:
+            run["seed"] = seed
+        payload = self.model_dump(mode="python")
+        payload["run"] = {**payload["run"], **run}
+        return SimulationConfig.model_validate(payload)
+
+    @model_validator(mode="after")
+    def _gear_is_sound(self) -> SimulationConfig:
+        for subclass, items in self.expeditions.gear.items():
+            if not items:
+                raise ValueError(f"{subclass.value} carries no gear")
+            negative = [p.value for p, bonus in items.items() if bonus < 0]
+            if negative:
+                raise ValueError(f"{subclass.value} gear has negative bonuses: {negative}")
+            if not any(p in self.economy.durability for p in items):
+                raise ValueError(
+                    f"{subclass.value} gear has no durable item, so nothing it equips helps"
+                )
+        for subclass, item in self.expeditions.starting_gear.items():
+            if item not in self.expeditions.gear.get(subclass, {}):
+                raise ValueError(
+                    f"{subclass.value} starts with {item.value}, which is not its gear"
+                )
+            if item not in self.economy.durability:
+                raise ValueError(
+                    f"{subclass.value} starts with {item.value}, which has no durability"
+                )
+        return self
+
+    @model_validator(mode="after")
+    def _demand_surge_target_is_carried(self) -> SimulationConfig:
+        """The surge multiplies trip provisions, which only consumables are."""
+        target = self.shocks.demand_surge.target_product
+        if target in self.economy.durability:
+            raise ValueError(
+                f"demand_surge target_product {target.value} is durable equipment; "
+                "only a consumable is used up per expedition"
+            )
+        if not any(target in items for items in self.expeditions.gear.values()):
+            raise ValueError(
+                f"demand_surge target_product {target.value} is in no subclass's "
+                "expedition gear, so the surge would change nothing"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _scarcity_target_spawns(self) -> SimulationConfig:
+        """The scarce resource must appear somewhere, or the shock cuts nothing."""
+        target = self.shocks.resource_scarcity.target_resource
+        if not any(zone.spawn_per_tick.get(target, 0) > 0 for zone in self.expeditions.zones):
+            raise ValueError(
+                f"resource_scarcity target_resource {target.value} spawns in no zone, "
+                "so the shock would change nothing"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _productivity_drop_target_produces(self) -> SimulationConfig:
+        """The slowed specialization must exist and produce, or the shock hits nothing."""
+        target = self.shocks.productivity_drop.target_specialization
+        if self.population.artisans.get(target, 0) < 1:
+            raise ValueError(
+                f"productivity_drop target_specialization {target.value} has no artisan "
+                "in the population, so the shock would change nothing"
+            )
+        if self.economy.production_capacity_per_cycle.get(target, Decimal(0)) <= 0:
+            raise ValueError(
+                f"productivity_drop target_specialization {target.value} has no "
+                "production capacity, so the shock would change nothing"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _phases_fit_horizon(self) -> SimulationConfig:
+        total = self.phases.base_ticks + self.phases.shock_ticks + self.phases.recovery_ticks
+        if total != self.time.horizon_ticks:
+            raise ValueError(
+                f"phase ticks sum to {total} but horizon_ticks is "
+                f"{self.time.horizon_ticks}; they must be equal"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _recovery_reference_window_fits(self) -> SimulationConfig:
+        if self.metrics.volatility_window_w > self.phases.base_ticks:
+            raise ValueError(
+                "volatility_window_w exceeds base_ticks: the recovery reference value is "
+                "the mean over the last W ticks of the base phase (design v1.0 s11.1)"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _liquidity_subset_fits_the_population(self) -> SimulationConfig:
+        named = self.shocks.liquidity_loss.affected_agents
+        if named is not None:
+            # Checked at load, not at the shock tick: a run that fails halfway
+            # has already spent its LLM calls on nothing.
+            known = {agent_id for agent_id, _, _ in self.population.members()}
+            unknown = sorted(set(named) - known)
+            if unknown:
+                raise ValueError(
+                    f"liquidity_loss.affected_agents names agents the population does "
+                    f"not have: {unknown}"
+                )
+            duplicates = _duplicates(named)
+            if duplicates:
+                raise ValueError(f"liquidity_loss.affected_agents has duplicates: {duplicates}")
+        by_role = self.shocks.liquidity_loss.affected_by_role
+        if by_role is None:
+            return self
+        available = {
+            Role.ADVENTURER: sum(self.population.adventurers.values()),
+            Role.ARTISAN: sum(self.population.artisans.values()),
+        }
+        for role, count in by_role.items():
+            if count > available[role]:
+                raise ValueError(
+                    f"liquidity_loss would freeze {count} agents of role {role.value} "
+                    f"but the population has {available[role]}"
+                )
+        return self
+
+    @model_validator(mode="after")
+    def _budget_present_for_experiment_2(self) -> SimulationConfig:
+        if (
+            self.run.experiment is ExperimentRegime.EQUAL_COST
+            and self.budget.experiment_2_total_tokens is None
+        ):
+            raise ValueError(
+                "experiment_2 requires budget.experiment_2_total_tokens; derive it from "
+                "the pilot logs and add it to the configuration (design v1.0 s8.4)"
             )
         return self
