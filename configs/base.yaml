@@ -1,0 +1,357 @@
+# Base configuration (design v1.0 section 13).
+#
+# Values marked `calibrated` are not fixed by the design; they were set by
+# calibrating the economy before the experiment ran.
+#
+# Nothing here may be duplicated as a literal in code (docs/design/IMPLEMENTATION.md section 3).
+
+schema_version: "1.0"
+design_version: "1.0"
+
+# What this run is. The trio runner overrides condition/seed/experiment; every
+# other section is identical across a seed-trio.
+run:
+  condition: A
+  scenario: resource_scarcity
+  experiment: experiment_1
+  seed: 0
+  phase: adhoc              # pilot | final | adhoc; the campaign sets pilot or final
+                            # on the cells it plans. Only final runs enter inference.
+
+time:
+  ticks_per_cycle: 1        # calibrated -- design s8.1; 1 => tick == macro-cycle
+  k_activations: 6          # calibrated -- K, design s13. 6 of 12 agents per
+                            # cycle, so the limit binds in all conditions.
+  horizon_ticks: 340        # must equal base + shock + recovery below
+
+phases:
+  base_ticks: 100
+  shock_ticks: 90           # calibrated -- every shock is finite (design s10);
+                            # long enough for the target good to trade (design s13)
+  recovery_ticks: 150
+
+population:                 # design s13: 6 adventurers + 6 artisans = 12 agents
+  adventurers:
+    warrior: 2
+    mage: 2
+    ranger: 2
+  artisans:                 # 2 per specialization, so each resource has more
+    smithing: 2               # than one buyer (design s13)
+    woodworking: 2
+    alchemy: 2
+
+agents:                     # design s7 -- traits are fixed across a seed-trio
+  traits:                   # keyed by subclass/specialization, else role. calibrated.
+    warrior:     {risk_tolerance: 0.75, time_orientation: 0.35, commercial_aggressiveness: 0.45, adaptability: 0.50}
+    mage:        {risk_tolerance: 0.55, time_orientation: 0.65, commercial_aggressiveness: 0.40, adaptability: 0.70}
+    ranger:      {risk_tolerance: 0.40, time_orientation: 0.55, commercial_aggressiveness: 0.50, adaptability: 0.75}
+    smithing:    {risk_tolerance: 0.35, time_orientation: 0.60, commercial_aggressiveness: 0.55, adaptability: 0.45}
+    woodworking: {risk_tolerance: 0.40, time_orientation: 0.55, commercial_aggressiveness: 0.50, adaptability: 0.55}
+    alchemy:     {risk_tolerance: 0.50, time_orientation: 0.50, commercial_aggressiveness: 0.60, adaptability: 0.65}
+  trait_overrides: {}       # per-agent-id, so two warriors need not be identical
+
+economy:
+  recipes:                  # design s5.1; quantities calibrated
+    melee_weapon:
+      inputs: {iron: 2, leather: 1}
+      output_quantity: 1
+      specialization: smithing
+    armor:
+      inputs: {iron: 2, leather: 2}
+      output_quantity: 1
+      specialization: smithing
+    bow_gear:
+      inputs: {wood: 2, leather: 2}
+      output_quantity: 1
+      specialization: woodworking
+    staff_focus:            # a wooden staff: woodworking, which also keeps that
+      inputs: {wood: 2, arcane_crystal: 2}  # trade from depending on two rangers alone
+      output_quantity: 1
+      specialization: woodworking
+    health_potion:
+      inputs: {herbs: 1}
+      output_quantity: 1     # one herb per potion, so a herb shortage reaches the potion
+      specialization: alchemy
+    mana_potion:
+      inputs: {herbs: 1, arcane_crystal: 1}
+      output_quantity: 2     # a mage uses one every trip
+      specialization: alchemy
+
+  initial_gold:             # calibrated, per role
+    adventurer: 100.0
+    artisan: 150.0
+
+  initial_inventory:        # calibrated; part of the endowment
+    adventurer:             # one potion each for the first trip
+      health_potion: 1
+    smithing:               # artisans start with the inputs of one run
+      iron: 2
+      leather: 2
+    woodworking:
+      wood: 2
+      leather: 2
+      arcane_crystal: 1
+    alchemy:                # enough for a first batch of potions, without
+      herbs: 3              # a stock that would cover the herb shock
+      arcane_crystal: 2
+
+  initial_reference_price:  # calibrated; the price guide shown to agents and the
+                            # Gini fallback for goods untraded in the base phase
+                            # (design s11.1). Products: input cost at these resource
+                            # prices, per unit of output, plus about 65%.
+    iron: 10.0
+    wood: 8.0
+    leather: 9.0
+    herbs: 6.0
+    arcane_crystal: 20.0
+    melee_weapon: 48.0
+    armor: 63.0
+    bow_gear: 56.0
+    staff_focus: 92.0
+    health_potion: 10.0
+    mana_potion: 21.5
+
+  durability:               # calibrated; expeditions an item lasts (each costs
+    melee_weapon: 4         # durability_loss_per_expedition = 1; nothing wears in town).
+    armor: 5                # Long enough that gear pays for itself, short enough that
+    bow_gear: 3             # it is re-bought within a phase, which carries a resource
+    staff_focus: 6          # shock through to demand.
+
+  production_capacity_per_cycle:  # calibrated; productivity_drop scales this.
+    smithing: 0.3           # Recipe runs (batches) per cycle, each yielding the recipe's
+    woodworking: 4          # output_quantity; below one it accrues, one run every few
+    alchemy: 5              # cycles.
+
+  taxes:                    # calibrated; the gold sinks that balance loot
+    profit_rate: 0.3        # share of a product sale's profit (value less input cost
+                            # at last traded prices), paid by the seller; a thin
+                            # margin pays little, a sale at cost nothing
+    wealth_rate: 0.3        # share of gold above the exemption, paid every
+    wealth_every_ticks: 10  # this many ticks by every agent that has it, so gold
+    wealth_exemption: 150.0 # settles instead of piling up; the exemption keeps an
+                            # artisan's working capital
+  storage_cost_per_unit:    # calibrated; per unit of goods held, per cycle, so
+    artisan: 0.03           # sitting on stock nobody buys costs something
+    adventurer: 0.03
+  charge_floor: 60.0        # calibrated; storage never takes an artisan
+                            # below this: what its next purchase needs
+  craft_stock_limit: 2      # calibrated; holding this many units of a product
+                            # (own sell orders included), an artisan cannot craft more
+  floor_at_initial_gold: true  # storage and the profit tax never take an agent
+                            # below its starting gold
+
+market:
+  order_expiry_ticks: 6     # calibrated. Short enough that an unfilled order
+                            # lapses and is re-posted at a new price within a few
+                            # activations; long enough that re-posting does not eat
+                            # the activations adventurers need for expeditions.
+  max_orders_per_activation: 4  # calibrated; orders one place_orders may carry
+  visible_last_n_trades: 10 # N recent trades per good in the agent's interest list
+  usual_price_ticks: 340    # calibrated; when the latest trade is 25% or more off
+  usual_price_gap_pct: 0.25 # the median of this window, agents are told both
+  price_step_pct: 0.10      # calibrated; the step price signals suggest
+  recent_sale_ticks: 15     # calibrated; a bid is told to step up only when the
+                            # good has not sold for this long
+  input_margin_pct: 0.15    # calibrated; the input ceiling leaves products this
+                            # much over their inputs
+  allow_self_trade: false   # design s5.2 -- wash trades would inflate traded
+                            # volume, the liquidity_loss primary target
+
+observability:              # design s5.2 -- fixed interest lists per role/subclass.
+  own_history: 5            # calibrated; own recent actions and trades shown per activation
+  director_recent_results: 5  # calibrated; RESULTs the Director sees per call
+                            # Agents see the last N trades of THESE goods only, never
+                            # others' gold, inventories, plans or any aggregate.
+  interest_lists:
+    # Adventurers see every raw material: they bring back whatever their zone
+    # yields, and must see a market to sell it in.
+    warrior:     [iron, leather, wood, herbs, arcane_crystal, melee_weapon, armor, health_potion]
+    mage:        [arcane_crystal, herbs, iron, leather, wood, staff_focus, armor, health_potion, mana_potion]
+    ranger:      [wood, herbs, leather, iron, arcane_crystal, bow_gear, armor, health_potion]
+    smithing:    [iron, leather, melee_weapon, armor]
+    woodworking: [wood, leather, arcane_crystal, bow_gear, staff_focus]
+    alchemy:     [herbs, arcane_crystal, health_potion, mana_potion]
+
+expeditions:                # design s5.3; all calibrated
+  duration_ticks:
+    low: 2
+    medium: 3
+    high: 4
+  recovery_ticks_on_failure:  # added to rest_ticks after a failed trip
+    low: 1
+    medium: 2
+    high: 4
+  success_probability:
+    low: 0.25               # a bare-handed trip often fails, even in the safe
+    medium: 0.18            # zone, so gear is worth buying
+    high: 0.12
+  expected_yield:           # higher risk => higher expected reward ...
+    low: 3                  # sized so supply covers what gear buying uses
+    medium: 5
+    high: 7
+  yield_spread:            # ... and higher variance (design s5.3)
+    low: 1
+    medium: 2
+    high: 2
+  gold_loot:                # calibrated; gold a successful trip brings back
+    low: 15                 # before gear_gold_bonus, balanced against taxes and
+    medium: 22              # storage so no role drains or hoards
+    high: 30
+  partial_yield_on_failure: 0.25  # failure is partial loss, never death (s5.3, s14)
+  durability_loss_per_expedition: 1
+  rest_ticks: 7             # calibrated; after every return, ticks before setting out
+                            # again. Trading is allowed meanwhile; orders stay on the book
+                            # while the adventurer is away.
+  min_success_probability: 0.05
+  max_success_probability: 0.95
+  gear:                     # design s4.1, s5.3 -- calibrated. Success added by
+                            # each item carried. Weapons and armor are equipped and
+                            # wear out; potions are used up on setting out (one
+                            # each, times demand_surge for its target). Each item
+                            # adds about twice its cost a trip in green_hollow at
+                            # the guide prices, so it still pays when its price rises.
+    warrior: {melee_weapon: 0.21, armor: 0.20, health_potion: 0.20}
+    ranger: {bow_gear: 0.25, armor: 0.18, health_potion: 0.20}
+    mage: {staff_focus: 0.16, armor: 0.08, health_potion: 0.16, mana_potion: 0.28}
+  starting_gear:            # equipped at the start; nothing is required to set out
+    warrior: melee_weapon
+    ranger: bow_gear
+    mage: staff_focus
+  gear_gold_bonus:          # calibrated; share added to a successful trip's gold
+    melee_weapon: 0.8       # per item carried, so gear pays for itself without
+    bow_gear: 0.9           # adding raw materials to the economy
+    staff_focus: 0.8
+    armor: 0.8
+    health_potion: 0.5
+    mana_potion: 0.8
+  pool_capacity_ticks: 10   # zone pools cap at spawn_per_tick x this. Long enough that
+                            # a zone nobody visits fills up and is worth the trip; the
+                            # scarcity shock takes the target out of the pools as well
+                            # (shocks.resource_scarcity.stock_multiplier).
+  gold_capacity_ticks: 20   # calibrated; zone gold pools hold this many ticks of
+                            # gold_per_tick, so two successes in a row both get paid
+  crowding:                 # calibrated. A zone that got more than an even share
+    window_ticks: 30        # of the trips set out over the window loses this much
+    per_trip: 0.02          # success per trip over it, one that got fewer gains as much,
+    cap: 0.15               # within the cap, so trips spread over the zones.
+
+  # Each resource appears at about the rate the economy uses it (potions
+  # consumed and gear worn out), about 1 unit a tick in all, below what the
+  # trips can carry, so the pools empty and supply is what appears whoever goes
+  # where. Gold is pooled the same way, a little over what the successes of a
+  # normal spread of trips are due, so a pool binds only where a zone is crowded.
+  zones:                    # difficulty + resource distribution (design s5.3)
+    - id: green_hollow
+      risk: low
+      spawn_per_tick: {herbs: 0.16, leather: 0.14, wood: 0.08, iron: 0.06, arcane_crystal: 0.01}
+      gold_per_tick: 7
+    - id: iron_marches
+      risk: medium
+      spawn_per_tick: {leather: 0.13, iron: 0.12, herbs: 0.04, wood: 0.04, arcane_crystal: 0.02}
+      gold_per_tick: 7.5
+    - id: arcane_deeps
+      risk: high
+      spawn_per_tick: {herbs: 0.07, wood: 0.07, arcane_crystal: 0.05, iron: 0.06, leather: 0.05}
+      gold_per_tick: 9.5
+
+  subclasses:               # design s4.1: minerals/heavy leather, arcane, wood/herbs
+    warrior:
+      success_bonus: {low: 0.05, medium: 0.10, high: 0.12}
+      resource_affinity: {iron: 1.6, leather: 1.3}
+    mage:
+      success_bonus: {low: 0.02, medium: 0.05, high: 0.08}
+      resource_affinity: {arcane_crystal: 1.8, herbs: 1.1}
+      loot_multiplier: 1.2  # calibrated; the mage burns a mana potion every trip
+    ranger:
+      success_bonus: {low: 0.08, medium: 0.08, high: 0.05}
+      resource_affinity: {wood: 1.6, herbs: 1.5, leather: 1.2}
+
+shocks:                     # design s10; timing derives from `phases` so a trio
+                            # necessarily shares shock type, magnitude and tick
+  resource_scarcity:        # PRIMARY scenario
+    target_resource: herbs
+    stock_multiplier: 0       # the herbs already in the zone pools go too
+    held_keep: 4              # and the herbs agents hold over 4 in all, sell orders
+                              # included (cut to what is left), are bought out at the
+                              # guide value, adventurers first, then the largest holders
+    spawn_multiplier: 0.25    # calibrated; a quarter of the normal appearance
+  demand_surge:
+    target_product: health_potion
+    consumption_multiplier: 3.0
+  productivity_drop:
+    target_specialization: smithing
+    capacity_multiplier: 0.05
+  liquidity_loss:
+    frozen_gold_fraction: 0.95   # calibrated; most of every agent's gold
+    # frozen is what it takes for aggregate trade to notice. Applies to the
+    # available gold at the shock (free gold net of tax arrears owed) and to
+    # pre-shock bid reservations released during it, net of the arrears they
+    # will pay.
+    # Who is affected is specified, never inferred from id ordering (design s10).
+    # Exactly one of affected_agents / affected_by_role. Every agent: a general
+    # credit crunch. Ids are checked against the population at load.
+    affected_agents: [warrior_1, warrior_2, mage_1, mage_2, ranger_1, ranger_2,
+                      smithing_1, smithing_2, woodworking_1, woodworking_2,
+                      alchemy_1, alchemy_2]
+
+triggers:                   # design s8.2 -- IDENTICAL in B and C, no LLM involved
+  t3_price_move_pct: 0.15         # calibrated
+  t4_gold_low: 20.0               # calibrated; on available gold
+  t4_gold_high: 500.0             # calibrated; on available gold
+  t4_durability_critical_pct: 0.34 # calibrated; two expeditions left of six
+  t5_inactivity_ticks: 3          # N -- calibrated
+
+metrics:                    # design s11
+  volatility_window_w: 20         # W -- also the base-phase reference window (s11.1)
+  recovery_band_pct_x: 0.10       # X -- band half-width, relative to the run reference
+  recovery_hold_ticks_m: 10       # M -- consecutive in-band ticks to declare recovery
+  useful_production_ticks_t: 20   # T -- window for useful production
+  unanswered_request_ticks_d: 10  # D -- window for an unanswered REQUEST
+
+llm:
+  provider: openai
+  model: gpt-5-nano         # constant across all conditions and both experiments
+                            # (design s13, s15)
+  temperature: 1.0          # provider default; the only value this model accepts.
+                            # Fixed and identical across conditions (design s11.4).
+  reasoning_effort: low     # at the provider default the model spends the whole
+                            # completion budget reasoning and returns empty content
+  max_output_tokens: 4096   # must cover hidden reasoning tokens as well as the answer;
+                            # the cap itself is not billed
+  model_snapshot: gpt-5-nano-2025-08-07   # the dated snapshot the alias resolves to
+  seed: 12345               # provider-side seed where supported (design s11.4)
+  request_timeout_s: 60     # one request; a timeout is a transient failure
+  max_transient_retries: 5  # 429 / timeout / connection / 5xx, jittered backoff,
+  retry_base_delay_s: 2.0   # then the run stops instead of continuing with WAITs
+  retry_max_delay_s: 60.0
+  mock: true                # default true: no run reaches the network by accident
+  pricing:                  # list price, for cost projection only -- never read during a run.
+    input_per_1m_tokens: 0.05
+    output_per_1m_tokens: 0.40
+    currency: USD
+    quoted_on: "2026-09-02"  # update alongside the price; an estimate is only as
+                             # good as the date attached to it.
+
+budget:
+  # Null until derived. Computed by script as the pooled median of per-run token
+  # totals across the resource_scarcity runs of A, B and C under Experiment 1
+  # (design s8.4). Never hand-tuned.
+  experiment_2_total_tokens: null
+  # Set by the derivation when the logs came from the offline mock client.
+  # A mock-derived budget is for offline runs only; real-provider runs refuse it.
+  derived_from_mock: false
+
+seeds:
+  # Disjoint sets without repeats, enforced by the schema (design s11.4).
+  pilot: [1001, 1002, 1003, 1004, 1005, 1006, 1007, 1008]
+  final: [2001, 2002, 2003, 2004, 2005, 2006, 2007, 2008, 2009, 2010,
+          2011, 2012]           # 12 primary seeds (design s11.4)
+
+campaign:
+  # The final campaign runs one secondary scenario (design s10). The primary
+  # scenario always runs and must not be listed here; no repeats.
+  secondary_scenarios: [demand_surge]
+  secondary_final_seeds: 8  # the first 8 final seeds (design s11.4: 8 x 3 = 24 runs)
+  # The pilot's calibration stage runs this compressed horizon, phases scaled in
+  # proportion; the budget-derivation stage runs the full horizon.
+  pilot_calibration_horizon: 120
