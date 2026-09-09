@@ -7,7 +7,13 @@ from decimal import Decimal
 
 import pytest
 
-from rpg_economy.domain import AdventurerSubclass, ExpeditionOutcome, Product, Resource, RiskLevel
+from rpg_economy.domain import (
+    AdventurerSubclass,
+    ExpeditionOutcome,
+    Product,
+    Resource,
+    RiskLevel,
+)
 from rpg_economy.engine import (
     AgentAccount,
     ExpeditionRejected,
@@ -530,3 +536,210 @@ def test_a_mage_brings_back_more_gold_per_trip() -> None:
         system.resolve(account, AlwaysSucceeds(1), tick=3)
         gold[account.agent_id] = account.gold - before
     assert gold["mage_1"] == gold["warrior_1"] * multiplier
+
+
+# ---------------------------------------------------------------------------
+# Optional gear
+# ---------------------------------------------------------------------------
+def test_each_adventurer_starts_with_its_main_item_equipped() -> None:
+    config = make_config()
+    world = build_world(config)
+    for subclass, item in config.expeditions.starting_gear.items():
+        account = world.account(f"{subclass.value}_1")
+        assert account.equipment == {item: config.economy.durability[item]}
+    assert world.account("smithing_1").equipment == {}
+
+
+def test_an_adventurer_sets_out_without_gear(
+    system: ExpeditionSystem, warrior: AgentAccount
+) -> None:
+    """Gear is optional: it raises the odds and the gold, nothing more."""
+    warrior.equipment.clear()
+    state, _ = system.start(warrior, "green_hollow", tick=0)
+    assert state.gear_bonus == {}
+
+
+def test_gear_adds_its_share_to_a_successful_trips_gold(system: ExpeditionSystem) -> None:
+    """With success alone no item paid for itself in the low-risk zone."""
+    config = make_config()
+    bonus = config.expeditions.gear_gold_bonus[Product.MELEE_WEAPON]
+    loot = config.expeditions.gold_loot[RiskLevel.LOW]
+    multiplier = config.expeditions.subclasses[AdventurerSubclass.WARRIOR].loot_multiplier
+    golds = {}
+    for armed in (True, False):
+        account = _fresh_warrior(config)
+        if not armed:
+            account.equipment.clear()
+        system.start(account, "green_hollow", tick=0)
+        result = system.resolve(account, AlwaysSucceeds(), tick=2)
+        assert result.outcome is ExpeditionOutcome.SUCCESS
+        golds[armed] = result.gold
+    assert golds[False] == loot * multiplier
+    assert golds[True] == loot * multiplier * (1 + bonus)
+
+
+def test_the_expected_take_rises_with_each_item(
+    system: ExpeditionSystem, warrior: AgentAccount
+) -> None:
+    zone = system.zones()[0]
+    bare = system.expected_take(warrior, zone, {}, lambda r: Decimal(10))
+    armed = system.expected_take(
+        warrior, zone, {Product.MELEE_WEAPON: Decimal("0.2")}, lambda r: Decimal(10)
+    )
+    assert armed > bare > 0
+
+
+def test_the_odds_now_count_worn_gear_and_held_potions(
+    system: ExpeditionSystem, warrior: AgentAccount
+) -> None:
+    """What the prompt shows is what setting out would give."""
+    warrior.inventory[Product.HEALTH_POTION] = 1
+    needed = system.supplies_for(warrior, _no_surge)
+    odds = system.odds_now(warrior, needed)
+    state, _ = system.start(warrior, "iron_marches", tick=0, supplies=needed)
+    assert odds["iron_marches"] == system.success_probability(
+        warrior, RiskLevel.MEDIUM, gear_bonus=state.gear_bonus
+    )
+
+
+def _fresh_warrior(config) -> AgentAccount:
+    return build_world(config).account("warrior_1")
+
+
+def test_adventurers_due_together_split_a_small_pool() -> None:
+    """Two trips due at once in a zone with 9 units left share it, 5 and 4,
+    rather than the first to resolve taking all it asked for."""
+    config = make_config()
+    zones = ZoneSystem(config.expeditions)
+    system = ExpeditionSystem(config.expeditions, zones, frozenset(config.economy.durability))
+    zone = zones.zone("arcane_deeps")
+    for resource in list(zone.available):
+        zone.take(resource, zone.stock(resource))
+    zone.available[IRON] = 9
+    world = build_world(config)
+    first, second = world.account("warrior_1"), world.account("warrior_2")
+    system.start(first, "arcane_deeps", tick=0)
+    system.start(second, "arcane_deeps", tick=0)
+
+    # AlwaysSucceeds asks the bottom of the spread: 5 units each at high risk.
+    results = system.resolve_group([(first, AlwaysSucceeds(1)), (second, AlwaysSucceeds(2))], 4)
+
+    assert [r.total_units for r in results] == [5, 4]
+    assert zone.stock(IRON) == 0
+
+
+def _crowded_system() -> ExpeditionSystem:
+    config = make_config(
+        expeditions={"crowding": {"window_ticks": 30, "per_trip": "0.02", "cap": "0.15"}}
+    )
+    return ExpeditionSystem(
+        config.expeditions, ZoneSystem(config.expeditions), frozenset(config.economy.durability)
+    )
+
+
+def test_a_crowded_zone_gets_harder_and_an_empty_one_easier() -> None:
+    system = _crowded_system()
+    world = build_world(make_config())
+    for agent in ("warrior_1", "warrior_2", "ranger_1"):
+        system.start(world.account(agent), "green_hollow", tick=5)
+
+    # Three trips, an even share is one: two over in green_hollow, one short elsewhere.
+    assert system.traffic(6) == {"green_hollow": 3, "iron_marches": 0, "arcane_deeps": 0}
+    assert system.crowding("green_hollow", 6) == Decimal("-0.04")
+    assert system.crowding("arcane_deeps", 6) == Decimal("0.02")
+    # Outside the window the trips no longer count.
+    assert system.crowding("green_hollow", 40) == Decimal(0)
+
+
+def test_crowding_is_capped_and_fixed_at_departure() -> None:
+    system = _crowded_system()
+    world = build_world(make_config())
+    starters = ["warrior_1", "warrior_2", "ranger_1", "ranger_2", "mage_1"]
+    for agent in starters:
+        world.account(agent).expedition = None
+    for i in range(30):
+        account = world.account(starters[i % len(starters)])
+        account.expedition = None
+        system.start(account, "green_hollow", tick=1)
+    assert system.crowding("green_hollow", 2) == Decimal("-0.15")
+
+    mage = world.account("mage_2")
+    state, _ = system.start(mage, "green_hollow", tick=2)
+    assert state.crowding == Decimal("-0.15")
+    bare = system.success_probability(mage, state.risk, gear_bonus=state.gear_bonus)
+    crowded = system.success_probability(
+        mage, state.risk, gear_bonus=state.gear_bonus, crowding=state.crowding
+    )
+    assert crowded == max(bare - Decimal("0.15"), make_config().expeditions.min_success_probability)
+
+
+def test_without_crowding_configured_no_zone_is_shifted() -> None:
+    config = make_config(expeditions={"crowding": None})
+    system = ExpeditionSystem(
+        config.expeditions, ZoneSystem(config.expeditions), frozenset(config.economy.durability)
+    )
+    world = build_world(config)
+    system.start(world.account("warrior_1"), "green_hollow", tick=0)
+    assert system.crowding("green_hollow", 1) == Decimal(0)
+
+
+def test_a_crowded_zone_is_likely_to_yield_what_it_grows_shared_among_its_trips() -> None:
+    system = _crowded_system()
+    config = make_config()
+    world = build_world(config)
+    zone = next(z for z in config.expeditions.zones if z.id == "arcane_deeps")
+    rate = sum(zone.spawn_per_tick.values(), Decimal(0))
+    # Nobody went: the full haul, or a full pool when that is less.
+    full = min(Decimal(7), rate * config.expeditions.pool_capacity_ticks)
+    assert system.likely_haul("arcane_deeps", 0) == full.quantize(Decimal("0.1"))
+    for agent in ("warrior_1", "warrior_2", "ranger_1", "ranger_2", "mage_1", "mage_2"):
+        system.start(world.account(agent), "arcane_deeps", tick=10)
+    shared = min(full, rate * 30 / 6)
+    assert system.likely_haul("arcane_deeps", 11) == shared.quantize(Decimal("0.1"))
+
+
+def test_successes_due_together_share_a_zones_gold() -> None:
+    """Three trips to an emptied zone still brought 194 gold."""
+    config = make_config()
+    zones = ZoneSystem(config.expeditions)
+    system = ExpeditionSystem(config.expeditions, zones, frozenset(config.economy.durability))
+    zone = zones.zone("arcane_deeps")
+    zone.gold = Decimal("30")
+    world = build_world(config)
+    first, second = world.account("warrior_1"), world.account("warrior_2")
+    system.start(first, "arcane_deeps", tick=0)
+    system.start(second, "arcane_deeps", tick=0)
+
+    results = system.resolve_group([(first, AlwaysSucceeds(1)), (second, AlwaysSucceeds(2))], 4)
+
+    assert all(r.gold_due > Decimal("30") for r in results)
+    assert sum(r.gold for r in results) <= Decimal("30")
+    assert results[0].gold == results[1].gold  # an even share each
+    assert zone.gold < Decimal("0.02")
+
+
+def test_a_zones_gold_grows_back_up_to_its_cap() -> None:
+    config = make_config()
+    zones = ZoneSystem(config.expeditions)
+    zone = zones.zone("green_hollow")
+    rate = next(z for z in config.expeditions.zones if z.id == "green_hollow").gold_per_tick
+    assert zone.gold == zone.gold_cap == rate * config.expeditions.gold_capacity_ticks
+    zone.gold = Decimal(0)
+    zones.accrue()
+    assert zone.gold == rate
+    for _ in range(100):
+        zones.accrue()
+    assert zone.gold == zone.gold_cap
+
+
+def test_a_crowded_zone_is_likely_to_pay_less_gold() -> None:
+    system = _crowded_system()
+    config = make_config()
+    world = build_world(config)
+    zone = next(z for z in config.expeditions.zones if z.id == "arcane_deeps")
+    cap = zone.gold_per_tick * config.expeditions.gold_capacity_ticks
+    assert system.likely_gold("arcane_deeps", 0, Decimal(500)) == cap.quantize(Decimal(1))
+    for agent in ("warrior_1", "warrior_2", "ranger_1", "ranger_2", "mage_1", "mage_2"):
+        system.start(world.account(agent), "arcane_deeps", tick=10)
+    shared = zone.gold_per_tick * 30 / 6
+    assert system.likely_gold("arcane_deeps", 11, Decimal(500)) == shared.quantize(Decimal(1))
