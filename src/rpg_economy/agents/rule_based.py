@@ -26,6 +26,7 @@ from rpg_economy.domain import (
     Priority,
     Product,
     Resource,
+    Role,
 )
 from rpg_economy.engine import Engine
 from rpg_economy.engine.state import AgentAccount
@@ -579,3 +580,225 @@ class AdventurerPolicy(RuleBasedPolicy):
             if roll < cumulative:
                 return zone_id
         return weights[-1][0]  # pragma: no cover -- unreachable while total > 0
+
+
+class ArtisanPolicy(RuleBasedPolicy):
+    """Crafts within its specialization, sources inputs, sells output (s4.2).
+
+    Two behaviours matter for the experiment's economics. It **escalates its
+    bid** the longer it is blocked on a missing input, which is what turns a
+    supply shock into a rising price rather than a silent stall. And it prices
+    output at cost plus a markup, so a rise in input prices propagates to
+    the finished good -- the resource-to-product propagation design v1.0 s11.3
+    pre-registers as a secondary analysis.
+    """
+
+    #: Markup over input cost. Selling below cost is how an artisan goes broke.
+    COST_MARKUP = Decimal("1.2")
+    #: Stop making a product once this many are already sitting unsold.
+    MAX_FINISHED_STOCK = 3
+    #: The same for consumables (potions), which every trip uses up.
+    MAX_CONSUMABLE_STOCK = 4
+
+    def _batch_size(self, engine: Engine, account: AgentAccount, product: Product) -> int:
+        """How many units to craft in this one activation.
+
+        Crafting a single unit per activation caps an artisan's throughput at
+        one unit per action, and with one action per macro-cycle the whole
+        economy's absorption falls an order of magnitude below what adventurers
+        gather. The result is chronic oversupply, a downward price drift, and a
+        market too thin to price a shock. The engine already validates the batch
+        against capacity and stock, so the agent may ask for as much as its
+        capacity and inputs allow.
+
+        The batch counts recipe runs, each yielding ``output_quantity`` units,
+        so the room left under the stock cap is converted from units to runs.
+        """
+        recipe = self.config.economy.recipes[product]
+        from_inputs = min(
+            account.available_quantity(resource) // needed
+            for resource, needed in recipe.inputs.items()
+        )
+        room = self._stock_cap(product) - account.quantity(product)
+        runs_for_room = -(-room // recipe.output_quantity)
+        return max(1, min(engine.production.capacity_of(account), from_inputs, runs_for_room))
+
+    def _stock_cap(self, product: Product) -> int:
+        """Finished stock worth holding: one batch, or MAX_FINISHED_STOCK if less.
+
+        Production follows sales. An artisan that keeps several units of each
+        line in stock makes more than wears out, remarks the surplus ever
+        cheaper, and drags down the price of its own inputs with it: a
+        deflation that starts in finished goods and runs back down the chain.
+        """
+        output = self.config.economy.recipes[product].output_quantity
+        if product not in self.config.economy.durability:
+            # Potions are used up on every trip by every adventurer: the line
+            # keeps enough on hand for several buyers, not one.
+            cap = max(output, self.MAX_CONSUMABLE_STOCK)
+        else:
+            cap = min(self.MAX_FINISHED_STOCK, output)
+        # Never past the engine's craft limit: held at it, the policy kept
+        # choosing to craft, was refused every time, and never reached the
+        # selling branch, so it stopped selling and buying altogether.
+        limit = self.config.economy.craft_stock_limit
+        return cap if limit is None else min(cap, limit)
+
+    def _input_cost(self, engine: Engine, product: Product) -> Decimal:
+        recipe = self.config.economy.recipes[product]
+        return sum(
+            (
+                reference_price(engine, resource) * quantity
+                for resource, quantity in recipe.inputs.items()
+            ),
+            Decimal(0),
+        )
+
+    def _unit_cost(self, engine: Engine, product: Product) -> Decimal:
+        """What the inputs of one unit of ``product`` cost: a batch over its output."""
+        recipe = self.config.economy.recipes[product]
+        return self._input_cost(engine, product) / recipe.output_quantity
+
+    def _input_ceiling(self, engine: Engine, product: Product, resource: Resource) -> Decimal:
+        """The most one unit of ``resource`` is worth as an input to ``product``.
+
+        What the product sells for, less the other inputs at their recent
+        prices, spread over the units of this input the recipe needs.
+        """
+        recipe = self.config.economy.recipes[product]
+        value = reference_price(engine, product) * recipe.output_quantity
+        others = sum(
+            (reference_price(engine, r) * q for r, q in recipe.inputs.items() if r is not resource),
+            Decimal(0),
+        )
+        return ((value - others) / recipe.inputs[resource]).quantize(PRICE_QUANTUM)
+
+    def _sourcing_priority(self, engine: Engine, product: Product) -> tuple[int, Decimal, str]:
+        """Sort key: products with a resting bid first, then by expected margin."""
+        bid = engine.market.best_bid(product)
+        value = bid if bid is not None else reference_price(engine, product)
+        margin = value - self._unit_cost(engine, product)
+        return (0 if bid is not None else 1, -margin, product.value)
+
+    def decide(self, engine: Engine, account: AgentAccount, rng: random.Random) -> AgentAction:
+        specialization = engine.production.specialization_of(account)
+        if specialization is None:
+            return wait("no specialization")
+
+        products = engine.production.products_for(specialization)
+
+        # Craft what is covered by stock and not already piling up unsold.
+        #
+        # Producing whatever comes first in the recipe table, regardless of what
+        # is selling, is how an artisan ends a run holding a dozen unsold
+        # weapons and no cash: it converts saleable inputs into stock nobody
+        # wants, and starves itself of the gold needed to buy more inputs.
+        # Design v1.0 s11.1 measures exactly this as overproduction.
+        if engine.production.capacity_of(account) > 0:
+            buildable = [
+                product
+                for product in products
+                if not engine.production.missing_inputs(account, product)
+                # Stock already offered counts: it is unsold all the same.
+                and account.quantity(product) < self._stock_cap(product)
+            ]
+            if buildable:
+                product = min(buildable, key=lambda p: (account.available_quantity(p), p.value))
+                for resource in self.config.economy.recipes[product].inputs:
+                    self._satisfied(account.agent_id, resource)
+                return AgentAction(
+                    action=ActionType.PRODUCE,
+                    target=product.value,
+                    quantity=self._batch_size(engine, account, product),
+                    short_reason="build the line that is shortest of stock",
+                )
+
+        # Otherwise trade, all at once: offer every finished good and bid for
+        # every input the next batches lack.
+        orders: list[AgentAction] = []
+        limit = self._limit()
+
+        # Sell finished goods at cost plus a markup, never below cost.
+        for finished in sorted(products, key=lambda p: (-account.available_quantity(p), p.value)):
+            if len(orders) >= limit or account.available_quantity(finished) <= 0:
+                continue
+            reference = reference_price(engine, finished)
+            # The markup gives way while the stock sits unsold, down to cost and
+            # never below: an artisan holding goods nobody takes at its price has
+            # its gold locked in them and cannot buy the next inputs.
+            concession = self._unsold(account, finished)
+            markup = max(Decimal(1), self.COST_MARKUP - concession)
+            floor = (self._unit_cost(engine, finished) * markup).quantize(PRICE_QUANTUM)
+            price = max(ask_price(engine, finished, reference, concession), floor)
+            orders.append(
+                AgentAction(
+                    action=ActionType.SELL,
+                    target=finished.value,
+                    quantity=min(account.available_quantity(finished), MAX_LOT),
+                    price=price,
+                    short_reason="move finished stock at cost plus markup",
+                )
+            )
+
+        # Source the inputs that block production, bidding higher the longer
+        # they stay blocked. Lines with buyers waiting and the widest margin
+        # come first: sourcing whatever line comes first in the recipe table
+        # leaves an alchemist chasing scarce wood for a staff while buyers bid
+        # twice the cost of a potion made from cheap herbs.
+        pending = {
+            order.good
+            for order in engine.market.open_orders_of(account.agent_id)
+            if order.side is OrderSide.BUY
+        }
+        budget = account.available_gold
+        for product in sorted(products, key=lambda p: self._sourcing_priority(engine, p)):
+            # No inputs for a line whose output is not selling: that gold would
+            # only turn into more stock nobody takes.
+            if account.quantity(product) >= self._stock_cap(product):
+                continue
+            for resource, units in engine.production.missing_inputs(account, product).items():
+                # One resting bid per input. Stacking a new one every activation
+                # locks all the agent's gold in orders and leaves it idle.
+                if len(orders) >= limit or resource in pending:
+                    continue
+                price = bid_price(
+                    engine,
+                    resource,
+                    reference_price(engine, resource),
+                    self._escalate(account.agent_id, resource, account, engine),
+                )
+                # Never pay more for an input than the product it goes into can
+                # return: past that, buying it loses money on every unit made.
+                ceiling = self._input_ceiling(engine, product, resource)
+                if ceiling < PRICE_QUANTUM:
+                    continue
+                price = min(price, ceiling)
+                quantity = min(units + 2, int(budget / price)) if price > 0 else 0
+                if quantity <= 0:
+                    continue
+                budget -= price * quantity
+                pending.add(resource)
+                orders.append(
+                    AgentAction(
+                        action=ActionType.BUY,
+                        target=resource.value,
+                        quantity=quantity,
+                        price=price,
+                        priority=Priority.HIGH,
+                        short_reason="input shortage blocks production",
+                    )
+                )
+
+        return self._bundle(orders, "sell finished stock and source inputs") or wait(
+            "no inputs affordable and nothing to sell"
+        )
+
+
+def policy_for(role: Role, config: SimulationConfig) -> RuleBasedPolicy:
+    """The policy governing a role."""
+    match role:
+        case Role.ADVENTURER:
+            return AdventurerPolicy(config)
+        case Role.ARTISAN:
+            return ArtisanPolicy(config)
+    raise ValueError(f"no rule-based policy for role {role}")  # pragma: no cover
