@@ -20,12 +20,21 @@ from decimal import Decimal
 from typing import Any
 
 from rpg_economy.config.models import SimulationConfig, TraitsConfig
-from rpg_economy.domain import AdventurerSubclass, Good, OrderSide, Product, Resource, Role
+from rpg_economy.domain import (
+    AdventurerSubclass,
+    Condition,
+    Good,
+    OrderSide,
+    Product,
+    Resource,
+    Role,
+    parse_good,
+)
 from rpg_economy.engine import Engine
 from rpg_economy.engine.market import Order, Trade
 from rpg_economy.engine.production import unit_cost as production_unit_cost
 from rpg_economy.engine.state import AgentAccount
-from rpg_economy.messaging import Message
+from rpg_economy.messaging import Message, MessageBus
 from rpg_economy.messaging.bus import OPENING_TYPES
 
 
@@ -172,6 +181,437 @@ class Observation:
             "bulletin": self.bulletin,
             "history": [dict(entry) for entry in self.history],
         }
+
+
+def build_observation(
+    config: SimulationConfig,
+    engine: Engine,
+    agent_id: str,
+    *,
+    messages: MessageBus | None = None,
+    include_bulletin: bool = False,
+    include_open_proposals: bool = False,
+    history: list[dict[str, Any]] | None = None,
+) -> Observation:
+    """Assemble the observation for one activation.
+
+    ``include_open_proposals`` adds the still-open REQUESTs and OFFERs addressed
+    to the agent that are not in its inbox (see ``should_include_open_proposals``).
+    """
+    account = engine.state.account(agent_id)
+    interest: list[Good] = [
+        parse_good(value)
+        for value in config.observability.interest_of(account.role.value, account.specialization)
+    ]
+
+    market = [
+        MarketView(
+            good=good.value,
+            best_bid=engine.market.best_bid(good),
+            best_ask=engine.market.best_ask(good),
+            recent_prices=[t.price for t in engine.market.last_trades(good)],
+            has_offer=engine.market.has_resting_asks(good),
+        )
+        for good in interest
+    ]
+
+    inbox = messages.inbox(agent_id) if messages is not None else []
+    proposals: list[dict[str, Any]] = []
+    inbox_open: dict[int, int | None] = {}
+    if messages is not None and (
+        include_open_proposals or any(m.type in OPENING_TYPES for m in inbox)
+    ):
+        still_open = messages.open_proposals(agent_id, tick=engine.tick)
+        new = {message.message_id for message in inbox}
+        inbox_open = {m.message_id: left for m, left in still_open if m.message_id in new}
+        if include_open_proposals:
+            proposals = _open_proposals(still_open, inbox)
+
+    return Observation(
+        agent_id=agent_id,
+        role=account.role.value,
+        specialization=account.specialization,
+        tick=engine.tick,
+        cycle=engine.cycle,
+        traits=config.agents.traits_of(agent_id, account.role.value, account.specialization),
+        gold=account.gold,
+        available_gold=account.available_gold,
+        tax_owed=account.tax_arrears,
+        inventory={
+            good.value: units
+            for good, units in sorted(account.inventory.items(), key=lambda kv: kv[0].value)
+            if units
+        },
+        available_inventory={
+            good.value: account.available_quantity(good)
+            for good in sorted(account.inventory, key=lambda g: g.value)
+            if account.available_quantity(good)
+        },
+        equipment={
+            product.value: durability
+            for product, durability in sorted(account.equipment.items(), key=lambda kv: kv[0].value)
+        },
+        expedition_gear=_gear_of(config, account.specialization),
+        signals=market_signals(config, engine, account, interest),
+        status=agent_status(config, engine, account),
+        gear=gear_facts(config, engine, account),
+        success_chance={
+            zone: str(chance.quantize(Decimal("0.01")))
+            for zone, chance in engine.expedition_odds(agent_id).items()
+        },
+        is_away=account.expedition is not None,
+        can_set_out_from_tick=(
+            account.recovering_until_tick if account.is_resting(engine.tick) else None
+        ),
+        production_capacity=engine.production.capacity_of(account),
+        market=market,
+        own_trades=[
+            {
+                "tick": trade.tick,
+                "side": "buy" if trade.buyer_id == agent_id else "sell",
+                "good": trade.good.value,
+                "quantity": trade.quantity,
+                "price": str(trade.price),
+            }
+            for trade in engine.market.trades_of(agent_id, config.observability.own_history)
+        ],
+        open_orders=[
+            {
+                "order_id": order.order_id,
+                "side": order.side.value,
+                "good": order.good.value,
+                "remaining": order.remaining,
+                "limit_price": str(order.limit_price),
+                "expires_at_tick": order.expires_at_tick,
+            }
+            for order in engine.market.open_orders_of(agent_id)
+        ],
+        directory=[
+            {
+                "agent_id": entry_id,
+                "role": engine.state.account(entry_id).role.value,
+                "specialization": engine.state.account(entry_id).specialization,
+            }
+            for entry_id in engine.state.agent_ids
+            if entry_id != agent_id
+        ],
+        messages=inbox,
+        open_proposals=proposals,
+        inbox_open=inbox_open,
+        bulletin=engine.bulletin if include_bulletin else None,
+        history=list(history or []),
+    )
+
+
+def market_signals(
+    config: SimulationConfig, engine: Engine, account: AgentAccount, interest: list[Good]
+) -> list[str]:
+    """What the book and the agent's own orders say about each good it follows.
+
+    Only what the agent can already see: the best bid and ask of its goods and
+    its own orders. Spelled out per good because a model shown the raw book
+    kept bidding the old price after its bids went unfilled, and an artisan
+    kept crafting what sat unsold while buyers waited for its other product.
+    """
+    market = engine.market
+    since = engine.tick - 2 * config.market.order_expiry_ticks
+    expired = market.expired_unfilled_of(account.agent_id, since)
+    # (order, line): goods the agent holds and a buyer is waiting for come
+    # first. Pilot: a woodworker's staff, wanted at 76, sat under its wood and
+    # leather lines and was never offered.
+    goods: list[tuple[int, str]] = []
+    for good in interest:
+        bid, ask = market.best_bid(good), market.best_ask(good)
+        facts: list[str] = []
+        sells_it = (
+            isinstance(good, Resource)
+            if account.role is Role.ADVENTURER
+            else _crafts(config, account, good)
+        )
+        cost = (
+            unit_cost(config, market, good) if account.role is Role.ARTISAN and sells_it else None
+        )
+        if bid is not None and ask is None and cost is not None and bid <= cost:
+            # A lowball bid on an artisan's own product is not a shortage it
+            # should sell into. Pilot: bows worth 38 in inputs went for 15.50.
+            # Bids at cost too; alchemists sold potions for their herb.
+            facts.append(f"the only bid is {bid}, " + _lowball(config, engine, good, bid, cost))
+        elif bid is not None and ask is None:
+            # An adventurer only sells raw materials: the buyer's half would
+            # invite a bid the engine refuses.
+            # Its gear and potions it only buys: the seller's half invited it to
+            # sell what its trips use.
+            adventurer = account.role is Role.ADVENTURER
+            seller_only = adventurer and isinstance(good, Resource)
+            buyer_only = adventurer and not isinstance(good, Resource)
+            sale = recent_sale(config, engine, good)
+            if sale is not None:
+                # Two buyers for leather, each told "a buyer who
+                # wants it must bid" a step above the other, took it from 9.1
+                # to 12.8 in the base with as much gathered as used. A good
+                # that sold lately is coming: the bid stands, no step.
+                price = max(bid, sale.price)
+                # Held at the last sale, herbs stayed at twice
+                # their typical price through the recovery. A raw material
+                # above it that still sells is bid a step toward it.
+                lower, typical = toward_typical(config, engine, account, good, price)
+                buy = (
+                    f"a buyer who wants it can bid about {lower}, a step toward its "
+                    f"{typical} typical price while it keeps selling"
+                    if lower < price
+                    else f"a buyer who wants it can bid about {price}"
+                )
+                facts.append(
+                    f"buyers bid {bid} and nothing is offered right now; it sold at "
+                    f"{sale.price} {engine.tick - sale.tick} tick(s) ago and sellers come "
+                    "back between trips, so "
+                    + (
+                        buy
+                        if buyer_only
+                        else ("" if seller_only else f"{buy}, and ")
+                        + f"a seller can ask about {price}"
+                    )
+                )
+            else:
+                facts.append(
+                    f"SHORT: buyers bid {bid} and nothing is offered, so "
+                    + (
+                        f"a buyer who wants it must bid {stepped(config, bid, True, engine, good)}"
+                        if buyer_only
+                        else (
+                            ""
+                            if seller_only
+                            else f"a buyer who wants it must bid "
+                            f"{stepped(config, bid, True, engine, good)}, and "
+                        )
+                        + f"a seller can ask {stepped(config, bid, True, engine, good)}"
+                    )
+                )
+        elif ask is not None and bid is None:
+            if cost is not None and ask <= cost:
+                # Told only "ask less", smiths cut armor worth 48 to 41.
+                facts.append(f"offered at {ask} with no bids, at or below its cost")
+            elif account.role is Role.ADVENTURER and not isinstance(good, Resource):
+                # Told a seller "must ask less", adventurers undercut
+                # alchemists with the potions their own trips would use.
+                facts.append(f"offered at {ask} with no bids: a buyer gets it at {ask}")
+            elif any(o.good == good and o.side is OrderSide.SELL for o in expired):
+                # Its own offer expired too: one step, stated once below.
+                facts.append(f"offered at {ask} with no bids")
+            elif (
+                account.role is Role.ARTISAN
+                and isinstance(good, Resource)
+                and (last := market.last_trades(good, 1))
+                and last[-1].price < ask
+            ):
+                # Herbs sold at 5.40 and one seller asked 11.39; told
+                # "a seller who wants to sell must ask about 8.70", an
+                # alchemist bid 8.70 and the price jumped 61%. The buyer is
+                # told what it last sold at instead.
+                price, _ = toward_typical(config, engine, account, good, last[-1].price)
+                facts.append(
+                    f"offered at {ask} with no bids, above its last sale at {last[-1].price} "
+                    f"{engine.tick - last[-1].tick} tick(s) ago: a bid about {price} may fill "
+                    "when other sellers come back"
+                )
+            else:
+                # To an artisan buying the input it says what sellers must
+                # cut to; without it, alchemists facing herbs at 17.38 after a
+                # 6.30 base bid lower in 3 of 20 answers, with it 14.
+                facts.append(
+                    f"offered at {ask} with no bids: a seller who wants to sell must ask "
+                    + _ask_down(config, engine, good, ask, cost)
+                )
+        elif bid is not None and ask is not None:
+            mid = _halfway(config, good, bid, ask)
+            facts.append(
+                f"bid {bid}, offered {ask}"
+                + (f": a deal at about {mid}, halfway, would trade" if mid else "")
+            )
+        # What the agent holds of a good it sells (its products, or an
+        # adventurer's raw materials). Pilot: a woodworker kept a staff for 100
+        # ticks while mages bid for one. Told "an offer at the bid sells at
+        # once", sellers all took the bid and prices stopped moving; stated
+        # neutrally, some ask more, and unfilled buyers bid up.
+        held = account.available_quantity(good) if sells_it else 0
+        offered = account.inventory.get(good, 0) - account.available_quantity(good)
+        if sells_it and offered and not held:
+            # Artisans re-offered goods already on their own sell orders,
+            # which the engine refuses.
+            facts.append(
+                f"all {offered} you hold are on your own sell orders: cancel one to reprice"
+            )
+        if cost is not None and (held or facts):
+            # Pilot: with no cost in view, woodworkers sold bows worth 38 in
+            # inputs to a 15.50 bid.
+            facts.insert(
+                0,
+                f"one costs about {cost} in inputs, so selling below that loses gold",
+            )
+        if held and bid is not None and not (cost is not None and bid <= cost):
+            facts.append(
+                f"you hold {held}; buyers are waiting and nothing else is offered"
+                if ask is None
+                else f"you hold {held}"
+            )
+        mine = [o for o in expired if o.good == good][:3]
+        bids = [str(o.limit_price) for o in mine if o.side is OrderSide.BUY]
+        asks = [str(o.limit_price) for o in mine if o.side is OrderSide.SELL]
+        if bids and ask is None:
+            facts.append(
+                f"your last {len(bids)} bid(s) at {', '.join(bids)} expired with nothing "
+                + (
+                    "bought: bid higher to get any"
+                    if config.market.price_step_pct is None
+                    else f"bought: {rebid(config, engine, good, max(Decimal(b) for b in bids))}"
+                )
+            )
+        elif bids:
+            # Told "bid higher" while sellers offered, buyers chased
+            # every ask, so raw prices rose in the shock and never came back
+            # once supply returned. Pressure up only when nothing is offered.
+            mid = _halfway(config, good, max(Decimal(b) for b in bids), ask)
+            facts.append(
+                f"your last {len(bids)} bid(s) at {', '.join(bids)} expired with nothing "
+                f"bought; sellers ask {ask}"
+                + (f": a bid of about {mid}, halfway, may trade" if mid else "")
+            )
+        elif (
+            account.role is Role.ARTISAN
+            and isinstance(good, Resource)
+            and ask is not None
+            and config.market.price_step_pct is not None
+            and any(
+                t.good == good and t.buyer_id == account.agent_id and t.tick >= since
+                for t in market.trades_of(account.agent_id, 20)
+            )
+        ):
+            # Buyers stepped bids up in the shock and, once supply
+            # returned, kept paying the last trade; nothing pushed the herb
+            # price down and it stayed at 2.6x base through the recovery.
+            facts.append(
+                f"your bids filled and sellers still offer at {ask}: "
+                f"a bid of {stepped(config, ask, False, engine, good)} may also fill"
+            )
+        if asks and cost is not None and min(Decimal(a) for a in asks) <= cost:
+            facts.append(
+                f"your last {len(asks)} offer(s) at {', '.join(asks)} expired unsold, "
+                "at or below its cost: asking less loses gold"
+            )
+        elif (
+            asks and bid is not None and _halfway(config, good, bid, min(Decimal(a) for a in asks))
+        ):
+            mid = _halfway(config, good, bid, min(Decimal(a) for a in asks))
+            facts.append(
+                f"your last {len(asks)} offer(s) at {', '.join(asks)} expired unsold; "
+                f"buyers bid {bid}: an offer of about {mid}, halfway, may trade"
+            )
+        elif asks:
+            facts.append(
+                f"your last {len(asks)} offer(s) at {', '.join(asks)} expired unsold: "
+                "ask "
+                + _ask_down(
+                    config,
+                    engine,
+                    good,
+                    min([Decimal(a) for a in asks] + ([ask] if ask is not None else [])),
+                    cost,
+                )
+                + " to sell"
+            )
+        # The last trades were all the shock's, so once supply returned
+        # buyers and sellers settled at 2.6x the base price and stayed there.
+        # With no trades yet there was no typical price, and an
+        # alchemist's first mana potions went for 8.30 against a 21.50 guide.
+        window = config.market.usual_price_ticks
+        latest = market.last_trades(good, 1)
+        usual, guide = reference_price(config, engine, good)
+        if cost is not None and usual is not None:
+            # An alchemist told potions "typically traded at 10.00"
+            # with herbs at 11.50 had no margin to sell at. Its own product is
+            # measured against its inputs now.
+            usual = natural_price(config, market, good)
+        if (
+            usual is not None
+            and latest
+            and abs(latest[-1].price - usual) >= usual * config.market.usual_price_gap_pct
+        ):
+            facts.append(
+                (
+                    f"its guide margin over the {cost} its inputs cost now puts it at {usual}"
+                    if cost is not None
+                    else f"the price guide puts it at {usual}"
+                    if guide
+                    else f"it typically traded at {usual} over the last {window} ticks"
+                )
+                + f"; the latest trade was {latest[-1].price}"
+            )
+        if facts:
+            wanted = held and bid is not None and not (cost is not None and bid <= cost)
+            # Adventurers with gold and nothing to sell bid for raw
+            # materials on offer "to diversify"; the rule sat in the role brief.
+            label = (
+                f"{good.value} (you only sell it)"
+                if account.role is Role.ADVENTURER and isinstance(good, Resource)
+                else good.value
+            )
+            goods.append((0 if wanted else 1, f"- {label}: " + "; ".join(facts)))
+    lines: list[str] = [line for _, line in sorted(goods, key=lambda pair: pair[0])]
+    if account.role is Role.ARTISAN:
+        rows: list[tuple[int, str, str]] = []
+        for product, recipe in config.economy.recipes.items():
+            if recipe.specialization != account.specialization:
+                continue
+            runs = min(account.available_quantity(r) // q for r, q in recipe.inputs.items())
+            bid, ask = market.best_bid(product), market.best_ask(product)
+            cost = unit_cost(config, market, product)
+            if bid is not None and ask is None and bid <= cost:
+                rank, demand = (
+                    1,
+                    f"the only bid is {bid}, " + _lowball(config, engine, product, bid, cost),
+                )
+            elif bid is not None and ask is None:
+                rank, demand = (
+                    0,
+                    f"buyers bid {bid} and nobody sells it: one crafted now sells at once",
+                )
+            elif ask is not None and bid is None:
+                rank, demand = (
+                    2,
+                    (
+                        f"already offered at {ask} with no buyer: another would sit unsold, "
+                        "paying storage"
+                    ),
+                )
+            else:
+                rank, demand = 1, "no buyer waiting"
+            held = account.available_quantity(product)
+            stock = f"; you already hold {held} unsold" if held else ""
+            stock += f"; one costs about {cost} in inputs"
+            limit = config.economy.craft_stock_limit
+            owned = account.inventory.get(product, 0)
+            if limit is not None and owned >= limit:
+                rows.append(
+                    (
+                        3,
+                        product.value,
+                        f"- craft {product.value}: not allowed: you hold {owned} unsold "
+                        f"(limit {limit}); you can craft more once fewer than {limit} remain",
+                    )
+                )
+                continue
+            rows.append(
+                (
+                    rank,
+                    product.value,
+                    f"- craft {product.value}: {runs} run(s) possible from your inputs; "
+                    f"{demand}{stock}",
+                )
+            )
+        # Products a buyer is waiting for first: listed alphabetically, the
+        # model crafted whichever came first.
+        lines += [row for _, _, row in sorted(rows)]
+    return lines
 
 
 ZERO_GOLD = Decimal(0)
@@ -431,6 +871,14 @@ def _ask_down(
     if cost is not None and step is not None and moved(config, engine, good, ask, False) < cost:
         return f"less, but not below its {cost} cost"
     return text
+
+
+def agent_status(config: SimulationConfig, engine: Engine, account: AgentAccount) -> list[str]:
+    """An agent's headline lines, shown above its state (see the role's own)."""
+    lines = confiscation_lines(engine, account)
+    if account.role is Role.ADVENTURER:
+        return lines + adventurer_status(config, engine, account)
+    return lines + artisan_status(config, engine, account)
 
 
 def confiscation_lines(engine: Engine, account: AgentAccount) -> list[str]:
@@ -923,3 +1371,55 @@ def unit_cost(config: SimulationConfig, market: object, product: Good) -> Decima
         return last[-1].price if last else None
 
     return production_unit_cost(config.economy, last_price, product)
+
+
+def _crafts(config: SimulationConfig, account: AgentAccount, good: Good) -> bool:
+    recipe = config.economy.recipes.get(good)
+    return recipe is not None and recipe.specialization == account.specialization
+
+
+def should_include_bulletin(condition: Condition) -> bool:
+    """Only Condition C carries the bulletin into a prompt (design v1.0 s3.3)."""
+    return condition is Condition.C
+
+
+def should_include_open_proposals(condition: Condition) -> bool:
+    """Open proposals exist only where peer messages do: B and C (design s3.1)."""
+    return condition is not Condition.A
+
+
+def _open_proposals(
+    still_open: list[tuple[Message, int | None]], inbox: list[Message]
+) -> list[dict[str, Any]]:
+    """Open REQUESTs and OFFERs to the agent, less those in its inbox.
+
+    ``still_open`` is the bus's ``open_proposals`` for the agent at this tick.
+    A proposal still in the inbox is shown there, as a new message marked
+    open; listing it again would show it twice and charge its tokens twice.
+    """
+    new = {message.message_id for message in inbox}
+    return [
+        {
+            "message_id": message.message_id,
+            "sender_id": message.sender_id,
+            "type": message.type.value,
+            "good": message.payload.get("good"),
+            "quantity": message.payload.get("quantity"),
+            "price": message.payload.get("price"),
+            "ticks_left": ticks_left,
+        }
+        for message, ticks_left in still_open
+        if message.message_id not in new
+    ]
+
+
+def _gear_of(config: SimulationConfig, specialization: str | None) -> dict[str, str]:
+    """What an adventurer subclass can carry, and the success each item adds.
+
+    The configured amounts: a demand surge changes how many potions a trip uses
+    up, and agents learn of a shock the way they learn of any, not from here.
+    """
+    for subclass, gear in config.expeditions.gear.items():
+        if subclass.value == specialization:
+            return {p.value: str(b) for p, b in sorted(gear.items(), key=lambda kv: kv[0].value)}
+    return {}
