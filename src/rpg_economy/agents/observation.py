@@ -23,6 +23,7 @@ from rpg_economy.config.models import SimulationConfig, TraitsConfig
 from rpg_economy.domain import AdventurerSubclass, Good, OrderSide, Product, Resource, Role
 from rpg_economy.engine import Engine
 from rpg_economy.engine.market import Order, Trade
+from rpg_economy.engine.production import unit_cost as production_unit_cost
 from rpg_economy.engine.state import AgentAccount
 from rpg_economy.messaging import Message
 from rpg_economy.messaging.bus import OPENING_TYPES
@@ -278,6 +279,17 @@ def toward_typical(
     return moved(config, engine, good, price, False), reference
 
 
+def natural_price(config: SimulationConfig, market: object, product: Good) -> Decimal:
+    """A product's guide price moved with what its inputs cost now.
+
+    Its guide margin over its inputs at their guide prices, applied to their
+    last prices: dearer herbs make a dearer potion, cheaper ones a cheaper one.
+    """
+    guide = Decimal(str(config.economy.initial_reference_price[product.value]))
+    guide_cost = production_unit_cost(config.economy, lambda good: None, product)
+    return (guide * unit_cost(config, market, product) / guide_cost).quantize(CENT)
+
+
 def reference_price(
     config: SimulationConfig, engine: Engine, good: Good
 ) -> tuple[Decimal | None, bool]:
@@ -309,6 +321,48 @@ def _halfway(config: SimulationConfig, good: Good, bid: Decimal, ask: Decimal) -
     if ask > bid * (1 + 2 * step):
         return None
     return ((bid + ask) / 2).quantize(CENT)
+
+
+def _input_price_note(
+    config: SimulationConfig,
+    engine: Engine,
+    account: AgentAccount,
+    resource: Resource,
+    bid: Decimal,
+) -> str:
+    """What an input costs to get now: the ask, or with none what to bid."""
+    ask = engine.market.best_ask(resource)
+    if ask is not None and ask < bid:
+        return f"offered at {ask}: a bid at that price buys now"
+    if ask is not None:
+        return f"offered at {ask}"
+    reference, _ = reference_price(config, engine, resource)
+    if reference is None:
+        return "nobody offers any"
+    # In the herb shock alchemists were told to bid the 6.00 typical
+    # price for herbs last sold at 9.80. The last trade leads it there, held
+    # under what the input is worth to the artisan.
+    # With herbs last sold at 6.82, an alchemist whose 7.50 bid had
+    # expired unfilled was told "bid about 6.82" here and "about 8.25" in its
+    # "Buying" line. Never below its own unfilled bids since then, and a step
+    # above them once the input stopped selling.
+    last = engine.market.last_trades(resource, 1)
+    candidates = [last[-1].price] if last else []
+    if last:
+        # Above its typical price and not short of it, a step toward it.
+        candidates = [toward_typical(config, engine, account, resource, last[-1].price)[0]]
+    unfilled = [o.limit_price for o in _unfilled_bids(config, engine, account, resource)]
+    if unfilled:
+        # A step above, as its "Buying" line says, unless it still sells.
+        top = max(unfilled)
+        if recent_sale(config, engine, resource) is None and config.market.price_step_pct:
+            top = moved(config, engine, resource, top, True)
+        candidates.append(top)
+    if candidates and max(candidates) > reference:
+        ceiling, products = input_ceiling(config, engine, account, resource)
+        price = min(max(candidates), ceiling) if products else max(candidates)
+        reference = max(reference, price)
+    return f"nobody offers any: bid about {reference}"
 
 
 def _lapsing(config: SimulationConfig, engine: Engine, account: AgentAccount, good: Good) -> bool:
@@ -623,3 +677,249 @@ def gear_lines(facts: list[dict[str, Any]]) -> list[str]:
         )
         lines.append(f"Gear: {fact['item']} ({where}; {terms}) adds about {adds} a trip")
     return lines
+
+
+def artisan_status(config: SimulationConfig, engine: Engine, account: AgentAccount) -> list[str]:
+    """Headline lines for an artisan, about its own products and inputs.
+
+    Replayed at real runs' moments, a woodworker shown its staff only in
+    the signals sold it 1 time in 42; with a "Ready to sell" line above its
+    state, 41 in 42. The same holds for a product buyers wait for ("Wanted")
+    and for inputs its bids failed to buy ("Buying"): in the signals alone the
+    model often missed them.
+    """
+    if account.role is not Role.ARTISAN:
+        return []
+    market = engine.market
+    lines: list[str] = []
+    inputs: set[Good] = set()
+    # Products of its specialization that buyers bid for with nothing offered.
+    wanted = [
+        (product, market.best_bid(product))
+        for product, recipe in sorted(config.economy.recipes.items(), key=lambda kv: kv[0].value)
+        if recipe.specialization == account.specialization
+        and market.best_bid(product) is not None
+        and market.best_ask(product) is None
+    ]
+    for product, recipe in config.economy.recipes.items():
+        if recipe.specialization != account.specialization:
+            continue
+        inputs.update(recipe.inputs)
+        held = account.available_quantity(product)
+        bid, ask = market.best_bid(product), market.best_ask(product)
+        # The line counted only units off the book, so a smith whose 6
+        # weapons sat on its own unfilled sell orders was never told and crafted
+        # more. Units on its own orders are unsold too.
+        unsold = account.inventory.get(product, 0)
+        limit = config.economy.craft_stock_limit
+        if bid is None and unsold >= (UNSOLD_FLAG if limit is None else limit):
+            instead = [f"{p.value} (buyers bid {b})" for p, b in wanted if p is not product]
+            lines.append(
+                f"Unsold: {product.value}: you already hold {unsold} and no one is bidding; "
+                + (
+                    "craft no more until some sell (unsold stock pays storage)"
+                    if limit is None
+                    # Told "sell some", alchemists sold five potions
+                    # at their input cost. The limit stops crafting; the price
+                    # signals, not the limit, say what to sell at.
+                    else f"you can craft more once fewer than {limit} remain"
+                )
+                + (f"; craft {' or '.join(instead)} instead" if instead else "")
+            )
+        cost = unit_cost(config, market, product)
+        runs = min(account.available_quantity(r) // q for r, q in recipe.inputs.items())
+        at_limit = limit is not None and unsold >= limit
+        if runs and not at_limit and bid is not None and ask is None and bid > cost:
+            lines.append(
+                f"Wanted: {product.value}: buyers bid {bid} and nobody sells it; your inputs "
+                f"allow {runs} run(s) now"
+            )
+        elif not runs and not held and bid is not None and ask is None and bid > cost:
+            # Smiths without iron kept offering armor nobody bid for
+            # while warriors waited 30 ticks for a weapon.
+            # Told what one unit lacks, alchemists bid for one herb at
+            # a time, crafting one potion in three activations while ~55 potion
+            # bids went unserved. The line gives the need per run and the runs
+            # the capacity allows.
+            # Told only "bid for the inputs", alchemists bid the
+            # 6.00 guide for herbs offered at 6.04 to 6.60 and stacked more bids
+            # at 6.00 each turn; no herb traded in 41 ticks. The price is stated.
+            short = [
+                f"{q} {r.value} ({_input_price_note(config, engine, account, r, bid)})"
+                for r, q in sorted(recipe.inputs.items(), key=lambda kv: kv[0].value)
+                if account.available_quantity(r) < q
+            ]
+            capacity = engine.production.capacity_of(account)
+            lines.append(
+                f"Wanted: {product.value}: buyers bid {bid} and nobody sells it; each run needs "
+                f"{' and '.join(short)}, which you lack, and your capacity allows {capacity} "
+                "run(s) this cycle: bid for the inputs of every run you mean to craft"
+            )
+        if not held:
+            continue
+        if bid is None and ask is None:
+            # Smiths held weapons nobody bid for and never offered them
+            # while they sourced leather for armor; warriors without a weapon
+            # saw "nobody offers one" and set out bare.
+            # Offered at its typical price or its cost, potions
+            # sold at cost through the herb shock: the price followed the
+            # inputs with no margin. Its guide margin over what its inputs
+            # cost now moves it with them, up or down.
+            price = natural_price(config, market, product)
+            lines.append(
+                f"Not offered: {product.value} x{held}: nobody offers or bids for one; "
+                f"offer it at about {price}, its guide margin over the {cost} its inputs "
+                "cost now, so buyers see one"
+            )
+        if bid is not None and ask is None and bid > cost:
+            lines.append(
+                f"Ready to sell: {product.value} x{held}: buyers bid {bid}, above its {cost} "
+                "input cost"
+            )
+    since = engine.tick - 2 * config.market.order_expiry_ticks
+    expired = market.expired_unfilled_of(account.agent_id, since)
+    # A later bid that did buy makes the failed ones old news: a
+    # woodworker told its bids "expired with nothing bought" after buying
+    # with another order bid up again instead of crafting.
+    bought = {
+        t.good
+        for t in market.trades_of(account.agent_id, 50)
+        if t.buyer_id == account.agent_id and t.tick >= since
+    }
+    for good in sorted(inputs, key=lambda g: g.value):
+        ceiling, products = input_ceiling(config, engine, account, good)
+        bids = [str(o.limit_price) for o in expired if o.good == good and o.side is OrderSide.BUY][
+            :3
+        ]
+        ask = market.best_ask(good)
+        if bids and good not in bought and ask is None:
+            top = Decimal(max(bids, key=Decimal))
+            step = config.market.price_step_pct
+            if step is None or moved(config, engine, good, top, True) <= ceiling:
+                lines.append(
+                    f"Buying: {good.value}: your last {len(bids)} bid(s) at {', '.join(bids)} "
+                    f"expired with nothing bought and nothing is offered; "
+                    f"{rebid(config, engine, good, top)}"
+                )
+        elif (
+            bids
+            and good not in bought
+            and recent_sale(config, engine, good) is None
+            and (not products or ask <= ceiling)
+        ):
+            # In the herb shock an alchemist re-bid the last sale,
+            # 6.82, under asks of 9.08 to 7.12 for ten ticks, and the seller
+            # came down: with the line only shown when nothing was offered,
+            # its expired bids went unremarked. Only for a good that stopped
+            # selling: with sales still coming, the halfway price does.
+            lines.append(
+                f"Buying: {good.value}: your last {len(bids)} bid(s) at {', '.join(bids)} "
+                f"expired with nothing bought; it is offered at {ask}: a bid at {ask} buys now"
+            )
+        last = market.last_trades(good, 1)
+        lower, typical = (
+            toward_typical(config, engine, account, good, last[-1].price) if last else (None, None)
+        )
+        if products and last and lower < last[-1].price and lower <= ceiling:
+            # Told "bid at most 11.67", the ceiling, alchemists bid
+            # it for 100 ticks after the herb shock while herbs went unsold.
+            # A buyer not short of it bids a step toward its typical price.
+            lines.append(
+                f"Too dear: {good.value}: it last sold at {last[-1].price}, above its {typical} "
+                f"typical price, and your bids have not gone unfilled: bid about {lower}, a step "
+                "toward it, and higher only once your bids expire with nothing bought"
+            )
+        elif products and _near_ceiling(config, market, good, ceiling):
+            # Smiths stepped iron up 10% whenever none was offered,
+            # from 10.5 to 30, and paid 58 in inputs for a weapon that sold at
+            # 48-53. The ceiling follows the product's own price, so a dearer
+            # product (a potion in the herb shock) lifts it.
+            names = " or ".join(p.value for p in products)
+            article = "an" if names[0] in "aeiou" else "a"
+            margin = config.market.input_margin_pct
+            lines.append(
+                f"Too dear: {good.value}: above {ceiling} {article} {names} made from it "
+                + (
+                    f"sells for less than {(margin * 100).normalize()}% over what "
+                    if margin
+                    else "sells for less than what "
+                )
+                + f"its inputs cost; bid at most {ceiling} until "
+                f"{'its' if len(products) == 1 else 'their'} price rises"
+            )
+    # What sells now first: listed alphabetically, a woodworker read its two
+    # "Buying" lines and bid, under a staff a mage bid 76 for.
+    return sorted(lines, key=lambda line: (HEADLINE_ORDER.index(line.split(":")[0]), line))
+
+
+def product_value(config: SimulationConfig, engine: Engine, product: Good) -> Decimal:
+    """What one unit of a product fetches: its typical price, or more when buyers pay more."""
+    market = engine.market
+    reference, _ = reference_price(config, engine, product)
+    last = market.last_trades(product, 1)
+    candidates = [
+        price
+        for price in (reference, market.best_bid(product), last[-1].price if last else None)
+        if price is not None
+    ]
+    if not candidates:
+        return Decimal(str(config.economy.initial_reference_price[product.value]))
+    return max(candidates)
+
+
+def input_ceiling(
+    config: SimulationConfig, engine: Engine, account: AgentAccount, resource: Good
+) -> tuple[Decimal, list[Good]]:
+    """The most an input is worth to an artisan, and the products that set it.
+
+    For each product of its specialization that uses ``resource``: the
+    product's value per run less its other inputs at their last prices, per
+    unit of ``resource``. The highest over products, so an input is not
+    flagged while any product still pays for it. Other inputs at their typical
+    price.
+    """
+    best: Decimal | None = None
+    products: list[Good] = []
+    for product, recipe in sorted(config.economy.recipes.items(), key=lambda kv: kv[0].value):
+        if recipe.specialization != account.specialization or resource not in recipe.inputs:
+            continue
+        other = Decimal(0)
+        for r, q in recipe.inputs.items():
+            if r == resource:
+                continue
+            # At its typical price, not its last: an input bid up past its own
+            # ceiling would otherwise drag the other inputs' ceilings down too.
+            reference, _ = reference_price(config, engine, r)
+            if reference is None:
+                reference = Decimal(str(config.economy.initial_reference_price[r.value]))
+            other += reference * q
+        value = product_value(config, engine, product) * recipe.output_quantity
+        value /= 1 + config.market.input_margin_pct
+        ceiling = ((value - other) / recipe.inputs[resource]).quantize(CENT)
+        products.append(product)
+        if best is None or ceiling > best:
+            best = ceiling
+    return (best if best is not None else Decimal(0)), products
+
+
+def _near_ceiling(config: SimulationConfig, market: object, good: Good, ceiling: Decimal) -> bool:
+    """Whether the input's price is within one price step of the ceiling, or above it."""
+    last = market.last_trades(good, 1)
+    prices = [p for p in (market.best_bid(good), last[-1].price if last else None) if p]
+    step = config.market.price_step_pct or Decimal(0)
+    return bool(prices) and max(prices) * (1 + step) > ceiling
+
+
+def unit_cost(config: SimulationConfig, market: object, product: Good) -> Decimal:
+    """What the inputs of one unit of ``product`` cost at the last traded prices.
+
+    Each input at its last trade, or at its starting reference price before any
+    trade: prices the agent already sees in its market view or price guide. The
+    engine assesses the profit tax against the same figure.
+    """
+
+    def last_price(good: Good) -> Decimal | None:
+        last = market.last_trades(good, 1)
+        return last[-1].price if last else None
+
+    return production_unit_cost(config.economy, last_price, product)
