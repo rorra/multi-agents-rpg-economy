@@ -536,3 +536,207 @@ def test_an_order_crossing_the_agents_own_is_refused(
     assert two_traders.account("woodworking_1").available_gold == gold
     assert two_traders.account("woodworking_1").available_quantity(IRON) == iron
     assert market.best_bid(IRON) is None or market.best_ask(IRON) is None
+
+
+def test_an_own_order_that_does_not_cross_is_accepted(
+    market: Market, two_traders: WorldState
+) -> None:
+    stock(two_traders, "woodworking_1", IRON, 5)
+    market.place(
+        agent_id="woodworking_1", side=OrderSide.SELL, good=IRON, quantity=1, price=d("10"), tick=0
+    )
+    market.place(
+        agent_id="woodworking_1", side=OrderSide.BUY, good=IRON, quantity=1, price=d("9"), tick=0
+    )
+    assert (market.best_bid(IRON), market.best_ask(IRON)) == (d("9"), d("10"))
+
+
+def test_self_trade_occurs_when_configured(two_traders: WorldState) -> None:
+    market = Market(
+        two_traders, order_expiry_ticks=10, visible_last_n_trades=10, allow_self_trade=True
+    )
+    stock(two_traders, "woodworking_1", IRON, 5)
+    market.place(
+        agent_id="woodworking_1", side=OrderSide.SELL, good=IRON, quantity=5, price=d("10"), tick=0
+    )
+    market.place(
+        agent_id="woodworking_1", side=OrderSide.BUY, good=IRON, quantity=5, price=d("10"), tick=0
+    )
+
+    assert len(market.trades) == 1
+
+
+def test_the_self_cross_refusal_is_an_invalid_order(
+    market: Market, two_traders: WorldState
+) -> None:
+    from rpg_economy.agents.executor import rejection_code
+    from rpg_economy.domain import RejectionCode
+
+    stock(two_traders, "woodworking_1", IRON, 5)
+    market.place(
+        agent_id="woodworking_1", side=OrderSide.SELL, good=IRON, quantity=1, price=d("10"), tick=0
+    )
+    with pytest.raises(OrderRejected) as refused:
+        market.place(
+            agent_id="woodworking_1",
+            side=OrderSide.BUY,
+            good=IRON,
+            quantity=1,
+            price=d("12"),
+            tick=0,
+        )
+    assert rejection_code(refused.value) is RejectionCode.INVALID_ORDER
+
+
+def test_a_self_crossing_order_is_refused_even_when_another_seller_would_fill_it(
+    market: Market, two_traders: WorldState
+) -> None:
+    """Nothing is cancelled behind the agent's back: it cancels its own order first."""
+    stock(two_traders, "woodworking_1", IRON, 5)
+    stock(two_traders, "woodworking_2", IRON, 5)
+    own = market.place(
+        agent_id="woodworking_1", side=OrderSide.SELL, good=IRON, quantity=1, price=d("10"), tick=0
+    )
+    market.place(
+        agent_id="woodworking_2", side=OrderSide.SELL, good=IRON, quantity=1, price=d("8"), tick=0
+    )
+    with pytest.raises(OrderRejected, match="cancel it first"):
+        market.place(
+            agent_id="woodworking_1",
+            side=OrderSide.BUY,
+            good=IRON,
+            quantity=1,
+            price=d("10"),
+            tick=0,
+        )
+    market.cancel(own.order_id, agent_id="woodworking_1")
+    bid = market.place(
+        agent_id="woodworking_1", side=OrderSide.BUY, good=IRON, quantity=1, price=d("10"), tick=0
+    )
+    assert bid.status is OrderStatus.FILLED
+    assert market.trades[-1].seller_id == "woodworking_2"
+    assert market.trades[-1].price == d("8")
+
+
+# ---------------------------------------------------------------------------
+# Validation and observability
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize(("quantity", "price"), [(0, "10"), (-1, "10"), (1, "0"), (1, "-5")])
+def test_degenerate_orders_are_rejected(market: Market, quantity: int, price: str) -> None:
+    with pytest.raises(OrderRejected):
+        market.place(
+            agent_id="woodworking_1",
+            side=OrderSide.BUY,
+            good=IRON,
+            quantity=quantity,
+            price=d(price),
+            tick=0,
+        )
+
+
+def test_last_trades_are_capped_and_per_good(market: Market, two_traders: WorldState) -> None:
+    """Agents see the last N trades of goods in their interest list (design s5.2)."""
+    stock(two_traders, "woodworking_2", IRON, 20)
+    stock(two_traders, "woodworking_2", WOOD, 5)
+    for _ in range(15):
+        market.place(
+            agent_id="woodworking_2",
+            side=OrderSide.SELL,
+            good=IRON,
+            quantity=1,
+            price=d("10"),
+            tick=0,
+        )
+        market.place(
+            agent_id="woodworking_1",
+            side=OrderSide.BUY,
+            good=IRON,
+            quantity=1,
+            price=d("10"),
+            tick=0,
+        )
+
+    assert len(market.last_trades(IRON)) == 10
+    assert market.last_trades(WOOD) == []
+
+
+def test_there_is_no_official_price(market: Market) -> None:
+    """Prices exist only as the record of transactions (design v1.0 s5.2)."""
+    assert not hasattr(market, "price")
+    assert market.best_bid(IRON) is None
+    assert market.best_ask(IRON) is None
+    assert market.last_trades(IRON) == []
+
+
+@pytest.mark.invariant
+def test_an_agent_cannot_cancel_another_agents_order(
+    two_traders: WorldState, market: Market
+) -> None:
+    """Order ids are small sequential integers; a wrong one must not hit a peer."""
+    stock(two_traders, "woodworking_2", IRON, 1)
+    order = market.place(
+        agent_id="woodworking_2", side=OrderSide.SELL, good=IRON, quantity=1, price=d("10"), tick=0
+    )
+    with pytest.raises(OrderRejected, match="another agent"):
+        market.cancel(order.order_id, agent_id="woodworking_1")
+    assert order.status is OrderStatus.OPEN
+
+    market.cancel(order.order_id, agent_id="woodworking_2")
+    assert order.status is OrderStatus.CANCELLED
+
+
+def test_cancelling_an_unknown_order_is_rejected(market: Market) -> None:
+    with pytest.raises(OrderRejected, match="does not exist"):
+        market.cancel(999, agent_id="woodworking_1")
+
+
+def test_median_price_spans_a_window_of_ticks(market: Market, two_traders: WorldState) -> None:
+    """The typical price agents are told once the latest trade is far from it."""
+    stock(two_traders, "woodworking_2", IRON, 10)
+    for tick, price in ((0, "6"), (1, "6"), (2, "7"), (10, "17"), (11, "17")):
+        market.place(
+            agent_id="woodworking_2",
+            side=OrderSide.SELL,
+            good=IRON,
+            quantity=1,
+            price=d(price),
+            tick=tick,
+        )
+        market.place(
+            agent_id="woodworking_1",
+            side=OrderSide.BUY,
+            good=IRON,
+            quantity=1,
+            price=d(price),
+            tick=tick,
+        )
+
+    assert market.median_price(IRON, 0) == d("7")
+    assert market.median_price(IRON, 2) == d("17")
+    assert market.median_price(IRON, 1) == d("12.00")
+    assert market.median_price(WOOD, 0) is None
+
+
+def test_trade_count_spans_a_window_of_ticks(market: Market, two_traders: WorldState) -> None:
+    stock(two_traders, "woodworking_2", IRON, 3)
+    for tick in (0, 5, 9):
+        market.place(
+            agent_id="woodworking_2",
+            side=OrderSide.SELL,
+            good=IRON,
+            quantity=1,
+            price=d("10"),
+            tick=tick,
+        )
+        market.place(
+            agent_id="woodworking_1",
+            side=OrderSide.BUY,
+            good=IRON,
+            quantity=1,
+            price=d("10"),
+            tick=tick,
+        )
+
+    assert market.trade_count(IRON, 0) == 3
+    assert market.trade_count(IRON, 5) == 2
+    assert market.trade_count(WOOD, 0) == 0
