@@ -577,3 +577,283 @@ def test_a_broken_state_invariant_propagates_instead_of_being_a_rejection(
             )
     events = read_events(tmp_path / "run.jsonl")
     assert not any(e.type is EventType.ACTION_REJECTED for e in events)
+
+
+def test_the_activation_key_is_added_to_every_executor_event(tmp_path: Path) -> None:
+    from rpg_economy.agents import AgentAction, execute
+
+    key = {"tick": 0, "agent_id": "smithing_1", "seq": 3}
+    engine, log = _executing_engine(tmp_path)
+    sell = AgentAction(action=ActionType.SELL, target="iron", quantity=1, price=Decimal("50"))
+    with log:
+        engine.state.account("smithing_1").inventory = {Resource.IRON: 1}
+        execute(engine, "smithing_1", sell, activation=key)
+        execute(engine, "smithing_1", sell, activation=key)  # nothing left to sell
+        execute(
+            engine,
+            "smithing_1",
+            AgentAction(action=ActionType.PLACE_ORDERS, orders=(sell,)),
+            activation=key,
+        )
+        execute(engine, "smithing_1", AgentAction(action=ActionType.WAIT))
+    events = read_events(tmp_path / "run.jsonl")
+    kinds = {EventType.AGENT_OUTPUT, EventType.ACTION_EXECUTED, EventType.ACTION_REJECTED}
+    logged = [e for e in events if e.type in kinds]
+    keyed = [e for e in logged if "activation" in e.payload]
+    assert {e.type for e in keyed} == kinds
+    assert all(e.payload["activation"] == key for e in keyed)
+    # Without a key, the payloads are as before.
+    unkeyed = [e for e in logged if "activation" not in e.payload]
+    assert [e.type for e in unkeyed] == [EventType.AGENT_OUTPUT, EventType.ACTION_EXECUTED]
+
+
+# ---------------------------------------------------------------------------
+# Offline agents stay solvent enough to trade (the calibration proxy)
+# ---------------------------------------------------------------------------
+def test_an_artisan_does_not_stack_bids_for_one_input(
+    live_engine: Engine, config: SimulationConfig
+) -> None:
+    """A second bid for the same input would lock its gold and leave it idle."""
+    from rpg_economy.agents.executor import execute
+
+    account = live_engine.state.account("alchemy_1")
+    account.inventory.clear()
+    policy = policy_for(Role.ARTISAN, config)
+    bought: list[str] = []
+    for _ in range(4):
+        action = policy.decide(live_engine, account, live_engine.random.agent("alchemy_1"))
+        if action.action is ActionType.BUY:
+            bought.append(action.target)
+            execute(live_engine, "alchemy_1", action)
+    assert len(bought) == len(set(bought)), f"bid twice for the same input: {bought}"
+
+
+def test_an_artisan_sources_the_line_buyers_are_bidding_for(
+    live_engine: Engine, config: SimulationConfig
+) -> None:
+    from rpg_economy.agents.executor import execute
+
+    buyer = live_engine.state.account("warrior_1")
+    buyer.gold = Decimal("500")
+    execute(
+        live_engine,
+        "warrior_1",
+        AgentAction(
+            action=ActionType.BUY,
+            target=Product.HEALTH_POTION.value,
+            quantity=1,
+            price=Decimal("40"),
+        ),
+    )
+    account = live_engine.state.account("alchemy_1")
+    account.inventory.clear()
+    action = policy_for(Role.ARTISAN, config).decide(
+        live_engine, account, live_engine.random.agent("alchemy_1")
+    )
+    first = orders_of(action)[0]
+    assert first.action is ActionType.BUY
+    assert first.target == Resource.HERBS.value
+
+
+# ---------------------------------------------------------------------------
+# Two-sided price formation in the offline agents
+# ---------------------------------------------------------------------------
+def test_an_adventurer_sells_into_a_bid_at_the_recent_price(
+    live_engine: Engine, config: SimulationConfig
+) -> None:
+    """A buyer waiting at the going price gets the iron, however little is held."""
+    from rpg_economy.agents.executor import execute
+    from rpg_economy.agents.rule_based import reference_price
+
+    smith = live_engine.state.account("smithing_1")
+    smith.gold = Decimal("500")
+    price = reference_price(live_engine, IRON)
+    execute(
+        live_engine,
+        "smithing_1",
+        AgentAction(action=ActionType.BUY, target="iron", quantity=2, price=price),
+    )
+    account = live_engine.state.account("warrior_1")
+    fully_equip(account)
+    for product in PROVISIONS:
+        account.receive(product, 5)
+    account.receive(IRON, 1)  # below the surplus threshold
+
+    action = policy_for(Role.ADVENTURER, config).decide(
+        live_engine, account, live_engine.random.agent("warrior_1")
+    )
+    assert action.action is ActionType.SELL
+    assert action.target == "iron"
+    assert action.price == price
+
+
+def test_a_seller_concedes_while_unsold_and_asks_more_while_selling(
+    live_engine: Engine, config: SimulationConfig
+) -> None:
+    from rpg_economy.agents.rule_based import MAX_SELLER_DISCOUNT, MAX_SELLER_PREMIUM
+
+    policy = policy_for(Role.ADVENTURER, config)
+    account = live_engine.state.account("warrior_1")
+    account.receive(IRON, 10)
+    shading = [policy._unsold(account, IRON) for _ in range(4)]
+    assert shading[0] == 0
+    assert shading[1] < shading[2] < shading[3] <= MAX_SELLER_DISCOUNT
+
+    # Each offer that finds its stock sold since asks a step more.
+    premiums = []
+    for _ in range(3):
+        account.consume(IRON, 1)
+        premiums.append(policy._unsold(account, IRON))
+    assert 0 > premiums[0] > premiums[1] > premiums[2] >= -MAX_SELLER_PREMIUM
+
+
+def test_escalation_resets_once_the_buyer_is_filled(config: SimulationConfig) -> None:
+    from rpg_economy.agents.rule_based import AdventurerPolicy
+    from rpg_economy.engine import build_world
+
+    account = build_world(config).account("warrior_1")
+    policy = AdventurerPolicy(config)
+    first = policy._escalate("warrior_1", Product.HEALTH_POTION, account)
+    second = policy._escalate("warrior_1", Product.HEALTH_POTION, account)
+    assert second > first
+    account.receive(Product.HEALTH_POTION, 1)
+    assert policy._escalate("warrior_1", Product.HEALTH_POTION, account) == first
+
+
+def test_a_balanced_market_does_not_drift(config: SimulationConfig) -> None:
+    """Neither side quotes off the recent price unless pressed (no ratchet)."""
+    from rpg_economy.agents.rule_based import BUYER_PREMIUM, SELLER_MARGIN, RuleBasedPolicy
+
+    assert SELLER_MARGIN == 0
+    assert -RuleBasedPolicy.ESCALATION_STEP < BUYER_PREMIUM <= 0
+
+
+# ---------------------------------------------------------------------------
+# A refusal carries a closed code beside the engine's words
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    ("agent_id", "action", "code"),
+    [
+        (
+            "woodworking_1",
+            AgentAction(action=ActionType.SELL, target="iron", quantity=99, price=Decimal("10")),
+            "insufficient_inventory",
+        ),
+        (
+            "woodworking_1",
+            AgentAction(action=ActionType.BUY, target="iron", quantity=1, price=Decimal("99999")),
+            "insufficient_gold",
+        ),
+        (
+            "woodworking_1",
+            AgentAction(action=ActionType.PRODUCE, target="melee_weapon", quantity=1),
+            "not_allowed",
+        ),
+        (
+            "smithing_1",
+            AgentAction(action=ActionType.PRODUCE, target="health_potion", quantity=1),
+            "not_allowed",
+        ),
+        (
+            "smithing_1",
+            AgentAction(action=ActionType.PRODUCE, target="melee_weapon", quantity=1000),
+            "no_capacity",
+        ),
+        (
+            "woodworking_1",
+            AgentAction(action=ActionType.CANCEL_ORDER, quantity=999),
+            "invalid_order",
+        ),
+        (
+            "warrior_1",
+            AgentAction(action=ActionType.START_EXPEDITION, target="the_moon"),
+            "invalid_target",
+        ),
+        (
+            "woodworking_1",
+            AgentAction(action=ActionType.START_EXPEDITION, target="green_hollow"),
+            "not_allowed",
+        ),
+        (
+            "warrior_1",
+            AgentAction(action=ActionType.EQUIP, target="melee_weapon"),
+            "insufficient_inventory",
+        ),
+        (
+            "woodworking_1",
+            AgentAction(action=ActionType.SELL, target="gold", quantity=1, price=Decimal("1")),
+            "invalid_target",
+        ),
+        (
+            "woodworking_1",
+            AgentAction(action=ActionType.BUY, target="iron", quantity=1, price=Decimal("0")),
+            "invalid_order",
+        ),
+        (
+            "woodworking_1",
+            AgentAction(action=ActionType.BUY, target="iron", quantity=0, price=Decimal("1")),
+            "invalid_quantity",
+        ),
+        (
+            "woodworking_1",
+            AgentAction(action=ActionType.EQUIP, target="melee_weapon"),
+            "not_allowed",
+        ),
+    ],
+)
+def test_a_refusal_is_classified_into_a_closed_code(
+    tmp_path: Path, config: SimulationConfig, agent_id, action, code
+) -> None:
+    from rpg_economy.domain import RejectionCode
+
+    path = tmp_path / "run.jsonl"
+    with EventLogWriter(path, make_metadata(config)) as log:
+        engine = Engine(config, build_world(config), log)
+        outcome = execute(engine, agent_id, action)
+
+    assert not outcome.accepted
+    assert outcome.code is RejectionCode(code)
+    assert outcome.detail
+    rejected = next(e for e in read_events(path) if e.type is EventType.ACTION_REJECTED)
+    assert rejected.payload["code"] == code
+    assert rejected.payload["reason"] == outcome.detail
+
+
+def test_missing_inputs_have_their_own_code(live_engine: Engine) -> None:
+    from rpg_economy.domain import RejectionCode
+
+    live_engine.state.account("smithing_1").inventory.clear()
+    outcome = execute(
+        live_engine,
+        "smithing_1",
+        AgentAction(action=ActionType.PRODUCE, target="melee_weapon", quantity=1),
+    )
+    assert outcome.code is RejectionCode.MISSING_INPUTS
+
+
+def test_a_departure_while_away_is_its_own_code(live_engine: Engine) -> None:
+    from rpg_economy.domain import RejectionCode
+
+    live_engine.start_expedition("warrior_1", "green_hollow")
+    outcome = execute(
+        live_engine,
+        "warrior_1",
+        AgentAction(action=ActionType.START_EXPEDITION, target="green_hollow"),
+    )
+    assert outcome.code is RejectionCode.AGENT_AWAY
+
+
+def test_a_departure_while_resting_is_its_own_code(live_engine: Engine) -> None:
+    """Resting in town is not away: the RESULT tells the two apart, as the Director's legend does."""
+    from rpg_economy.domain import RejectionCode
+
+    account = live_engine.state.account("warrior_1")
+    account.recovering_until_tick = live_engine.tick + 3
+    outcome = execute(
+        live_engine,
+        "warrior_1",
+        AgentAction(action=ActionType.START_EXPEDITION, target="green_hollow"),
+    )
+    assert outcome.code is RejectionCode.RESTING
+    assert "resting" in outcome.detail
+    assert account.expedition is None
