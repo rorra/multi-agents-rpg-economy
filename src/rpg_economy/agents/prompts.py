@@ -15,8 +15,16 @@ never reach engine validation, which sees only the resulting action.
 
 from __future__ import annotations
 
-from rpg_economy.config.models import SimulationConfig
+import functools
+import hashlib
+import json
+from dataclasses import dataclass, field
+from decimal import Decimal
+
+from rpg_economy.agents.observation import Observation
+from rpg_economy.config.models import SimulationConfig, TraitsConfig
 from rpg_economy.domain import ActionType, Condition, ObservationSignal, Role
+from rpg_economy.logging_.metadata import clear_hash_caches, register_hash_cache
 
 #: Bump when any template below changes. Recorded in run metadata.
 PROMPT_VERSION = "2.61"
@@ -383,3 +391,362 @@ def render_world(config: SimulationConfig, role: Role | None = None) -> str:
         f"{guide}\n"
         f"{gathering}{costs}{own}"
     )
+
+
+def describe_traits(traits: TraitsConfig) -> str:
+    """Render the four trait dimensions as guidance (design v1.0 s7)."""
+
+    def band(value: object, low: str, mid: str, high: str) -> str:
+        v = float(value)
+        return low if v < 0.34 else (mid if v < 0.67 else high)
+
+    return (
+        "Your disposition:\n"
+        f"- Risk tolerance {traits.risk_tolerance}: you are "
+        + band(traits.risk_tolerance, "cautious", "balanced", "willing to gamble")
+        + ".\n"
+        f"- Time orientation {traits.time_orientation}: you weigh "
+        + band(
+            traits.time_orientation,
+            "immediate payoff over later gain",
+            "near and far outcomes about equally",
+            "long-run position over immediate payoff",
+        )
+        + ".\n"
+        f"- Commercial aggressiveness {traits.commercial_aggressiveness}: you price "
+        + band(traits.commercial_aggressiveness, "conservatively", "moderately", "assertively")
+        + ".\n"
+        f"- Adaptability {traits.adaptability}: you revise plans "
+        + band(traits.adaptability, "slowly", "readily", "quickly")
+        + " when conditions change."
+    )
+
+
+@dataclass
+class Prompt:
+    """A prompt assembled from labelled sections."""
+
+    system: str
+    sections: dict[str, str] = field(default_factory=dict)
+
+    @property
+    def user(self) -> str:
+        """The user message: every non-system section, in a fixed order."""
+        order = (
+            SECTION_TASK,
+            SECTION_STATE,
+            SECTION_MARKET,
+            SECTION_DIRECTORY,
+            SECTION_P2P,
+            SECTION_BULLETIN,
+            SECTION_INSTRUCTIONS,
+        )
+        return "\n\n".join(self.sections[name] for name in order if self.sections.get(name))
+
+    def section_sizes(self) -> dict[str, int]:
+        """Deterministic size of each section, for token apportionment."""
+        from rpg_economy.llm.tokens import estimate_tokens
+
+        sizes = {name: estimate_tokens(text) for name, text in self.sections.items() if text}
+        sizes[SECTION_SYSTEM] = estimate_tokens(self.system)
+        return sizes
+
+
+def render_directory(entries: list[dict[str, str | None]]) -> str:
+    """The static public directory, one compact record per agent.
+
+    Carries exactly what design v1.0 s6.1 permits -- id, role, specialization,
+    nothing else -- in the compact form of IMPLEMENTATION.md section 4.8.1,
+    which avoids repeating key names for every agent on every call.
+    """
+    if not entries:
+        return "Other agents: none."
+    rows = " ".join(
+        f"{entry['agent_id']}:{(entry['role'] or '')}/{entry['specialization'] or '-'}"
+        for entry in entries
+    )
+    return "Other agents (id:role/specialization, all you may know of them):\n" + rows
+
+
+def set_out_status(observation: Observation) -> str | None:
+    """Whether an adventurer can set out now and what gear that pays it lacks.
+
+    Spelled out because a model told the parts (rest, inventory) still set out
+    while resting. The gear: shown only in the "Gear" lines, gear that paid for
+    itself was bought 1 time in 88, as "ready now" alone led straight to setting
+    out; named here, 75-100% of the time while resting (2.34).
+    """
+    if observation.role != Role.ADVENTURER.value:
+        return None
+    gear = _paying_gear(observation)
+    if observation.is_away:
+        status = "not now: you are away on an expedition; you can still trade"
+        return f"{status}; meanwhile, {gear}" if gear else status
+    if observation.can_set_out_from_tick is not None:
+        status = (
+            f"not now: you are resting until tick {observation.can_set_out_from_tick} "
+            f"(it is tick {observation.tick}); trade meanwhile"
+        )
+        return f"{status}; meanwhile, {gear}" if gear else status
+    # Told "you lack gear that pays: ... bid about 48 for one",
+    # warriors set out without a weapon in 17 answers of 20.
+    return (
+        f"ready now, but you do not carry gear that pays for itself: {gear}. Set out "
+        "now and you go without it; a bid stays on the book while you are away, so "
+        "bid first and set out next"
+        if gear
+        else "ready now"
+    )
+
+
+def _paying_gear(observation: Observation) -> str | None:
+    """The gear the adventurer lacks that would add more to a trip than it costs."""
+    parts = []
+    for fact in observation.gear:
+        if not fact["pays"]:
+            continue
+        gains = [Decimal(g) for g in fact["gains"].values()]
+        adds = f"adds about {min(gains):.0f}-{max(gains):.0f} a trip"
+        item = fact["item"]
+        if fact["ask"] is not None:
+            if observation.available_gold >= Decimal(fact["ask"]):
+                parts.append(f"{item} offered at {fact['ask']} {adds} for {fact['cost_per_trip']}")
+        else:
+            # 2.35: told "adds ... for 9.75" (the cost a trip), warriors bid 9.75
+            # for a weapon worth 39; the price to bid is the item's own.
+            lasts = f", lasts {fact['durability']} trips" if fact["durability"] else ""
+            parts.append(
+                f"nobody offers {'an' if item[0] in 'aeiou' else 'a'} {item} ({adds}{lasts}): "
+                f"bid about {fact['price']} for one "
+                "(artisans craft what buyers bid for)"
+            )
+    if any(" for one " in part for part in parts) and any(
+        line.startswith("Wanted:") for line in observation.status
+    ):
+        # 2.35: holding raw materials to sell as well, it sold them and never
+        # bid (15%); the two fit in one place_orders.
+        parts.append("one place_orders can carry that bid and your raw-material sales")
+    return "; ".join(parts) or None
+
+
+def _json(payload: object) -> str:
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def build_agent_prompt(
+    observation: Observation,
+    config: SimulationConfig,
+    *,
+    condition: Condition = Condition.B,
+    task: dict | None = None,
+) -> Prompt:
+    """Build one activation's prompt from what the agent may see.
+
+    ``task`` is the Director's TASK in Condition A. Its tokens belong to the
+    agent bucket: it is the agent's own context, not peer traffic and not the
+    bulletin.
+    """
+    role = Role(observation.role)
+
+    system = "\n\n".join(
+        [
+            ROLE_BRIEF[role],
+            describe_traits(observation.traits),
+            RULES,
+            render_world(config, role),
+        ]
+    )
+
+    status = set_out_status(observation)
+    headline = (f"Setting out: {status}\n" if status else "") + "".join(
+        f"{line}\n" for line in observation.status
+    )
+    state = (
+        "Your state:\n"
+        + headline
+        + _json(
+            {
+                "agent_id": observation.agent_id,
+                "specialization": observation.specialization,
+                "tick": observation.tick,
+                "gold": observation.gold,
+                "available_gold": observation.available_gold,
+                "tax_owed": observation.tax_owed,
+                "inventory": observation.inventory,
+                "available_inventory": observation.available_inventory,
+                "equipment": observation.equipment,
+                # Named expedition_gear, the table read as gear held;
+                # warriors whose weapon broke set out "with current gear".
+                "gear_if_carried": observation.expedition_gear or None,
+                "your_success_chance": observation.success_chance or None,
+                "away_on_expedition": observation.is_away,
+                "can_set_out_from_tick": observation.can_set_out_from_tick,
+                "production_capacity_left": observation.production_capacity,
+                "your_open_orders": observation.open_orders,
+                "your_recent_trades": observation.own_trades or None,
+                "your_recent_actions": observation.history or None,
+            }
+        )
+    )
+
+    # With gold and nothing to sell, adventurers bid for raw materials
+    # on offer; the rule in the role brief alone held 42-93% of the time, and
+    # stated here, where the offers are read, 92-99%.
+    follow = (
+        "Market, for the goods you follow (raw materials: you only sell them; the market "
+        "refuses your bids for them; gear and potions: you only buy them, for your trips):\n"
+        if role is Role.ADVENTURER
+        else "Market, for the goods you follow:\n"
+    )
+    market = follow + _json([view.to_payload() for view in observation.market])
+    if observation.signals:
+        market = (
+            "Market signals (from the book and your own orders):\n"
+            + "\n".join(observation.signals)
+            + "\n\n"
+            + market
+        )
+
+    directory = render_directory(observation.directory)
+
+    sections = {
+        SECTION_STATE: state,
+        SECTION_MARKET: market,
+        SECTION_DIRECTORY: directory,
+        SECTION_INSTRUCTIONS: action_schema(condition),
+    }
+
+    if task is not None:
+        sections[SECTION_TASK] = (
+            "The Director has assigned you this task. Carry it out within your role: "
+            "a task ends in the action that serves it; wait only if no action is "
+            "worth taking now.\n" + _task_purpose(task) + _json(task)
+        )
+
+    # New messages and still-open proposals are both peer content, charged to
+    # the p2p_content bucket. They never overlap: a proposal still in the inbox
+    # is listed only as a new message (observation._open_proposals).
+    p2p = []
+    if observation.messages:
+        p2p.append(
+            "Messages addressed to you (a REQUEST or OFFER marked open can be "
+            "answered until ticks_left reaches 0; one marked open false has "
+            "expired, been replaced by a newer one or been answered, and is shown "
+            "for information only):\n" + _json(observation.message_payloads())
+        )
+    if observation.open_proposals:
+        p2p.append(
+            OPEN_PROPOSALS_HEADER + " (received earlier, not yet answered; you can "
+            "answer each until ticks_left reaches 0):\n" + _json(observation.open_proposals)
+        )
+    if p2p:
+        sections[SECTION_P2P] = "\n\n".join(p2p)
+
+    if observation.bulletin is not None:
+        from rpg_economy.orchestration.global_view import render_global_summary
+
+        sections[SECTION_BULLETIN] = "Global bulletin (published to everyone):\n" + (
+            render_global_summary(observation.bulletin)
+        )
+
+    return Prompt(system=system, sections=sections)
+
+
+def _task_purpose(task: dict) -> str:
+    """The one-line purpose of the TASK's type (design v1.0 s3.1.1), if known."""
+    from rpg_economy.domain import TaskType
+    from rpg_economy.orchestration.protocol import TASK_PURPOSES
+
+    try:
+        task_type = TaskType(task.get("type"))
+    except ValueError:
+        return ""
+    return f"{task_type.value}: {TASK_PURPOSES[task_type]}\n"
+
+
+def _task_purposes_text() -> str:
+    from rpg_economy.orchestration.protocol import TASK_PURPOSES
+
+    return _json({task_type.value: text for task_type, text in TASK_PURPOSES.items()})
+
+
+def agent_prompt_sources() -> tuple:
+    """Every function whose source shapes an agent prompt's text.
+
+    The code that assembles a prompt, not only its fixed strings: trait
+    wording, section headers, the world rules' format and the task preamble
+    live in these functions, as do the payload builders whose output is
+    serialised into the prompt -- the TASK and its context references (A),
+    peer messages (B, C), the market window, and the observation's own rows
+    (open orders, own trades). The state section, tax_owed included, is
+    rendered in build_agent_prompt itself.
+    """
+    from rpg_economy.agents.observation import (
+        MarketView,
+        Observation,
+        _open_proposals,
+        build_observation,
+    )
+    from rpg_economy.engine.market import Market
+    from rpg_economy.messaging import Message
+    from rpg_economy.orchestration.protocol import Result, ResultReference, Task
+
+    return (
+        build_agent_prompt,
+        describe_traits,
+        render_world,
+        render_directory,
+        _task_purpose,
+        Task.to_payload,
+        Task.to_agent_payload,
+        ResultReference.public_view,
+        Result.to_reference,
+        Message.to_payload,
+        Observation.message_payloads,
+        MarketView.to_payload,
+        _open_proposals,
+        build_observation,
+        Market.trades_of,
+    )
+
+
+def prompt_hashes() -> dict[str, str]:
+    """Version hashes of every template (design v1.0 s15).
+
+    Recorded in run metadata so a run can be tied to the exact wording that
+    produced it: results can be sensitive to the wording.
+
+    Computed once per process, as ``logging_.code_digest`` is: the source
+    ``inspect.getsource`` reads is the file on disk, which may have been edited
+    since it was imported. Tests that alter a template call
+    ``prompt_hashes.cache_clear()``, which clears the Director's cache too.
+    """
+    return dict(_prompt_hashes())
+
+
+@functools.cache
+def _prompt_hashes() -> tuple[tuple[str, str], ...]:
+    import inspect
+
+    templates = {
+        "agent_prompt_builder": "".join(inspect.getsource(f) for f in agent_prompt_sources()),
+        "version": PROMPT_VERSION,
+        "rules": RULES,
+        "task_purposes": _task_purposes_text(),
+        "action_schema": ACTION_SCHEMA,
+        "action_schema_a": ACTION_SCHEMA_A,
+        "open_proposals_header": OPEN_PROPOSALS_HEADER,
+        "directory_format": render_directory(
+            [{"agent_id": "a", "role": "r", "specialization": "s"}]
+        ),
+        **{f"role_brief.{role.value}": text for role, text in ROLE_BRIEF.items()},
+    }
+    return tuple(
+        (name, hashlib.sha256(text.encode("utf-8")).hexdigest()[:16])
+        for name, text in templates.items()
+    )
+
+
+# Clearing either module's cache clears both (logging_.metadata.register_hash_cache).
+register_hash_cache(_prompt_hashes.cache_clear)
+prompt_hashes.cache_clear = clear_hash_caches  # type: ignore[attr-defined]
