@@ -35,7 +35,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from rpg_economy.config.models import SimulationConfig
-from rpg_economy.domain import TaskType, TokenBucket
+from rpg_economy.domain import Resource, TaskType, TokenBucket, parse_good
 from rpg_economy.engine import Engine
 from rpg_economy.llm.budget import TokenBudget
 from rpg_economy.llm.client import LLMClient, LLMError, ProviderError
@@ -558,3 +558,165 @@ class Director:
                 continue
             references.append(recent[result_id].to_reference().model_dump(mode="json"))
         return references
+
+    def _validate_task(self, task: Task) -> None:
+        """Check a TASK against the closed vocabulary, the target's role and the world."""
+        if task.agent_id not in self._engine.state.accounts:
+            raise InvalidDirectorOutput(f"unknown agent {task.agent_id!r}")
+        if task.agent_id in self._cycle_agents:
+            raise InvalidDirectorOutput(
+                f"{task.agent_id} already has a task this macro-cycle; each agent gets "
+                f"at most one per cycle"
+            )
+        account = self._engine.state.account(task.agent_id)
+        role = account.role.value
+        allowed = TASK_TARGET_ROLES[task.type]
+        if role not in allowed:
+            raise InvalidDirectorOutput(
+                f"{task.type.value} cannot be assigned to a {role}; it targets {sorted(allowed)}"
+            )
+
+        spec = TASK_PARAMS[task.type]
+        for key, value in task.params.items():
+            kind = spec.get(key)
+            if kind is None:
+                raise InvalidDirectorOutput(
+                    f"{task.type.value} takes no parameter {key!r}; it takes {sorted(spec)}"
+                )
+            if not self._param_ok(kind, value, account):
+                raise InvalidDirectorOutput(f"invalid {key} for {task.type.value}: {value!r}")
+
+    def _param_ok(self, kind: str, value: object, account) -> bool:
+        match kind:
+            case "quantity":
+                return isinstance(value, int) and value > 0
+            case "zone":
+                return value in self._engine.zones.zone_ids
+            case "good" | "resource":
+                try:
+                    good = parse_good(str(value))
+                except ValueError:
+                    return False
+                return kind == "good" or isinstance(good, Resource)
+            case "product":
+                specialization = self._engine.production.specialization_of(account)
+                return specialization is not None and value in {
+                    product.value
+                    for product in self._engine.production.products_for(specialization)
+                }
+        return False  # pragma: no cover -- every kind in TASK_PARAMS is handled
+
+    # -- the macro-cycle ---------------------------------------------------
+    def __call__(self, engine: Engine) -> None:
+        """Run the Director's decision phase for one macro-cycle."""
+        k = self._config.time.k_activations
+        report = DirectorCycleReport(k=k)
+
+        # Budget exhausted: all LLM calls cease, the Director's included. The
+        # engine keeps running mechanical ticks to the planned horizon (s8.4).
+        if not self._budget.may_call():
+            report.closed_by_budget = True
+            report.post_exhaustion = True
+            self._last_report = report
+            return
+
+        self._open_view(engine)
+        self._cycle_agents = set()
+
+        while report.activations < k:
+            if report.calls_used >= self.call_cap:
+                report.closed_by_cap = True
+                break
+            if not self._budget.may_call():
+                report.closed_by_budget = True
+                break
+
+            try:
+                decision = self._infer(report)
+            except InvalidDirectorOutput as exc:
+                # One retry, and only if the cap still has room for it.
+                if report.calls_used >= self.call_cap:
+                    # Exhausted during the failure: close with no further call.
+                    report.closed_by_cap = True
+                    report.errors += 1
+                    self._log_error(report, str(exc), retried=False)
+                    break
+                if not self._budget.may_call():
+                    # The failed call spent the last of the budget: no retry,
+                    # because every call after exhaustion is refused (s8.4).
+                    report.closed_by_budget = True
+                    report.errors += 1
+                    self._log_error(report, str(exc), retried=False)
+                    break
+                report.retries += 1
+                try:
+                    decision = self._infer(report)
+                except InvalidDirectorOutput as retry_exc:
+                    report.errors += 1
+                    self._log_error(report, str(retry_exc), retried=True)
+                    continue
+
+            if decision.decision == "close":
+                report.closed_by_decision = True
+                engine.log_event(
+                    EventType.DIRECTOR_CYCLE_CLOSED,
+                    payload={"activations": report.activations, "calls": report.calls_used},
+                )
+                break
+
+            task = decision.task
+            assert task is not None  # guaranteed by DirectorDecision validation
+            # Set by the parse that produced this decision (the last one made).
+            dropped_context = list(self._dropped_context)
+            self._next_task += 1
+
+            # The agent's own activation is an LLM call as well. A TASK whose
+            # assigning call spent the last of the budget can never be carried
+            # out: it is logged as dropped, not as assigned, so no assigned TASK
+            # is left without its RESULT.
+            if not self._budget.may_call():
+                report.closed_by_budget = True
+                engine.log_event(
+                    EventType.DIRECTOR_TASK_DROPPED,
+                    agent_id=task.agent_id,
+                    payload={**task.to_payload(), "reason": "budget_exhausted"},
+                )
+                break
+
+            report.tasks.append(task)
+            engine.log_event(
+                EventType.DIRECTOR_TASK_ASSIGNED,
+                agent_id=task.agent_id,
+                payload={
+                    **task.to_payload(),
+                    # Context ids outside the recent window, dropped rather
+                    # than refused. Present only when there were any.
+                    **({"dropped_context": dropped_context} if dropped_context else {}),
+                },
+            )
+
+            self._cycle_agents.add(task.agent_id)
+            count, _ = self._tasked.get(task.agent_id, (0, None))
+            self._tasked[task.agent_id] = (count + 1, engine.tick)
+            result = self._activate(engine, task.agent_id, task)
+            self._recent.append(result)
+            report.activations += 1
+            engine.log_event(
+                EventType.RESULT_RETURNED,
+                agent_id=task.agent_id,
+                payload=result.to_payload(),
+            )
+
+        self._last_report = report
+
+    def _log_error(self, report: DirectorCycleReport, reason: str, *, retried: bool) -> None:
+        self._engine.log_event(
+            EventType.DIRECTOR_ERROR,
+            payload={
+                "reason": reason,
+                "retried": retried,
+                "calls_used": report.calls_used,
+                "cap": self.call_cap,
+                "cap_exhausted": report.calls_used >= self.call_cap,
+            },
+        )
