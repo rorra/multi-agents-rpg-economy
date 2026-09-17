@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from rpg_economy.domain import MessageType, Priority, Role
+from rpg_economy.domain import MessageType, Priority, Role, parse_good
 from rpg_economy.messaging import (
     P2P_MESSAGE_TYPES,
     Directory,
@@ -309,3 +309,273 @@ def test_a_proposal_can_be_answered_until_it_expires(kind: MessageType) -> None:
     )
     assert answer.type is kind
     assert answer.recipient_id == "warrior_1"
+
+
+@pytest.mark.parametrize("kind", [MessageType.ACK, MessageType.REJECT])
+def test_an_answer_to_an_expired_proposal_is_not_a_reply(kind: MessageType) -> None:
+    """Expired after the order expiry: refused like an answer to nothing."""
+    bus, _ = expiring_bus(ticks=6)
+    offer_iron(bus, tick=0)
+    with pytest.raises(NotAReply):
+        bus.send(
+            sender_id="smithing_1",
+            recipient_id="warrior_1",
+            message_type=kind,
+            tick=6,
+            payload={"good": "iron"},
+        )
+
+
+def test_open_proposal_reads_the_clock_and_skips_expired_ones() -> None:
+    bus, clock = expiring_bus(ticks=6)
+    offer_iron(bus, tick=0)
+    offer_iron(bus, tick=4)
+    clock[0] = 5
+    assert bus.open_proposal("smithing_1", "warrior_1", "iron") is MessageType.OFFER
+    clock[0] = 6
+    # The second replaced the first, and is open until its own expiry.
+    assert bus.open_proposal("smithing_1", "warrior_1", "iron") is MessageType.OFFER
+    clock[0] = 10
+    assert bus.open_proposal("smithing_1", "warrior_1", "iron") is None
+    assert bus.open_proposal("smithing_1", "warrior_1", "iron", tick=9) is None
+
+
+def test_without_an_expiry_a_proposal_stays_open(bus: MessageBus) -> None:
+    bus.send(
+        sender_id="warrior_1",
+        recipient_id="smithing_1",
+        message_type=MessageType.OFFER,
+        tick=0,
+        payload={"good": "iron"},
+    )
+    assert bus.open_proposal("smithing_1", "warrior_1", "iron", tick=10_000) is MessageType.OFFER
+
+
+def test_the_decentralized_orchestrator_sets_the_order_expiry_on_the_bus(tmp_path) -> None:
+    from rpg_economy.agents.action import AgentAction
+    from rpg_economy.agents.executor import execute
+    from rpg_economy.domain import ActionType, Condition, RejectionCode
+    from rpg_economy.engine import Engine, build_world
+    from rpg_economy.logging_ import EventLogWriter
+    from rpg_economy.orchestration import DecentralizedOrchestrator, build_directory
+    from tests.conftest import make_config, make_metadata
+
+    config = make_config(run={"condition": "B"})
+    with EventLogWriter(tmp_path / "run.jsonl", make_metadata(config)) as log:
+        engine = Engine(config, build_world(config), log)
+        messages = MessageBus(build_directory(engine))
+        DecentralizedOrchestrator(config, engine, lambda e, a: None, messages=messages)
+        expiry = config.market.order_expiry_ticks
+        assert messages.proposal_expiry_ticks == expiry
+
+        engine.state.account("warrior_1").receive(parse_good("iron"), 2)
+        offer = AgentAction(
+            action=ActionType.SEND_MESSAGE,
+            message_type=MessageType.OFFER,
+            target="iron",
+            quantity=1,
+            price="10",
+            recipient="smithing_1",
+        )
+        assert execute(
+            engine, "warrior_1", offer, messages=messages, condition=Condition.B
+        ).accepted
+
+        engine.state.tick += expiry
+        ack = AgentAction(
+            action=ActionType.SEND_MESSAGE,
+            message_type=MessageType.ACK,
+            target="iron",
+            quantity=1,
+            price="10",
+            recipient="warrior_1",
+        )
+        outcome = execute(engine, "smithing_1", ack, messages=messages, condition=Condition.B)
+        assert not outcome.accepted
+        assert outcome.code is RejectionCode.NOT_A_REPLY
+        # The ACK places no order when there is nothing open to accept.
+        assert not engine.market.open_orders_of("smithing_1")
+
+
+# ---------------------------------------------------------------------------
+# At most one open proposal per (sender, recipient, good)
+# ---------------------------------------------------------------------------
+def _propose(bus: MessageBus, kind: MessageType, tick: int = 1, good: str = "iron", **ids) -> None:
+    bus.send(
+        sender_id=ids.get("sender", "warrior_1"),
+        recipient_id=ids.get("recipient", "smithing_1"),
+        message_type=kind,
+        tick=tick,
+        payload={"good": good, "quantity": 1, "price": "10"},
+    )
+
+
+def test_an_offer_then_a_request_leaves_only_the_request_open(bus: MessageBus) -> None:
+    _propose(bus, MessageType.OFFER)
+    _propose(bus, MessageType.REQUEST)
+    assert bus.open_proposal("smithing_1", "warrior_1", "iron") is MessageType.REQUEST
+    # Both were delivered: replacing closes the older proposal, not the message.
+    assert bus.unread_count("smithing_1") == 2
+
+    bus.send(
+        sender_id="smithing_1",
+        recipient_id="warrior_1",
+        message_type=MessageType.ACK,
+        tick=2,
+        payload={"good": "iron"},
+    )
+    assert bus.open_proposal("smithing_1", "warrior_1", "iron") is None
+    # The replaced OFFER is not left behind to be answered.
+    with pytest.raises(NotAReply):
+        bus.send(
+            sender_id="smithing_1",
+            recipient_id="warrior_1",
+            message_type=MessageType.REJECT,
+            tick=2,
+            payload={"good": "iron"},
+        )
+
+
+def test_proposals_about_other_goods_or_to_other_agents_stay_open(bus: MessageBus) -> None:
+    _propose(bus, MessageType.OFFER, good="iron")
+    _propose(bus, MessageType.REQUEST, good="wood")
+    _propose(bus, MessageType.OFFER, good="iron", recipient="woodworking_1")
+    # The other direction is its own proposal too.
+    _propose(bus, MessageType.REQUEST, good="iron", sender="smithing_1", recipient="warrior_1")
+
+    assert bus.open_proposal("smithing_1", "warrior_1", "iron") is MessageType.OFFER
+    assert bus.open_proposal("smithing_1", "warrior_1", "wood") is MessageType.REQUEST
+    assert bus.open_proposal("woodworking_1", "warrior_1", "iron") is MessageType.OFFER
+    assert bus.open_proposal("warrior_1", "smithing_1", "iron") is MessageType.REQUEST
+
+
+def test_a_replacing_proposal_expires_on_its_own_clock() -> None:
+    bus, _ = expiring_bus(ticks=6)
+    offer_iron(bus, tick=0)
+    bus.send(
+        sender_id="warrior_1",
+        recipient_id="smithing_1",
+        message_type=MessageType.REQUEST,
+        tick=4,
+        payload={"good": "iron", "quantity": 1, "price": "10"},
+    )
+    assert bus.open_proposal("smithing_1", "warrior_1", "iron", tick=9) is MessageType.REQUEST
+    assert bus.open_proposal("smithing_1", "warrior_1", "iron", tick=10) is None
+
+
+def test_an_ack_after_an_offer_then_a_request_answers_the_request(tmp_path) -> None:
+    """Accepting the latest proposal, a REQUEST, places a sell, not a buy."""
+    from rpg_economy.agents.action import AgentAction
+    from rpg_economy.agents.executor import execute
+    from rpg_economy.domain import ActionType, Condition, OrderSide
+    from rpg_economy.engine import Engine, build_world
+    from rpg_economy.logging_ import EventLogWriter
+    from rpg_economy.orchestration import DecentralizedOrchestrator, build_directory
+    from tests.conftest import make_config, make_metadata
+
+    config = make_config(run={"condition": "B"})
+    with EventLogWriter(tmp_path / "run.jsonl", make_metadata(config)) as log:
+        engine = Engine(config, build_world(config), log)
+        messages = MessageBus(build_directory(engine))
+        DecentralizedOrchestrator(config, engine, lambda e, a: None, messages=messages)
+        engine.state.account("warrior_1").receive(parse_good("iron"), 2)
+        engine.state.account("smithing_1").receive(parse_good("iron"), 2)
+
+        def propose(kind: MessageType) -> None:
+            action = AgentAction(
+                action=ActionType.SEND_MESSAGE,
+                message_type=kind,
+                target="iron",
+                quantity=1,
+                price="10",
+                recipient="smithing_1",
+            )
+            assert execute(
+                engine, "warrior_1", action, messages=messages, condition=Condition.B
+            ).accepted
+
+        propose(MessageType.OFFER)
+        propose(MessageType.REQUEST)
+
+        ack = AgentAction(
+            action=ActionType.SEND_MESSAGE,
+            message_type=MessageType.ACK,
+            target="iron",
+            quantity=1,
+            price="10",
+            recipient="warrior_1",
+        )
+        assert execute(engine, "smithing_1", ack, messages=messages, condition=Condition.B).accepted
+        (order,) = engine.market.open_orders_of("smithing_1")
+        assert order.side is OrderSide.SELL
+        assert messages.open_proposal("smithing_1", "warrior_1", "iron") is None
+
+
+def test_send_returns_the_delivered_message_with_its_id(bus: MessageBus) -> None:
+    """The executor logs message_id from what send returns."""
+    kwargs = {"sender_id": "woodworking_1", "recipient_id": "warrior_1", "tick": 1}
+    first = bus.send(message_type=MessageType.OFFER, payload={"good": "iron"}, **kwargs)
+    second = bus.send(message_type=MessageType.INFORM, payload={"good": "wood"}, **kwargs)
+    assert second.message_id == first.message_id + 1
+    assert bus.inbox("warrior_1") == [first, second]
+    assert first.to_payload()["message_id"] == first.message_id
+
+
+# ---------------------------------------------------------------------------
+# Listing the proposals still open to an agent
+# ---------------------------------------------------------------------------
+def test_open_proposals_list_what_can_still_be_answered_with_ticks_left() -> None:
+    bus, clock = expiring_bus(ticks=6)
+    offer_iron(bus, tick=0)
+    bus.send(
+        sender_id="warrior_1",
+        recipient_id="smithing_1",
+        message_type=MessageType.REQUEST,
+        tick=2,
+        payload={"good": "wood", "quantity": 2, "price": "4"},
+    )
+    bus.send(
+        sender_id="warrior_1",
+        recipient_id="smithing_1",
+        message_type=MessageType.INFORM,
+        tick=2,
+        payload={"good": "herbs"},
+    )
+    bus.drain("smithing_1")  # the inbox empties; the proposals stay open
+    clock[0] = 3
+
+    listed = [(m.type, m.payload["good"], left) for m, left in bus.open_proposals("smithing_1")]
+    assert listed == [(MessageType.OFFER, "iron", 3), (MessageType.REQUEST, "wood", 5)]
+    assert bus.open_proposals("warrior_1") == []
+
+    clock[0] = 6  # the offer has expired, the request has not
+    assert [m.payload["good"] for m, _ in bus.open_proposals("smithing_1")] == ["wood"]
+    assert bus.open_proposal("smithing_1", "warrior_1", "iron") is None
+
+
+def test_an_answered_or_replaced_proposal_is_not_listed() -> None:
+    bus, clock = expiring_bus(ticks=6)
+    offer_iron(bus, tick=0)
+    offer_iron(bus, tick=1)  # replaces the first
+    assert [m.message_id for m, _ in bus.open_proposals("smithing_1")] == [2]
+    bus.send(
+        sender_id="smithing_1",
+        recipient_id="warrior_1",
+        message_type=MessageType.REJECT,
+        tick=1,
+        payload={"good": "iron"},
+    )
+    assert bus.open_proposals("smithing_1") == []
+
+
+def test_without_an_expiry_open_proposals_have_no_ticks_left(bus: MessageBus) -> None:
+    bus.send(
+        sender_id="warrior_1",
+        recipient_id="smithing_1",
+        message_type=MessageType.OFFER,
+        tick=0,
+        payload={"good": "iron"},
+    )
+    ((message, left),) = bus.open_proposals("smithing_1")
+    assert message.type is MessageType.OFFER
+    assert left is None
