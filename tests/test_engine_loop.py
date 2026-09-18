@@ -823,3 +823,509 @@ def test_storage_never_takes_anyone_below_the_floor(tmp_path: Path) -> None:
     assert state.account("woodworking_1").gold == Decimal("60")
     assert state.account("alchemy_1").gold == Decimal("50")
     assert not any(e.agent_id == "alchemy_1" for e in paid)
+
+
+def test_gold_behind_a_bid_counts_toward_the_floor(tmp_path: Path) -> None:
+    """Reserved gold is on its way to inputs: it is kept, and storage takes the rest."""
+    config = make_config(
+        economy={
+            "taxes": NO_TAXES,
+            "storage_cost_per_unit": {"artisan": 100},
+            "charge_floor": 60,
+            "floor_at_initial_gold": False,
+        }
+    )
+
+    def prepare(state: WorldState) -> None:
+        smith = state.account("smithing_1")
+        smith.gold = Decimal("100")
+        smith.reserve_gold(Decimal("70"))
+
+    state, paid = _charged(tmp_path, config, cycles=1, prepare=prepare)
+    charged = [Decimal(e.payload["amount"]) for e in paid if e.agent_id == "smithing_1"]
+
+    # min(storage due, gold above the floor 40, unreserved 30)
+    assert charged == [Decimal("30")]
+    assert state.account("smithing_1").gold == Decimal("70")
+
+
+def test_frozen_gold_does_not_count_toward_the_floor(tmp_path: Path) -> None:
+    """During a liquidity freeze the floor protects the gold the agent can still use."""
+    config = make_config(
+        economy={
+            "taxes": NO_TAXES,
+            "storage_cost_per_unit": {"artisan": 100},
+            "charge_floor": 60,
+            "floor_at_initial_gold": False,
+        }
+    )
+
+    def prepare(state: WorldState) -> None:
+        smith = state.account("smithing_1")
+        smith.gold = Decimal("200")
+        smith.freeze_gold(Decimal("0.5"))  # 100 frozen, 100 usable
+
+    state, paid = _charged(tmp_path, config, cycles=1, prepare=prepare)
+    smith = state.account("smithing_1")
+    charged = [Decimal(e.payload["amount"]) for e in paid if e.agent_id == "smithing_1"]
+
+    # min(storage due, usable gold above the floor 40, available 100)
+    assert charged == [Decimal("40")]
+    assert smith.frozen_gold == Decimal("100")
+    assert smith.available_gold == Decimal("60")
+
+
+def test_storage_leaves_what_a_pre_freeze_bid_would_freeze(tmp_path: Path) -> None:
+    """Storage cannot take gold the freeze is still owed from a pre-freeze bid.
+
+    Were the bid withdrawn, half its reservation would freeze. The floor is
+    measured net of that part, as the wealth-tax base is, so the charge is the
+    same whether the agent's gold was free or in a bid at the shock.
+    """
+    config = make_config(
+        economy={
+            "taxes": NO_TAXES,
+            "storage_cost_per_unit": {"artisan": 100},
+            "charge_floor": 60,
+            "floor_at_initial_gold": False,
+        }
+    )
+
+    def prepare(state: WorldState) -> None:
+        smith = state.account("smithing_1")
+        smith.gold = Decimal("200")
+        smith.reserve_gold(Decimal("100"))  # a bid resting at the shock
+        smith.freeze_gold(Decimal("0.5"), tick=0)  # 50 of the free 100 frozen
+
+    state, paid = _charged(tmp_path, config, cycles=1, prepare=prepare)
+    smith = state.account("smithing_1")
+    charged = [Decimal(e.payload["amount"]) for e in paid if e.agent_id == "smithing_1"]
+
+    # usable = 200 - 50 frozen - 50 frozen on release = 100; above the floor, 40.
+    assert charged == [Decimal("40")]
+    # Withdrawing the bid now leaves the agent exactly at the floor.
+    smith.release_gold(Decimal("100"), placed_tick=-1)
+    assert smith.frozen_gold == Decimal("100")
+    assert smith.available_gold == Decimal("60")
+
+
+def test_no_charges_configured_charges_nothing(tmp_path: Path) -> None:
+    config = make_config(economy={"taxes": NO_TAXES, "storage_cost_per_unit": {"artisan": 0}})
+    initial = build_world(config)
+    state, paid = _charged(tmp_path, config, cycles=3)
+    assert paid == []
+    assert state.total_gold() == initial.total_gold()
+
+
+# ---------------------------------------------------------------------------
+# Taxes: profit tax on finished products, periodic wealth tax
+# ---------------------------------------------------------------------------
+NO_STORAGE = {"artisan": 0}
+
+
+def _trade(tmp_path: Path, config: SimulationConfig, good, price: str):
+    """woodworking_1 sells one unit of ``good`` to smithing_1; return the state and log."""
+    state = build_world(config)
+    state.account("woodworking_1").receive(good, 1)
+    state.account("smithing_1").gold = Decimal("1000")
+    path = tmp_path / "run.jsonl"
+    with EventLogWriter(path, make_metadata(config)) as log:
+        engine = Engine(config, state, log)
+
+        def decide(e: Engine) -> None:
+            e.submit_order("woodworking_1", OrderSide.SELL, good, 1, price)
+            e.submit_order("smithing_1", OrderSide.BUY, good, 1, price)
+
+        engine.run_cycle(decide)
+    return state, list(read_events(path))
+
+
+def test_the_seller_of_a_product_pays_the_profit_tax(tmp_path: Path) -> None:
+    """The tax is a share of the sale's value above the input cost at the last prices."""
+    from rpg_economy.domain import Product
+
+    config = make_config(
+        economy={
+            "taxes": {"profit_rate": "0.1", "wealth_rate": 0},
+            "storage_cost_per_unit": NO_STORAGE,
+        }
+    )
+    before = build_world(config).account("woodworking_1").gold
+    state, events = _trade(tmp_path, config, Product.HEALTH_POTION, "20")
+
+    recipe = config.economy.recipes[Product.HEALTH_POTION]
+    cost = (
+        sum(
+            Decimal(str(config.economy.initial_reference_price[r.value])) * q
+            for r, q in recipe.inputs.items()
+        )
+        / recipe.output_quantity
+    )
+    due = ((Decimal("20") - cost) * Decimal("0.1")).quantize(Decimal("0.01"))
+    (trade,) = [e for e in events if e.type is EventType.TRADE_EXECUTED]
+    (tax,) = [e for e in events if e.type is EventType.TAX_PAID]
+    assert tax.agent_id == "woodworking_1"
+    assert tax.payload["tax"] == "sales"
+    assert tax.payload["good"] == "health_potion"
+    assert tax.payload["trade_id"] == trade.payload["trade_id"]
+    assert Decimal(tax.payload["profit"]) == Decimal("20") - cost
+    assert Decimal(tax.payload["amount"]) == due
+    assert tax.seq > trade.seq
+    assert state.account("woodworking_1").gold == before + Decimal("20") - due
+    assert state.account("smithing_1").gold == Decimal("980"), "the buyer pays the price only"
+
+
+def test_the_profit_tax_never_takes_a_seller_below_its_starting_gold(tmp_path: Path) -> None:
+    """Smiths taxed on every sale ended a run at 1 gold of the 150 they had."""
+    from rpg_economy.domain import Product
+
+    config = make_config(
+        economy={
+            "taxes": {"profit_rate": "0.9", "wealth_rate": 0},
+            "storage_cost_per_unit": NO_STORAGE,
+        }
+    )
+    start = config.economy.initial_gold["artisan"]
+
+    def sell_from(gold: str) -> Decimal:
+        state = build_world(config)
+        state.account("woodworking_1").gold = Decimal(gold)
+        state.account("woodworking_1").receive(Product.HEALTH_POTION, 1)
+        state.account("smithing_1").gold = Decimal("1000")
+        with EventLogWriter(tmp_path / f"{gold}.jsonl", make_metadata(config)) as log:
+            engine = Engine(config, state, log)
+
+            def decide(e: Engine) -> None:
+                e.submit_order("woodworking_1", OrderSide.SELL, Product.HEALTH_POTION, 1, "20")
+                e.submit_order("smithing_1", OrderSide.BUY, Product.HEALTH_POTION, 1, "20")
+
+            engine.run_cycle(decide)
+        return state.account("woodworking_1").gold
+
+    # Below its start, the sale's proceeds are all kept; just above it, the
+    # tax takes only the gold above the start.
+    assert sell_from("100") == Decimal("120")
+    assert sell_from(str(start - 10)) == start
+    assert sell_from(str(start + 100)) < start + 120
+
+
+def test_adventurers_pay_storage_but_never_below_their_starting_gold(tmp_path: Path) -> None:
+    config = make_config(economy={"taxes": NO_TAXES, "storage_cost_per_unit": {"adventurer": 100}})
+
+    def prepare(state: WorldState) -> None:
+        state.account("warrior_1").gold = Decimal("130")
+        state.account("ranger_1").gold = Decimal("90")
+
+    state, paid = _charged(tmp_path, config, cycles=2, prepare=prepare)
+
+    assert state.account("warrior_1").gold == config.economy.initial_gold["adventurer"]
+    assert state.account("ranger_1").gold == Decimal("90")
+    assert not any(e.agent_id == "ranger_1" for e in paid)
+
+
+def test_raw_materials_pay_no_profit_tax(tmp_path: Path) -> None:
+    config = make_config(
+        economy={
+            "taxes": {"profit_rate": "0.1", "wealth_rate": 0},
+            "storage_cost_per_unit": NO_STORAGE,
+        }
+    )
+    _, events = _trade(tmp_path, config, IRON, "10")
+    assert any(e.type is EventType.TRADE_EXECUTED for e in events)
+    assert not any(e.type is EventType.TAX_PAID for e in events)
+
+
+def _wealth_config(every: int = 3):
+    return make_config(
+        economy={
+            "taxes": {
+                "profit_rate": 0,
+                "wealth_rate": "0.1",
+                "wealth_every_ticks": every,
+                "wealth_exemption": 100,
+            },
+            "storage_cost_per_unit": NO_STORAGE,
+        }
+    )
+
+
+def test_the_wealth_tax_is_collected_every_period_on_gold_above_the_exemption(
+    tmp_path: Path,
+) -> None:
+    def prepare(state: WorldState) -> None:
+        for agent_id in state.agent_ids:
+            state.account(agent_id).gold = Decimal("50")
+        state.account("woodworking_1").gold = Decimal("300")
+        state.account("smithing_1").gold = Decimal("150")
+        state.account("warrior_1").gold = Decimal("100")
+
+    state, paid = _charged(tmp_path, _wealth_config(), cycles=7, prepare=prepare, kind="wealth")
+
+    # Collected at ticks 3 and 6, never at tick 0.
+    assert sorted({e.tick for e in paid}) == [3, 6]
+    at_3 = {e.agent_id: Decimal(e.payload["amount"]) for e in paid if e.tick == 3}
+    # Only the excess is taxed; the richer pays more; at or below the exemption pays nothing.
+    assert at_3 == {"woodworking_1": Decimal("20.00"), "smithing_1": Decimal("5.00")}
+    assert state.account("woodworking_1").gold == Decimal("300") - 20 - Decimal("18.00")
+    assert state.account("warrior_1").gold == Decimal("100")
+
+
+def test_the_wealth_tax_never_takes_reserved_gold(tmp_path: Path) -> None:
+    def prepare(state: WorldState) -> None:
+        artisan = state.account("woodworking_1")
+        artisan.gold = Decimal("300")
+        artisan.reserve_gold(Decimal("295"))
+
+    state, paid = _charged(tmp_path, _wealth_config(), cycles=4, prepare=prepare, kind="wealth")
+    (payment,) = [e for e in paid if e.agent_id == "woodworking_1"]
+    assert Decimal(payment.payload["amount"]) == Decimal("5")
+    assert state.account("woodworking_1").available_gold == ZERO
+
+
+def test_the_wealth_tax_falls_in_the_cycle_holding_its_tick(tmp_path: Path) -> None:
+    """With cycles longer than one tick, each period is still collected once."""
+    config = make_config(
+        time={"ticks_per_cycle": 5, "horizon_ticks": HORIZON},
+        economy={
+            "taxes": {"profit_rate": 0, "wealth_rate": "0.1", "wealth_every_ticks": 7},
+            "storage_cost_per_unit": NO_STORAGE,
+        },
+    )
+
+    def prepare(state: WorldState) -> None:
+        state.account("woodworking_1").gold = Decimal("1000")
+
+    _, paid = _charged(tmp_path, config, cycles=6, prepare=prepare, kind="wealth")
+    starts = [e.tick for e in paid if e.agent_id == "woodworking_1"]
+    # Cycles start at 0, 5, 10, 15, 20, 25; periods fall at 7, 14, 21, 28.
+    assert starts == [5, 10, 20, 25]
+
+
+def test_the_wealth_tax_is_collected_for_every_period_inside_a_long_cycle(
+    tmp_path: Path,
+) -> None:
+    """A period shorter than the cycle is still collected once per period, not per cycle."""
+    config = make_config(
+        time={"ticks_per_cycle": 5, "horizon_ticks": HORIZON},
+        economy={
+            "taxes": {
+                "profit_rate": 0,
+                "wealth_rate": "0.1",
+                "wealth_every_ticks": 2,
+                "wealth_exemption": 100,
+            },
+            "storage_cost_per_unit": NO_STORAGE,
+        },
+    )
+    assert HORIZON % 5 == 0
+
+    def prepare(state: WorldState) -> None:
+        state.account("woodworking_1").gold = Decimal("1000")
+
+    state, paid = _charged(tmp_path, config, cycles=3, prepare=prepare, kind="wealth")
+    mine = [e for e in paid if e.agent_id == "woodworking_1"]
+    # Cycles span 0-4, 5-9, 10-14: periods at 2, 4 | 6, 8 | 10, 12, 14.
+    assert [e.tick for e in mine] == [0, 0, 5, 5, 10, 10, 10]
+    first, second = (Decimal(e.payload["amount"]) for e in mine[:2])
+    assert (first, second) == (Decimal("90.00"), Decimal("81.00")), "each on what is left"
+    total = sum((Decimal(e.payload["amount"]) for e in mine), Decimal(0))
+    assert state.account("woodworking_1").gold == Decimal("1000") - total
+
+
+def test_the_wealth_tax_excludes_frozen_gold_from_its_base(tmp_path: Path) -> None:
+    """Frozen gold is not the agent's to use, so it is not taxed."""
+
+    def prepare(state: WorldState) -> None:
+        artisan = state.account("woodworking_1")
+        artisan.gold = Decimal("300")
+        artisan.frozen_gold = Decimal("100")
+
+    state, paid = _charged(tmp_path, _wealth_config(), cycles=4, prepare=prepare, kind="wealth")
+    (payment,) = [e for e in paid if e.agent_id == "woodworking_1"]
+    # (300 - 100 frozen - 100 exempt) * 0.1
+    assert payment.payload["taxable"] == "100"
+    assert Decimal(payment.payload["amount"]) == Decimal("10.00")
+    assert Decimal(payment.payload["owed"]) == ZERO
+    assert state.account("woodworking_1").tax_arrears == ZERO
+
+
+def _parked_bid_run(tmp_path: Path, release: str, cycles: int):
+    """woodworking_1 parks all its gold in a bid at tick 0; return the state, log and before."""
+    config = _wealth_config()
+    state = build_world(config)
+    for agent_id in state.agent_ids:
+        state.account(agent_id).gold = Decimal("50")
+    state.account("woodworking_1").gold = Decimal("300")
+    before = state.total_gold()
+    path = tmp_path / "run.jsonl"
+    with EventLogWriter(path, make_metadata(config)) as log:
+        engine = Engine(config, state, log)
+
+        def decide(e: Engine) -> None:
+            if e.tick == 0:
+                e.submit_order("woodworking_1", OrderSide.BUY, IRON, 300, "1")
+            elif e.tick == 3 and release == "cancel":
+                (order,) = e.market.open_orders_of("woodworking_1")
+                e.market.cancel(order.order_id)
+
+        for _ in range(cycles):
+            engine.run_cycle(decide)
+    return state, path, before
+
+
+@pytest.mark.invariant
+@pytest.mark.parametrize("release", ["cancel", "expiry"])
+def test_parking_gold_in_a_bid_does_not_avoid_the_wealth_tax(tmp_path: Path, release: str) -> None:
+    """What the bid kept from the collection becomes arrears, paid once the bid goes."""
+    state, path, before = _parked_bid_run(tmp_path, release, cycles=12)
+    events = list(read_events(path))
+    mine = [e for e in events if e.type is EventType.TAX_PAID and e.agent_id == "woodworking_1"]
+
+    (at_3,) = [e for e in mine if e.tick == 3]
+    # The whole 20 is due; nothing is available, so it is all owed.
+    assert at_3.payload["amount"] == "0"
+    assert (Decimal(at_3.payload["due"]), Decimal(at_3.payload["owed"])) == (20, 20)
+
+    arrears = [e for e in mine if e.payload.get("arrears")]
+    assert arrears, "the arrears are collected once the bid releases its gold"
+    released = next(
+        e.tick
+        for e in events
+        if e.type in (EventType.ORDER_CANCELLED, EventType.ORDER_EXPIRED)
+        and e.agent_id == "woodworking_1"
+    )
+    assert arrears[0].tick == released + 1, "at the first cycle start after the release"
+    assert sum(Decimal(e.payload["amount"]) for e in mine) == sum(
+        Decimal(e.payload["due"]) for e in mine if not e.payload.get("arrears")
+    ), "everything assessed is eventually paid"
+    assert state.account("woodworking_1").tax_arrears == ZERO
+    assert Decimal(mine[-1].payload["owed"]) == ZERO
+    if release == "cancel":
+        # Paid before the next collection, so the same as never parking: 20, 18, 16.20.
+        assert sum(Decimal(e.payload["amount"]) for e in mine) == Decimal("54.20")
+    # Gold is conserved: only what the log says was paid left the economy.
+    assert state.total_gold() == before + gold_flow(path)
+
+
+def test_arrears_are_paid_before_the_next_collection(tmp_path: Path) -> None:
+    config = _wealth_config()
+    state = build_world(config)
+    for agent_id in state.agent_ids:
+        state.account(agent_id).gold = Decimal("50")
+    state.account("woodworking_1").gold = Decimal("300")
+    path = tmp_path / "run.jsonl"
+    with EventLogWriter(path, make_metadata(config)) as log:
+        engine = Engine(config, state, log)
+        for _ in range(3):
+            engine.run_cycle(None)
+        assert engine.tick == 3
+        state.account("woodworking_1").tax_arrears = Decimal("50")
+        engine.run_cycle(None)
+
+    paid = [
+        e
+        for e in read_events(path)
+        if e.type is EventType.TAX_PAID and e.agent_id == "woodworking_1"
+    ]
+    first, second = paid
+    assert first.tick == second.tick == 3
+    assert first.seq < second.seq
+    assert first.payload == {"tax": "wealth", "amount": "50", "arrears": True, "owed": "0"}
+    # The new tax is assessed on what is left after the arrears: 250 - 100 exempt.
+    assert second.payload["taxable"] == "150"
+    assert second.payload["amount"] == "15.00"
+    assert state.account("woodworking_1").gold == Decimal("235.00")
+
+
+def test_arrears_never_take_reserved_or_frozen_gold(tmp_path: Path) -> None:
+    def prepare(state: WorldState) -> None:
+        artisan = state.account("woodworking_1")
+        artisan.gold = Decimal("100")
+        artisan.reserve_gold(Decimal("60"))
+        artisan.frozen_gold = Decimal("30")
+        artisan.tax_arrears = Decimal("25")
+
+    state, paid = _charged(tmp_path, _wealth_config(), cycles=2, prepare=prepare, kind="wealth")
+    (payment,) = [e for e in paid if e.agent_id == "woodworking_1"]
+    assert payment.payload["arrears"] is True
+    assert Decimal(payment.payload["amount"]) == Decimal("10")
+    assert Decimal(payment.payload["owed"]) == Decimal("15")
+    artisan = state.account("woodworking_1")
+    assert artisan.gold == Decimal("90")
+    assert artisan.available_gold == ZERO
+    assert artisan.tax_arrears == Decimal("15")
+
+
+@pytest.mark.invariant
+def test_arrears_are_a_lien_gold_freed_by_a_bid_cannot_be_rebid(tmp_path: Path) -> None:
+    """Re-bidding gold an expiring bid frees, ahead of the collection, evades nothing.
+
+    The evader parks all its gold in a bid over the collection, then tries to
+    re-bid everything the expiry frees. The owed part is refused; the arrears
+    are collected at the next cycle start, and gold is conserved throughout.
+    """
+    config = _wealth_config()
+    state = build_world(config)
+    for agent_id in state.agent_ids:
+        state.account(agent_id).gold = Decimal("50")
+    state.account("woodworking_1").gold = Decimal("300")
+    before = state.total_gold()
+    refused: list[tuple[int, Decimal]] = []
+    path = tmp_path / "run.jsonl"
+    with EventLogWriter(path, make_metadata(config)) as log:
+        engine = Engine(config, state, log)
+
+        def decide(e: Engine) -> None:
+            account = e.state.account("woodworking_1")
+            if e.market.open_orders_of("woodworking_1"):
+                return
+            try:
+                e.submit_order("woodworking_1", OrderSide.BUY, IRON, int(account.free_gold), "1")
+            except OrderRejected:
+                refused.append((e.tick, account.tax_arrears))
+                if account.available_gold >= 1:
+                    e.submit_order(
+                        "woodworking_1", OrderSide.BUY, IRON, int(account.available_gold), "1"
+                    )
+            # Nothing owed is ever committed to a bid.
+            assert account.reserved_gold <= account.gold - account.frozen_gold - account.tax_arrears
+
+        for _ in range(16):
+            engine.run_cycle(decide)
+
+    events = list(read_events(path))
+    mine = [e for e in events if e.type is EventType.TAX_PAID and e.agent_id == "woodworking_1"]
+    assert refused, "the freed gold under the lien cannot back a new bid"
+    assert all(owed > ZERO for _, owed in refused)
+    expired = [
+        e.tick
+        for e in events
+        if e.type is EventType.ORDER_EXPIRED and e.agent_id == "woodworking_1"
+    ]
+    arrears = [e for e in mine if e.payload.get("arrears")]
+    assert arrears, "the arrears are collected even though the agent always re-bids"
+    assert arrears[0].tick == expired[0] + 1, "at the first cycle start after the expiry"
+    assert all(Decimal(e.payload["amount"]) > ZERO for e in arrears)
+    # Parking again after each expiry defers the latest assessment, never
+    # escapes it: what is not paid yet is still owed.
+    owed = state.account("woodworking_1").tax_arrears
+    assert sum(Decimal(e.payload["amount"]) for e in mine) + owed == sum(
+        Decimal(e.payload["due"]) for e in mine if not e.payload.get("arrears")
+    ), "nothing assessed is forgiven"
+    assert owed == Decimal(mine[-1].payload["owed"])
+    assert state.total_gold() == before + gold_flow(path)
+
+
+def test_the_arrears_lien_leaves_available_gold_and_blocks_reservations() -> None:
+    from rpg_economy.engine.state import InsufficientFunds
+
+    account = build_world(_wealth_config()).account("woodworking_1")
+    account.gold = Decimal("100")
+    account.reserve_gold(Decimal("40"))
+    account.tax_arrears = Decimal("50")
+    assert account.free_gold == Decimal("60")
+    assert account.available_gold == Decimal("10")
+    with pytest.raises(InsufficientFunds):
+        account.reserve_gold(Decimal("11"))
+    account.tax_arrears = Decimal("500")
+    assert account.available_gold == ZERO, "never below zero"
