@@ -9,7 +9,13 @@ import pytest
 
 from rpg_economy.agents.llm_agent import LLMAgentRunner
 from rpg_economy.agents.offline import json_action
-from rpg_economy.domain import Priority, ResultStatus, Role, TaskType, TokenBucket
+from rpg_economy.domain import (
+    Priority,
+    ResultStatus,
+    Role,
+    TaskType,
+    TokenBucket,
+)
 from rpg_economy.engine import Engine, build_world
 from rpg_economy.llm import MockLLMClient, TokenLedger, always, scripted
 from rpg_economy.logging_ import EventLogWriter, EventType, read_events
@@ -1209,3 +1215,191 @@ def test_a_zero_window_shows_no_recent_results_and_admits_no_context(rig) -> Non
     assert all(call.payload["recent_results"] == [] for call in calls)
     assigned = [e for e in events if e.type is EventType.DIRECTOR_TASK_ASSIGNED]
     assert assigned[1].payload["dropped_context"] == ["result-1"]
+
+
+def test_a_zero_window_from_the_config_is_honoured(tmp_path: Path) -> None:
+    config = make_config(run={"condition": "A"}, observability={"director_recent_results": 0})
+    with EventLogWriter(tmp_path / "run.jsonl", make_metadata(config)) as log:
+        engine = Engine(config, build_world(config), log)
+        ledger = TokenLedger()
+        agents = LLMAgentRunner(config, MockLLMClient(always(json_action(action="wait"))), ledger)
+        director = Director(
+            config,
+            engine,
+            MockLLMClient(scripted([assign("woodworking_1"), CLOSE])),
+            ledger,
+            TaskActivationRunner(config, agents),
+        )
+        director(engine)
+    assert len(director.recent_results) == 1
+    assert director._recent_references() == []
+
+
+# ---------------------------------------------------------------------------
+# Formatting parity with the agents
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("task", [{}, None])
+def test_a_close_with_an_empty_task_is_a_close(task) -> None:
+    from rpg_economy.orchestration.director import _normalize_decision
+
+    normalized = _normalize_decision({"decision": "close", "task": task})
+    assert normalized == {"decision": "close"}
+    assert DirectorDecision.model_validate(normalized).decision == "close"
+
+
+def test_a_close_with_a_real_task_is_still_invalid(rig) -> None:
+    from rpg_economy.orchestration.protocol import InvalidDirectorOutput
+
+    config, engine, ledger, build = rig
+    director, _ = build(always(CLOSE))
+    text = json.dumps(
+        {
+            "decision": "close",
+            "task": {"type": "ANALYZE_MARKET", "agent_id": "woodworking_1", "params": {}},
+        }
+    )
+    with pytest.raises(InvalidDirectorOutput):
+        director._parse(text)
+
+
+def test_a_close_with_an_empty_task_closes_the_cycle(rig) -> None:
+    config, engine, ledger, build = rig
+    director, client = build(always(json.dumps({"decision": "close", "task": {}})))
+    director(engine)
+    assert director.last_report.closed_by_decision
+    assert director.last_report.errors == 0
+    assert client.calls == 1
+
+
+def test_id_like_params_fold_spaces_and_hyphens() -> None:
+    from rpg_economy.orchestration.director import _normalize_decision
+
+    normalized = _normalize_decision(
+        {
+            "decision": "assign",
+            "task": {
+                "type": "analyze market",
+                "agent_id": "smithing_1",
+                "params": {
+                    "good": "Arcane Crystal",
+                    "resource": "arcane-crystal",
+                    "product": " Melee  Weapon ",
+                    "zone": "Iron-Marches",
+                },
+            },
+        }
+    )
+    assert normalized["task"]["params"] == {
+        "good": "arcane_crystal",
+        "resource": "arcane_crystal",
+        "product": "melee_weapon",
+        "zone": "iron_marches",
+    }
+
+
+def test_a_task_naming_a_good_with_spaces_is_assigned(rig) -> None:
+    config, engine, ledger, build = rig
+    director, _ = build(
+        scripted(
+            [
+                task_with(
+                    "smithing_1", TaskType.MANAGE_PROCUREMENT, params={"good": "Arcane Crystal"}
+                ),
+                CLOSE,
+            ]
+        )
+    )
+    director(engine)
+    assert director.last_report.errors == 0
+    assert director.last_report.tasks[0].params == {"good": "arcane_crystal"}
+
+
+# ---------------------------------------------------------------------------
+# Each call says whether it was billed, as the client reports it
+# ---------------------------------------------------------------------------
+class _BilledClient(MockLLMClient):
+    """A mock whose completions claim to be billed, as a real provider's are."""
+
+    def complete(self, *, system: str, user: str):
+        from dataclasses import replace
+
+        return replace(super().complete(system=system, user=user), billed=True)
+
+
+@pytest.mark.parametrize("billed", [False, True])
+def test_a_director_call_records_whether_it_was_billed(rig, billed: bool) -> None:
+    config, engine, ledger, _ = rig
+    agents = LLMAgentRunner(config, MockLLMClient(always(json_action(action="wait"))), ledger)
+    client = (_BilledClient if billed else MockLLMClient)(scripted([CLOSE]))
+    director = Director(config, engine, client, ledger, TaskActivationRunner(config, agents))
+    director(engine)
+    engine.log.close()
+
+    (call,) = [e for e in read_events(engine.log.path) if e.type is EventType.DIRECTOR_CALL]
+    assert call.payload["billed"] is billed
+
+
+def test_clearing_either_prompt_hash_cache_clears_both(monkeypatch) -> None:
+    """A cleared agent cache beside a stale Director one would mix two wordings."""
+    from rpg_economy.agents import prompts
+    from rpg_economy.orchestration import director as director_module
+
+    director_module.prompt_hashes()
+    prompts.prompt_hashes()
+    try:
+        monkeypatch.setattr(prompts, "RULES", prompts.RULES + " edited")
+        monkeypatch.setattr(director_module, "DIRECTOR_SYSTEM", "edited")
+        before = director_module.prompt_hashes()
+        # The agents' clear reaches the Director's cache, with no import between them.
+        prompts.prompt_hashes.cache_clear()
+        after = director_module.prompt_hashes()
+        assert after["rules"] != before["rules"]
+        assert after["director_system"] != before["director_system"]
+        # And the other way round.
+        monkeypatch.undo()
+        director_module.prompt_hashes.cache_clear()
+        assert prompts.prompt_hashes()["rules"] == before["rules"]
+    finally:
+        monkeypatch.undo()
+        prompts.prompt_hashes.cache_clear()
+
+
+def test_the_roster_counts_each_agents_tasks(rig) -> None:
+    """Pilot: a Director that only ever saw roles tasked one agent all run."""
+    config, engine, ledger, build = rig
+    director, _ = build(scripted([assign("woodworking_1"), CLOSE]))
+    director(engine)
+    prompt = director._user_prompt(director.last_report)
+    assert "woodworking_1:artisan/woodworking[1,t" in prompt
+    assert "warrior_1:adventurer/warrior[0]" in prompt
+
+
+def test_the_roster_lists_the_least_tasked_first(rig) -> None:
+    """Pilot: in id order the Director never reached the agents sorted last."""
+    config, engine, ledger, build = rig
+    director, _ = build(scripted([assign("alchemy_1"), CLOSE]))
+    director(engine)
+    prompt = director._user_prompt(director.last_report)
+    roster = prompt.split("listed fewest tasks first):\n")[1].split("\n")[0].split()
+    ids = [entry.split(":")[0] for entry in roster]
+    assert ids[-1] == "alchemy_1"
+    assert ids[:-1] == sorted(ids[:-1])  # the untasked, by id
+
+
+def test_the_director_is_told_an_untasked_agent_does_nothing() -> None:
+    from rpg_economy.orchestration.director import DIRECTOR_SYSTEM
+
+    assert "An agent never tasked does nothing" in DIRECTOR_SYSTEM
+    assert "EVALUATE_EXPEDITION" in DIRECTOR_SYSTEM
+
+
+def test_an_agent_gets_at_most_one_task_per_cycle(rig) -> None:
+    """As in B and C, where an agent is activated at most once per cycle."""
+    config, engine, ledger, build = rig
+    director, _ = build(
+        scripted([assign("woodworking_1"), assign("woodworking_1"), assign("warrior_1"), CLOSE])
+    )
+    director(engine)
+    tasked = [t.agent_id for t in director.last_report.tasks]
+    assert tasked == ["woodworking_1", "warrior_1"]
+    assert director.last_report.retries >= 1
