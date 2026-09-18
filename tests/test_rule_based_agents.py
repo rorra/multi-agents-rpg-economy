@@ -18,6 +18,7 @@ from rpg_economy.config.models import SimulationConfig
 from rpg_economy.domain import (
     ActionType,
     AdventurerSubclass,
+    MessageType,
     OrderSide,
     Priority,
     Product,
@@ -857,3 +858,498 @@ def test_a_departure_while_resting_is_its_own_code(live_engine: Engine) -> None:
     assert outcome.code is RejectionCode.RESTING
     assert "resting" in outcome.detail
     assert account.expedition is None
+
+
+def test_equipping_while_on_an_expedition_is_refused_as_away(live_engine: Engine) -> None:
+    """Gear is fixed when an adventurer sets out; trading while away stays allowed."""
+    from rpg_economy.domain import RejectionCode
+
+    account = live_engine.state.account("warrior_1")
+    live_engine.start_expedition("warrior_1", "green_hollow")
+    account.receive(Product.MELEE_WEAPON, 1)
+    before = dict(account.equipment)
+
+    outcome = execute(
+        live_engine, "warrior_1", AgentAction(action=ActionType.EQUIP, target="melee_weapon")
+    )
+    assert outcome.code is RejectionCode.AGENT_AWAY
+    assert account.equipment == before
+    assert account.quantity(Product.MELEE_WEAPON) == 1
+
+    account.receive(Resource.IRON, 1)
+    sell = AgentAction(action=ActionType.SELL, target="iron", quantity=1, price=Decimal("10"))
+    assert execute(live_engine, "warrior_1", sell).accepted
+
+
+def test_an_artisan_cannot_equip_even_what_it_holds(live_engine: Engine) -> None:
+    from rpg_economy.domain import RejectionCode
+
+    account = live_engine.state.account("smithing_1")
+    account.receive(Product.MELEE_WEAPON, 1)
+    outcome = execute(
+        live_engine, "smithing_1", AgentAction(action=ActionType.EQUIP, target="melee_weapon")
+    )
+    assert outcome.code is RejectionCode.NOT_ALLOWED
+    assert account.equipment == {}
+    assert account.quantity(Product.MELEE_WEAPON) >= 1
+
+
+def test_equipping_a_non_equipment_product_is_an_invalid_target(live_engine: Engine) -> None:
+    """Not equipment is checked before stock: holding none must not read as a shortage."""
+    from rpg_economy.domain import RejectionCode
+
+    account = live_engine.state.account("warrior_1")
+    account.inventory.pop(Product.HEALTH_POTION, None)
+    outcome = execute(
+        live_engine, "warrior_1", AgentAction(action=ActionType.EQUIP, target="health_potion")
+    )
+    assert outcome.code is RejectionCode.INVALID_TARGET
+
+    account.receive(Product.HEALTH_POTION, 1)
+    outcome = execute(
+        live_engine, "warrior_1", AgentAction(action=ActionType.EQUIP, target="health_potion")
+    )
+    assert outcome.code is RejectionCode.INVALID_TARGET
+    assert account.quantity(Product.HEALTH_POTION) == 1
+
+
+def test_equipping_missing_equipment_is_insufficient_inventory(live_engine: Engine) -> None:
+    from rpg_economy.domain import RejectionCode
+
+    account = live_engine.state.account("warrior_1")
+    account.inventory.pop(Product.ARMOR, None)
+    outcome = execute(
+        live_engine, "warrior_1", AgentAction(action=ActionType.EQUIP, target="armor")
+    )
+    assert outcome.code is RejectionCode.INSUFFICIENT_INVENTORY
+
+
+def test_an_accepted_action_has_no_rejection_code(live_engine: Engine) -> None:
+    outcome = execute(live_engine, "woodworking_1", AgentAction(action=ActionType.WAIT))
+    assert outcome.accepted
+    assert outcome.code is None
+
+
+def test_an_unrecognised_refusal_falls_back_to_other() -> None:
+    from rpg_economy.agents.executor import rejection_code
+    from rpg_economy.domain import RejectionCode
+
+    assert rejection_code(RuntimeError("something unforeseen")) is RejectionCode.OTHER
+    from rpg_economy.messaging import MessageRejected, NotAReply
+
+    assert rejection_code(NotAReply("x")) is RejectionCode.NOT_A_REPLY
+    assert rejection_code(MessageRejected("x")) is RejectionCode.MESSAGE_REJECTED
+    assert rejection_code(ZeroDivisionError("x")) is RejectionCode.INVALID_QUANTITY
+
+
+# ---------------------------------------------------------------------------
+# Offline adventurers and artisans keep the market moving
+# ---------------------------------------------------------------------------
+def test_an_adventurer_offers_even_a_single_gathered_unit(
+    live_engine: Engine, config: SimulationConfig
+) -> None:
+    """With no buyer waiting, anything gathered still goes on the book as an ask."""
+    from rpg_economy.agents.rule_based import ADVENTURER_STOCK_THRESHOLD
+
+    assert ADVENTURER_STOCK_THRESHOLD == 0
+    account = live_engine.state.account("warrior_1")
+    fully_equip(account)
+    for product in PROVISIONS:
+        account.receive(product, 5)
+    account.receive(IRON, 1)
+    assert live_engine.market.best_bid(IRON) is None
+
+    action = policy_for(Role.ADVENTURER, config).decide(
+        live_engine, account, live_engine.random.agent("warrior_1")
+    )
+    assert action.action is ActionType.SELL
+    assert action.target == "iron"
+    assert action.quantity == 1
+    execute(live_engine, "warrior_1", action)
+    assert live_engine.market.best_ask(IRON) == action.price
+
+
+def test_an_alchemist_never_brews_past_its_stock_cap(
+    live_engine: Engine, config: SimulationConfig
+) -> None:
+    """The batch counts recipe runs; the cap counts units: four, or the engine's
+    craft limit when lower (held at it, the policy kept choosing to craft and
+    was refused every time, never reaching its selling branch)."""
+    from rpg_economy.agents.rule_based import ArtisanPolicy
+
+    policy = ArtisanPolicy(config)
+    account = live_engine.state.account("alchemy_1")
+    account.inventory.clear()
+    for resource in Resource:
+        account.receive(resource, 40)
+    potion = Product.HEALTH_POTION
+    cap = min(4, config.economy.craft_stock_limit or 4)
+    assert policy._stock_cap(potion) == cap
+    assert live_engine.production.capacity_of(account) > 2, "capacity must not be what binds"
+
+    produced = 0
+    for _ in range(6):
+        action = policy.decide(live_engine, account, live_engine.random.agent("alchemy_1"))
+        if action.action is not ActionType.PRODUCE:
+            continue
+        assert execute(live_engine, "alchemy_1", action).accepted
+        produced += 1
+        for product in PROVISIONS:
+            assert account.quantity(product) <= policy._stock_cap(product), product
+    assert produced
+    assert account.quantity(potion) == cap
+
+
+def _alchemist_with_stock_on_the_book(engine: Engine):
+    from rpg_economy.agents.rule_based import ArtisanPolicy
+
+    policy = ArtisanPolicy(engine.config)
+    account = engine.state.account("alchemy_1")
+    account.inventory.clear()
+    for product in (Product.HEALTH_POTION, Product.MANA_POTION):
+        cap = policy._stock_cap(product)
+        account.receive(product, cap)
+        engine.submit_order("alchemy_1", OrderSide.SELL, product, cap, "500")
+        assert account.available_quantity(product) == 0
+    return account
+
+
+def test_an_artisan_counts_stock_on_the_book_before_sourcing(
+    live_engine: Engine, config: SimulationConfig
+) -> None:
+    """Units offered and unsold are still unsold: no inputs for more of them."""
+    account = _alchemist_with_stock_on_the_book(live_engine)
+
+    action = policy_for(Role.ARTISAN, config).decide(
+        live_engine, account, live_engine.random.agent("alchemy_1")
+    )
+    assert action.action is not ActionType.BUY
+    assert action.action is ActionType.WAIT
+
+
+def test_an_artisan_counts_stock_on_the_book_before_producing(
+    live_engine: Engine, config: SimulationConfig
+) -> None:
+    account = _alchemist_with_stock_on_the_book(live_engine)
+    for resource in Resource:
+        account.receive(resource, 40)
+
+    action = policy_for(Role.ARTISAN, config).decide(
+        live_engine, account, live_engine.random.agent("alchemy_1")
+    )
+    assert action.action is not ActionType.PRODUCE
+
+
+def test_an_adventurer_holds_back_a_resource_while_its_price_is_very_low(
+    live_engine: Engine, config: SimulationConfig
+) -> None:
+    """It waits a while for a better price, then sells at what the market pays."""
+    from rpg_economy.agents.rule_based import HOLD_FRACTION, HOLD_PATIENCE, AdventurerPolicy
+
+    policy = AdventurerPolicy(config)
+    account = live_engine.state.account("warrior_1")
+    start = Decimal(config.economy.initial_reference_price["wood"])
+    floor = (start * HOLD_FRACTION).quantize(Decimal("0.01"))
+    # A glut: wood last traded at a third of its starting price.
+    live_engine.state.account("ranger_1").receive(Resource.WOOD, 1)
+    live_engine.submit_order("ranger_1", OrderSide.SELL, Resource.WOOD, 1, str(start / 3))
+    live_engine.submit_order("smithing_1", OrderSide.BUY, Resource.WOOD, 1, str(start / 3))
+
+    assert policy._hold_floor(live_engine, account, Resource.WOOD) == floor
+    live_engine.state.tick += HOLD_PATIENCE
+    assert policy._hold_floor(live_engine, account, Resource.WOOD) == Decimal(0)
+
+
+def test_an_adventurer_sells_freely_at_a_normal_price(
+    live_engine: Engine, config: SimulationConfig
+) -> None:
+    from rpg_economy.agents.rule_based import AdventurerPolicy
+
+    account = live_engine.state.account("warrior_1")
+    assert AdventurerPolicy(config)._hold_floor(live_engine, account, IRON) == Decimal(0)
+
+
+def test_an_artisan_never_bids_more_for_an_input_than_its_product_returns(
+    live_engine: Engine, config: SimulationConfig
+) -> None:
+    from rpg_economy.agents.rule_based import ArtisanPolicy
+
+    policy = ArtisanPolicy(config)
+    recipe = config.economy.recipes[Product.MELEE_WEAPON]
+    ceiling = policy._input_ceiling(live_engine, Product.MELEE_WEAPON, IRON)
+    value = reference_price(live_engine, Product.MELEE_WEAPON) * recipe.output_quantity
+    leather = reference_price(live_engine, Resource.LEATHER) * recipe.inputs[Resource.LEATHER]
+    assert ceiling == ((value - leather) / recipe.inputs[IRON]).quantize(Decimal("0.01"))
+
+    # Blocked for a long time, the escalated bid still stops at the ceiling.
+    account = live_engine.state.account("smithing_1")
+    account.inventory.clear()
+    for _ in range(40):
+        action = policy.decide(live_engine, account, live_engine.random.agent("smithing_1"))
+        if action.action is ActionType.BUY and action.target == IRON.value:
+            assert action.price <= ceiling
+
+
+def _offered(tmp_path: Path, price: str = "9", quantity: int = 2):
+    """warrior_1 has offered woodworking_1 iron; returns engine, log and bus."""
+    from rpg_economy.messaging import MessageBus
+    from rpg_economy.orchestration import build_directory
+
+    engine, log = _executing_engine(tmp_path)
+    bus = MessageBus(build_directory(engine))
+    bus.send(
+        sender_id="warrior_1",
+        recipient_id="woodworking_1",
+        message_type=MessageType.OFFER,
+        tick=0,
+        payload={"good": "iron", "quantity": quantity, "price": price},
+    )
+    return engine, log, bus
+
+
+def _ack(
+    quantity: int | None = 2, price: str | None = "9", recipient: str = "warrior_1"
+) -> AgentAction:
+    return AgentAction(
+        action=ActionType.SEND_MESSAGE,
+        message_type=MessageType.ACK,
+        target="iron",
+        quantity=quantity,
+        price=None if price is None else Decimal(price),
+        recipient=recipient,
+    )
+
+
+def test_accepting_an_offer_places_the_buy_in_the_same_action(tmp_path: Path) -> None:
+    engine, log, bus = _offered(tmp_path)
+    with log:
+        outcome = execute(engine, "woodworking_1", _ack(), messages=bus)
+    assert outcome.accepted
+    bids = [o for o in engine.market.open_orders_of("woodworking_1") if o.side is OrderSide.BUY]
+    assert [(o.good, o.quantity, o.limit_price) for o in bids] == [(IRON, 2, Decimal("9.00"))]
+    assert bus.inbox("warrior_1")[-1].type is MessageType.ACK
+
+
+def test_message_sent_names_the_bus_message_id(tmp_path: Path) -> None:
+    """message_sent carries the id message_delivered names, so the two join."""
+    engine, log, bus = _offered(tmp_path)
+    with log:
+        assert execute(engine, "woodworking_1", _ack(), messages=bus).accepted
+    sent = [e for e in read_events(tmp_path / "run.jsonl") if e.type is EventType.MESSAGE_SENT]
+    assert len(sent) == 1
+    ack = bus.inbox("warrior_1")[-1]
+    assert sent[0].payload["message_id"] == ack.message_id
+
+
+def test_accepting_a_request_places_the_sell(tmp_path: Path) -> None:
+    from rpg_economy.messaging import MessageBus
+    from rpg_economy.orchestration import build_directory
+
+    engine, log = _executing_engine(tmp_path)
+    bus = MessageBus(build_directory(engine))
+    engine.state.account("woodworking_1").receive(IRON, 3)
+    bus.send(
+        sender_id="smithing_1",
+        recipient_id="woodworking_1",
+        message_type=MessageType.REQUEST,
+        tick=0,
+        payload={"good": "iron", "quantity": 3, "price": "11"},
+    )
+    ack = _ack(quantity=3, price="11", recipient="smithing_1")
+    with log:
+        assert execute(engine, "woodworking_1", ack, messages=bus).accepted
+    asks = [o for o in engine.market.open_orders_of("woodworking_1") if o.side is OrderSide.SELL]
+    assert [(o.quantity, o.limit_price) for o in asks] == [(3, Decimal("11.00"))]
+
+
+def test_an_ack_that_cannot_be_backed_is_not_sent(tmp_path: Path) -> None:
+    engine, log, bus = _offered(tmp_path)
+    engine.state.account("woodworking_1").gold = Decimal("1")
+    with log:
+        outcome = execute(engine, "woodworking_1", _ack(), messages=bus)
+    from rpg_economy.domain import RejectionCode
+
+    assert not outcome.accepted
+    assert outcome.code is RejectionCode.INSUFFICIENT_GOLD
+    assert bus.inbox("warrior_1") == []
+    # The proposal is still open: the agent can still answer it.
+    assert bus.open_proposal("woodworking_1", "warrior_1", "iron") is MessageType.OFFER
+
+
+def test_an_ack_needs_the_terms_of_its_order() -> None:
+    from rpg_economy.agents.parsing import InvalidAgentOutput, parse_action
+    from rpg_economy.domain import Condition
+
+    raw = (
+        '{"action": "send_message", "message_type": "ACK", "target": "iron", '
+        '"recipient": "warrior_1", "quantity": null, "price": null, '
+        '"priority": "medium", "short_reason": "ok"}'
+    )
+    with pytest.raises(InvalidAgentOutput, match="ACK"):
+        parse_action(raw, condition=Condition.B)
+
+
+def _back_from_a_trip(engine: Engine, account, resting: bool) -> None:
+    """Put the adventurer in town, resting or rested."""
+    account.expedition = None
+    account.recovering_until_tick = engine.tick + (5 if resting else 0)
+
+
+def test_a_resting_adventurer_trades_but_does_not_set_out(
+    live_engine: Engine, config: SimulationConfig
+) -> None:
+    account = live_engine.state.account("warrior_1")
+    fully_equip(account)
+    for product in PROVISIONS:
+        account.receive(product, 5)
+    account.receive(IRON, 3)
+    _back_from_a_trip(live_engine, account, resting=True)
+    policy = policy_for(Role.ADVENTURER, config)
+    rng = live_engine.random.agent("warrior_1")
+
+    first = policy.decide(live_engine, account, rng)
+    assert first.action is ActionType.SELL
+    live_engine.submit_order("warrior_1", OrderSide.SELL, IRON, 3, "50")  # on the book now
+    second = policy.decide(live_engine, account, rng)
+    assert second.action is ActionType.WAIT  # nothing left to trade, still resting
+
+
+def test_a_rested_adventurer_sets_out_with_orders_still_open(
+    live_engine: Engine, config: SimulationConfig
+) -> None:
+    account = live_engine.state.account("warrior_1")
+    fully_equip(account)
+    for product in PROVISIONS:
+        account.receive(product, 5)
+    account.receive(IRON, 6)
+    account.receive(Resource.LEATHER, 6)
+    policy = policy_for(Role.ADVENTURER, config)
+    rng = live_engine.random.agent("warrior_1")
+
+    _back_from_a_trip(live_engine, account, resting=True)
+    sells = orders_of(policy.decide(live_engine, account, rng))
+    assert {o.target for o in sells if o.action is ActionType.SELL} == {"iron", "leather"}
+    _back_from_a_trip(live_engine, account, resting=False)
+    # Haul still unsold and orders open: it leaves anyway.
+    action = policy.decide(live_engine, account, rng)
+    assert action.action is ActionType.START_EXPEDITION
+
+
+def test_an_adventurer_that_could_not_trade_while_resting_gets_one_trade_then_leaves(
+    live_engine: Engine, config: SimulationConfig
+) -> None:
+    account = live_engine.state.account("warrior_1")
+    fully_equip(account)
+    for product in PROVISIONS:
+        account.receive(product, 5)
+    account.receive(IRON, 6)
+    account.receive(Resource.LEATHER, 6)
+    _back_from_a_trip(live_engine, account, resting=False)
+    policy = policy_for(Role.ADVENTURER, config)
+    rng = live_engine.random.agent("warrior_1")
+
+    trade = orders_of(policy.decide(live_engine, account, rng))
+    assert all(o.action is ActionType.SELL for o in trade)
+    assert policy.decide(live_engine, account, rng).action is ActionType.START_EXPEDITION
+
+
+def test_place_orders_executes_each_order_on_its_own(tmp_path: Path) -> None:
+    """One bad order does not void the others."""
+    from rpg_economy.agents import execute
+    from rpg_economy.domain import RejectionCode
+
+    engine, log = _executing_engine(tmp_path)
+    engine.state.account("warrior_1").receive(IRON, 3)
+    action = AgentAction(
+        action=ActionType.PLACE_ORDERS,
+        orders=(
+            AgentAction(action=ActionType.SELL, target="iron", quantity=3, price=Decimal("12")),
+            AgentAction(action=ActionType.SELL, target="wood", quantity=5, price=Decimal("8")),
+            AgentAction(
+                action=ActionType.BUY, target="health_potion", quantity=1, price=Decimal("15")
+            ),
+        ),
+    )
+    with log:
+        outcome = execute(engine, "warrior_1", action)
+    assert outcome.accepted and outcome.engine_operation and not outcome.wasted
+    assert [r["accepted"] for r in outcome.order_results] == [True, False, True]
+    assert outcome.order_results[1]["rejection"] == RejectionCode.INSUFFICIENT_INVENTORY.value
+    sides = sorted(o.side.value for o in engine.market.open_orders_of("warrior_1"))
+    assert sides == ["buy", "sell"]
+
+    events = list(read_events(tmp_path / "run.jsonl"))
+    assert sum(e.type is EventType.AGENT_OUTPUT for e in events) == 1
+    assert [e.payload["order_index"] for e in events if e.type is EventType.ACTION_EXECUTED] == [
+        0,
+        2,
+    ]
+    assert [e.payload["order_index"] for e in events if e.type is EventType.ACTION_REJECTED] == [1]
+
+
+def test_place_orders_with_nothing_accepted_is_a_wasted_activation(tmp_path: Path) -> None:
+    from rpg_economy.agents import execute
+
+    engine, log = _executing_engine(tmp_path)
+    action = AgentAction(
+        action=ActionType.PLACE_ORDERS,
+        orders=(
+            AgentAction(action=ActionType.SELL, target="wood", quantity=5, price=Decimal("8")),
+            AgentAction(action=ActionType.SELL, target="herbs", quantity=5, price=Decimal("8")),
+        ),
+    )
+    with log:
+        outcome = execute(engine, "warrior_1", action)
+    assert not outcome.accepted and outcome.wasted
+    assert outcome.code is not None
+
+
+def test_a_bundle_of_one_is_the_order_itself(config: SimulationConfig) -> None:
+    from rpg_economy.agents.rule_based import RuleBasedPolicy
+
+    single = AgentAction(action=ActionType.SELL, target="iron", quantity=1, price=Decimal("9"))
+    assert RuleBasedPolicy._bundle([single], "x") is single
+    assert RuleBasedPolicy._bundle([], "x") is None
+    both = RuleBasedPolicy._bundle([single, single], "x")
+    assert both.action is ActionType.PLACE_ORDERS and len(both.orders) == 2
+
+
+def test_agents_never_place_more_orders_than_the_cap(
+    live_engine: Engine, config: SimulationConfig
+) -> None:
+    cap = config.market.max_orders_per_activation
+    _two_sided_books(live_engine)
+    for agent_id in ("warrior_1", "smithing_1", "woodworking_1"):
+        account = live_engine.state.account(agent_id)
+        for resource in Resource:
+            account.receive(resource, 3)
+        action = policy_for(account.role, config).decide(
+            live_engine, account, live_engine.random.agent(agent_id)
+        )
+        assert len(orders_of(action)) <= cap
+
+
+def test_an_artisan_prices_a_unit_from_its_share_of_the_batch(
+    live_engine: Engine, config: SimulationConfig
+) -> None:
+    """One batch makes several potions: the cost floor is per potion, not per batch."""
+    from rpg_economy.agents.rule_based import ArtisanPolicy
+
+    policy = policy_for(Role.ARTISAN, config)
+    assert isinstance(policy, ArtisanPolicy)
+    recipe = config.economy.recipes[Product.MANA_POTION]
+    assert recipe.output_quantity > 1
+    batch = policy._input_cost(live_engine, Product.MANA_POTION)
+    assert policy._unit_cost(live_engine, Product.MANA_POTION) == batch / recipe.output_quantity
+
+
+def test_a_buyer_never_bids_past_the_ceiling_over_the_starting_price(
+    live_engine: Engine, config: SimulationConfig
+) -> None:
+    """Escalation from a recent price that keeps rising would spiral without end."""
+    from rpg_economy.agents.rule_based import MAX_BID_OVER_START, bid_price, starting_price
+
+    good = Product.HEALTH_POTION
+    ceiling = starting_price(live_engine, good) * (1 + MAX_BID_OVER_START)
+    price = bid_price(live_engine, good, ceiling * 3, escalation=Decimal("0.6"))
+    assert price <= ceiling.quantize(Decimal("0.01"))
