@@ -1329,3 +1329,190 @@ def test_the_arrears_lien_leaves_available_gold_and_blocks_reservations() -> Non
         account.reserve_gold(Decimal("11"))
     account.tax_arrears = Decimal("500")
     assert account.available_gold == ZERO, "never below zero"
+
+
+def test_the_wealth_tax_base_excludes_arrears_already_owed(tmp_path: Path) -> None:
+    def prepare(state: WorldState) -> None:
+        artisan = state.account("woodworking_1")
+        artisan.gold = Decimal("400")
+        artisan.reserve_gold(Decimal("300"))
+        artisan.tax_arrears = Decimal("150")
+
+    state, paid = _charged(tmp_path, _wealth_config(), cycles=4, prepare=prepare, kind="wealth")
+    mine = [e for e in paid if e.agent_id == "woodworking_1"]
+    collected, assessed = mine
+    # Only the 100 free of the reservation pays arrears; 50 stays owed.
+    assert collected.tick == 0 and collected.payload["amount"] == "100"
+    assert collected.payload["owed"] == "50"
+    # (400 - 100 paid) - 50 owed - 100 exempt; nothing available, so all owed.
+    assert assessed.tick == 3
+    assert assessed.payload["taxable"] == "150"
+    assert assessed.payload["amount"] == "0"
+    assert Decimal(assessed.payload["owed"]) == Decimal("65.00")
+    artisan = state.account("woodworking_1")
+    assert artisan.gold == Decimal("300")
+    assert artisan.reserved_gold == Decimal("300")
+
+
+def test_the_wealth_tax_base_does_not_depend_on_a_bid_resting_at_the_freeze(
+    tmp_path: Path,
+) -> None:
+    """A pre-freeze reservation is taxed like the same gold freed at the shock."""
+
+    def prepare(state: WorldState) -> None:
+        resting = state.account("woodworking_1")
+        resting.gold = Decimal("1000")
+        resting.reserve_gold(Decimal("400"))
+        resting.freeze_gold(Decimal("0.5"), tick=0)
+        free = state.account("smithing_1")
+        free.gold = Decimal("1000")
+        free.freeze_gold(Decimal("0.5"), tick=0)
+
+    _, paid = _charged(tmp_path, _wealth_config(), cycles=4, prepare=prepare, kind="wealth")
+    by_agent = {e.agent_id: e.payload for e in paid if e.tick == 3}
+    # Free at the shock: 1000 - 500 frozen - 100 exempt. Resting: 1000 - 300
+    # frozen - 200 that would freeze if the bid were withdrawn - 100 exempt.
+    assert Decimal(by_agent["smithing_1"]["taxable"]) == Decimal("400")
+    assert Decimal(by_agent["woodworking_1"]["taxable"]) == Decimal("400")
+    assert Decimal(by_agent["woodworking_1"]["due"]) == Decimal(by_agent["smithing_1"]["due"])
+
+
+def test_run_end_holdings_carry_arrears_reserved_and_frozen_gold(tmp_path: Path) -> None:
+    config = _wealth_config()
+    state = build_world(config)
+    artisan = state.account("woodworking_1")
+    artisan.gold = Decimal("100")
+    artisan.reserve_gold(Decimal("60"))
+    artisan.frozen_gold = Decimal("30")
+    artisan.tax_arrears = Decimal("25")
+    path = tmp_path / "run.jsonl"
+    with EventLogWriter(path, make_metadata(config)) as log:
+        Engine(config, state, log).log_run_end()
+    (end,) = [e for e in read_events(path) if e.type is EventType.RUN_END]
+    holdings = end.payload["holdings"]["woodworking_1"]
+    assert holdings["gold"] == "100"
+    assert holdings["tax_arrears"] == "25"
+    assert holdings["reserved_gold"] == "60"
+    assert holdings["frozen_gold"] == "30"
+    assert all(
+        {"tax_arrears", "reserved_gold", "frozen_gold"} <= set(h)
+        for h in end.payload["holdings"].values()
+    )
+
+
+@pytest.mark.parametrize(
+    "taxes",
+    [
+        {"profit_rate": "-0.1"},
+        {"profit_rate": "1"},
+        {"wealth_rate": "-0.1"},
+        {"wealth_rate": "1"},
+    ],
+)
+def test_tax_rates_outside_zero_to_one_are_refused(taxes: dict) -> None:
+    from rpg_economy.config import ConfigError
+
+    with pytest.raises(ConfigError):
+        make_config(economy={"taxes": taxes})
+
+
+def test_a_sale_at_or_below_its_input_cost_pays_no_profit_tax(tmp_path: Path) -> None:
+    """An artisan who sells at a loss, or at cost, owes nothing."""
+    from rpg_economy.domain import Product
+
+    config = make_config(
+        economy={
+            "taxes": {"profit_rate": "0.3", "wealth_rate": 0},
+            "storage_cost_per_unit": NO_STORAGE,
+        }
+    )
+    # A bow's inputs cost far more than 20 at the guide prices.
+    _, events = _trade(tmp_path, config, Product.BOW_GEAR, "20")
+    assert any(e.type is EventType.TRADE_EXECUTED for e in events)
+    assert not any(e.type is EventType.TAX_PAID for e in events)
+
+
+def test_expeditions_due_together_resolve_in_a_seeded_order_not_by_name(tmp_path: Path) -> None:
+    """Shared zone pools: alphabetical order would always serve the same subclass first."""
+    config = make_config()
+    with EventLogWriter(tmp_path / "run.jsonl", make_metadata(config)) as log:
+        engine = Engine(config, build_world(config), log)
+        phase = RuleBasedDecisionPhase(config)
+        for _ in range(120):
+            engine.run_cycle(phase)
+    by_tick: dict[int, list[str]] = {}
+    for event in read_events(log.path):
+        if event.type is EventType.EXPEDITION_RESOLVED:
+            by_tick.setdefault(event.tick, []).append(event.agent_id)
+    together = [ids for ids in by_tick.values() if len(ids) > 1]
+    assert together, "the run should have expeditions returning on the same tick"
+    assert any(ids != sorted(ids) for ids in together)
+
+
+def test_two_agents_due_together_draw_in_the_same_order_whoever_else_is_due(
+    tmp_path: Path,
+) -> None:
+    """The order of a pair must not depend on which other agents return that tick."""
+
+    def resolved(agents: list[str], name: str) -> list[str]:
+        config = make_config()
+        with EventLogWriter(tmp_path / name, make_metadata(config)) as log:
+            engine = Engine(config, build_world(config), log)
+            for agent_id in agents:
+                engine.start_expedition(agent_id, "green_hollow")
+            for _ in range(6):
+                engine.run_cycle()
+        return [
+            e.agent_id for e in read_events(log.path) if e.type is EventType.EXPEDITION_RESOLVED
+        ]
+
+    pair = resolved(["mage_1", "warrior_1"], "pair.jsonl")
+    wider = resolved(["mage_1", "ranger_2", "warrior_1", "warrior_2"], "wider.jsonl")
+    assert sorted(pair) == ["mage_1", "warrior_1"]
+    assert [a for a in wider if a in pair] == pair
+
+
+def test_an_adventurer_cannot_bid_for_raw_materials(tmp_path: Path) -> None:
+    """Pilot: real adventurers bought herbs and hoarded them, outbidding alchemists."""
+    config = make_config()
+    with EventLogWriter(tmp_path / "run.jsonl", make_metadata(config)) as log:
+        engine = Engine(config, build_world(config), log)
+        with pytest.raises(OrderRejected, match="cannot buy raw materials"):
+            engine.submit_order("warrior_1", OrderSide.BUY, Resource.HERBS, 1, "6")
+        # Products and selling stay open to them.
+        engine.submit_order("warrior_1", OrderSide.BUY, Product.HEALTH_POTION, 1, "4.5")
+        engine.state.account("warrior_1").receive(Resource.HERBS, 1)
+        engine.submit_order("warrior_1", OrderSide.SELL, Resource.HERBS, 1, "6")
+
+
+def test_an_adventurer_cannot_offer_products(tmp_path: Path) -> None:
+    """Real adventurers sold the potions their trips used, undercutting alchemists."""
+    config = make_config()
+    with EventLogWriter(tmp_path / "run.jsonl", make_metadata(config)) as log:
+        engine = Engine(config, build_world(config), log)
+        engine.state.account("warrior_1").receive(Product.HEALTH_POTION, 1)
+        with pytest.raises(OrderRejected, match="may not offer products"):
+            engine.submit_order("warrior_1", OrderSide.SELL, Product.HEALTH_POTION, 1, "4")
+        # Artisans still offer them.
+        engine.state.account("alchemy_1").receive(Product.HEALTH_POTION, 1)
+        engine.submit_order("alchemy_1", OrderSide.SELL, Product.HEALTH_POTION, 1, "4")
+
+
+def test_setting_out_equips_held_gear_in_place_of_worn_out_gear(tmp_path: Path) -> None:
+    """Buy, equip and set out took three activations, and adventurers left without it."""
+    config = make_config()
+    with EventLogWriter(tmp_path / "run.jsonl", make_metadata(config)) as log:
+        engine = Engine(config, build_world(config), log)
+        warrior = engine.state.account("warrior_1")
+        warrior.equipment.clear()
+        bare = engine.expedition_odds("warrior_1")
+        warrior.receive(Product.MELEE_WEAPON, 1)
+        warrior.receive(Product.STAFF_FOCUS, 1)  # not a warrior's gear: left alone
+        # The odds it is shown count the held weapon, as setting out will.
+        assert engine.expedition_odds("warrior_1")["green_hollow"] > bare["green_hollow"]
+        engine.start_expedition("warrior_1", "green_hollow")
+        durability = config.economy.durability[Product.MELEE_WEAPON]
+        assert warrior.equipment[Product.MELEE_WEAPON] == durability
+        assert warrior.quantity(Product.MELEE_WEAPON) == 0
+        assert warrior.quantity(Product.STAFF_FOCUS) == 1
+        assert Product.MELEE_WEAPON in warrior.expedition.gear_bonus
