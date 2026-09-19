@@ -7,19 +7,34 @@ from pathlib import Path
 
 import pytest
 
-from rpg_economy.agents.llm_agent import LLMAgentRunner
+from rpg_economy.agents.action import AgentAction
+from rpg_economy.agents.llm_agent import MAX_ATTEMPTS, LLMAgentRunner
 from rpg_economy.agents.observation import build_observation
+from rpg_economy.agents.offline import json_action
+from rpg_economy.agents.parsing import InvalidAgentOutput, parse_action
 from rpg_economy.agents.prompts import (
     PROMPT_VERSION,
+    SECTION_BULLETIN,
+    SECTION_P2P,
     build_agent_prompt,
     prompt_hashes,
+    render_world,
 )
-from rpg_economy.domain import Product
+from rpg_economy.domain import (
+    ActionType,
+    AdventurerSubclass,
+    Condition,
+    MessageType,
+    Priority,
+    Product,
+    TokenBucket,
+)
 from rpg_economy.engine import Engine, build_world
-from rpg_economy.llm import MockLLMClient, TokenLedger
-from rpg_economy.logging_ import EventLogWriter
+from rpg_economy.llm import MockLLMClient, TokenLedger, always, scripted
+from rpg_economy.logging_ import EventLogWriter, EventType, read_events
 from rpg_economy.messaging import MessageBus
 from rpg_economy.orchestration import build_directory
+from rpg_economy.orchestration.global_view import build_global_summary
 from tests.conftest import make_config, make_metadata
 
 
@@ -569,3 +584,553 @@ def test_an_artisan_sees_first_the_product_a_buyer_waits_for(rig) -> None:
     assert "another would sit unsold" in crafts[-1]
     adventurer = build_observation(config, engine, "warrior_2", messages=messages).signals
     assert not any(line.startswith("- craft ") for line in adventurer)
+
+
+def test_the_world_rules_state_the_gear_gold_bonus(rig) -> None:
+    config, engine, messages = rig
+    warrior = build_observation(config, engine, "warrior_1", messages=messages)
+    prompt = build_agent_prompt(warrior, config)
+    assert "required_to_set_out" not in prompt.sections["state"]
+    assert "Gear gold: a successful trip's gold is raised" in prompt.system
+    assert "melee_weapon +80%" in render_world(config)
+
+
+def test_gear_lines_state_what_each_missing_item_adds_and_costs(rig) -> None:
+    """2.34: optional gear, priced against what it adds to a trip, as facts."""
+    from rpg_economy.domain import OrderSide
+
+    config, engine, messages = rig
+    account = engine.state.account("warrior_1")
+    account.equipment.clear()
+    engine.state.account("smithing_1").receive(Product.MELEE_WEAPON, 1)
+    engine.submit_order("smithing_1", OrderSide.SELL, Product.MELEE_WEAPON, 1, "40.00")
+    status = build_observation(config, engine, "warrior_1", messages=messages).status
+    weapon = next(line for line in status if line.startswith("Gear: melee_weapon"))
+    assert "(offered at 40.00; lasts 4 trips, 10.00 a trip) adds about" in weapon
+    assert "in green_hollow" in weapon and "in arcane_deeps" in weapon
+    armor = next(line for line in status if line.startswith("Gear: armor"))
+    armor_guide = config.economy.initial_reference_price["armor"]
+    assert f"nobody offers one; guide price {armor_guide:.2f}" in armor
+    # Held, setting out equips it (2.36); worn, too, it is not listed.
+    account.receive(Product.MELEE_WEAPON, 1)
+    status = build_observation(config, engine, "warrior_1", messages=messages).status
+    assert not any(line.startswith("Gear: melee_weapon") for line in status)
+    account.equipment[Product.MELEE_WEAPON] = 4
+    account.inventory.pop(Product.MELEE_WEAPON)
+    status = build_observation(config, engine, "warrior_1", messages=messages).status
+    assert not any("melee_weapon" in line for line in status)
+    smith = build_observation(config, engine, "smithing_1", messages=messages).status
+    assert not any(line.startswith("Gear:") for line in smith)
+
+
+def test_an_adventurer_is_told_its_expedition_gear(rig) -> None:
+    """Each item of the subclass's gear adds its own bonus (design s5.3), so say which."""
+    config, engine, messages = rig
+    mage = build_observation(config, engine, "mage_1", messages=messages)
+    prompt = build_agent_prompt(mage, config)
+    mana = config.expeditions.gear[AdventurerSubclass.MAGE][Product.MANA_POTION]
+    assert f'"mana_potion":"{mana}"' in prompt.sections["state"]
+    # Named expedition_gear, the table read as gear held.
+    assert "gear_if_carried lists every item your subclass can use" in prompt.system
+    assert "it is not what you hold" in prompt.system
+
+    artisan = build_observation(config, engine, "woodworking_1", messages=messages)
+    assert artisan.expedition_gear == {}
+    assert '"gear_if_carried":null' in build_agent_prompt(artisan, config).sections["state"]
+
+
+def test_a_broken_main_item_heads_the_adventurers_state(rig) -> None:
+    """Warriors whose weapon broke set out without one."""
+    config, engine, messages = rig
+    warrior = engine.state.account("warrior_1")
+    warrior.equipment.pop(Product.MELEE_WEAPON, None)
+    status = build_observation(config, engine, "warrior_1", messages=messages).status
+    assert status[0].startswith("Broken: your melee_weapon broke and you carry none")
+    assert "before you set out" in status[0]
+
+    # Gone once it bids for one.
+    from rpg_economy.domain import OrderSide
+
+    warrior.gold += Decimal("60")
+    engine.submit_order("warrior_1", OrderSide.BUY, Product.MELEE_WEAPON, 1, "48.00")
+    status = build_observation(config, engine, "warrior_1", messages=messages).status
+    assert not any(x.startswith("Broken") for x in status)
+
+
+def test_an_artisan_is_told_to_offer_a_product_nobody_offers_or_bids_for(rig) -> None:
+    """Smiths held weapons nobody bid for and never offered them."""
+    config, engine, messages = rig
+    engine.state.account("smithing_1").receive(Product.MELEE_WEAPON, 1)
+    status = build_observation(config, engine, "smithing_1", messages=messages).status
+    (line,) = [x for x in status if x.startswith("Not offered")]
+    guide = config.economy.initial_reference_price["melee_weapon"]
+    assert f"melee_weapon x1: nobody offers or bids for one; offer it at about {guide:.2f}" in line
+
+
+def test_a_valid_first_response_is_used(rig) -> None:
+    config, engine, messages = rig
+    agent, _ = runner(config, engine, messages, always(json_action(action="wait")))
+    result = agent.activate(engine, "woodworking_1")
+
+    assert result.attempts == 1
+    assert result.invalid_outputs == 0
+    assert result.action.action is ActionType.WAIT
+
+
+def test_one_retry_is_allowed_after_invalid_output(rig) -> None:
+    config, engine, messages = rig
+    engine.state.account("woodworking_1").receive_gold = None
+    agent, _ = runner(
+        config,
+        engine,
+        messages,
+        scripted(["not json at all", json_action(action="wait", short_reason="recovered")]),
+    )
+    result = agent.activate(engine, "woodworking_1")
+
+    assert result.attempts == 2
+    assert result.invalid_outputs == 1
+    assert result.action.short_reason == "recovered"
+
+
+def test_two_invalid_outputs_waste_the_activation_and_wait(rig) -> None:
+    config, engine, messages = rig
+    agent, _ = runner(config, engine, messages, always("still not json"))
+    result = agent.activate(engine, "woodworking_1")
+
+    assert result.attempts == MAX_ATTEMPTS
+    assert result.invalid_outputs == MAX_ATTEMPTS
+    assert result.action.action is ActionType.WAIT
+    assert result.wasted
+
+
+def test_there_is_never_a_second_retry(rig) -> None:
+    config, engine, messages = rig
+    client = MockLLMClient(always("nope"))
+    agent = LLMAgentRunner(config, client, TokenLedger(), messages=messages)
+    agent.activate(engine, "woodworking_1")
+    assert client.calls == MAX_ATTEMPTS
+
+
+def test_invalid_output_is_logged_with_its_reason(rig) -> None:
+    config, engine, messages = rig
+    agent, _ = runner(config, engine, messages, always("garbage"))
+    agent.activate(engine, "woodworking_1")
+    engine.log.close()
+
+    events = list(read_events(engine.log.path))
+    invalid = [e for e in events if e.type is EventType.AGENT_OUTPUT_INVALID]
+    assert len(invalid) == MAX_ATTEMPTS
+    assert invalid[0].payload["reason"]
+    assert any(e.type is EventType.ACTIVATION_WASTED for e in events)
+
+
+# ---------------------------------------------------------------------------
+# The wasted-activation predicate (design v1.0 s11.2)
+# ---------------------------------------------------------------------------
+def test_wait_is_a_wasted_activation(rig) -> None:
+    config, engine, messages = rig
+    agent, _ = runner(config, engine, messages, always(json_action(action="wait")))
+    assert agent.activate(engine, "woodworking_1").wasted
+
+
+def test_a_placed_order_is_not_wasted(rig) -> None:
+    config, engine, messages = rig
+    engine.state.account("woodworking_1").receive(
+        __import__("rpg_economy.domain", fromlist=["Resource"]).Resource.IRON, 5
+    )
+    agent, _ = runner(
+        config,
+        engine,
+        messages,
+        always(json_action(action="sell", target="iron", quantity=2, price=10.0)),
+    )
+    assert not agent.activate(engine, "woodworking_1").wasted
+
+
+def test_a_message_only_activation_is_not_wasted(rig) -> None:
+    """An activation that only communicated still did something."""
+    config, engine, messages = rig
+    agent, _ = runner(
+        config,
+        engine,
+        messages,
+        always(
+            json_action(
+                action="send_message",
+                message_type="REQUEST",
+                target="iron",
+                quantity=1,
+                price="5",
+                recipient="warrior_1",
+            )
+        ),
+    )
+    result = agent.activate(engine, "woodworking_1")
+    assert result.outcome.message_emitted
+    assert not result.wasted
+
+
+def test_a_rejected_action_is_wasted(rig) -> None:
+    config, engine, messages = rig
+    agent, _ = runner(
+        config,
+        engine,
+        messages,
+        always(json_action(action="sell", target="iron", quantity=99, price=10.0)),
+    )
+    result = agent.activate(engine, "woodworking_1")
+    assert not result.outcome.accepted
+    assert result.wasted
+
+
+# ---------------------------------------------------------------------------
+# Token buckets
+# ---------------------------------------------------------------------------
+def test_agent_tokens_are_charged_to_the_agent_bucket(rig) -> None:
+    config, engine, messages = rig
+    agent, ledger = runner(config, engine, messages, always(json_action(action="wait")))
+    agent.activate(engine, "woodworking_1")
+
+    assert ledger.total(TokenBucket.AGENT) > 0
+    assert ledger.total(TokenBucket.DIRECTOR) == 0
+    assert ledger.total(TokenBucket.BULLETIN) == 0
+
+
+def test_p2p_content_is_charged_to_its_own_bucket(rig) -> None:
+    """Design v1.0 s8.4: P2P content inside a prompt is billed separately."""
+    config, engine, messages = rig
+    messages.send(
+        sender_id="warrior_1",
+        recipient_id="woodworking_1",
+        message_type=MessageType.REQUEST,
+        tick=0,
+        payload={"good": "iron", "quantity": 5},
+    )
+    agent, ledger = runner(config, engine, messages, always(json_action(action="wait")))
+    agent.activate(engine, "woodworking_1")
+
+    assert ledger.input_tokens(TokenBucket.P2P_CONTENT) > 0
+
+
+def test_no_p2p_tokens_when_the_inbox_is_empty(rig) -> None:
+    config, engine, messages = rig
+    agent, ledger = runner(config, engine, messages, always(json_action(action="wait")))
+    agent.activate(engine, "woodworking_1")
+    assert ledger.input_tokens(TokenBucket.P2P_CONTENT) == 0
+
+
+@pytest.mark.invariant
+def test_bulletin_tokens_are_charged_only_on_inclusion(tmp_path: Path) -> None:
+    """Design v1.0 s3.3: counted only when actually included in a prompt."""
+    ledgers = {}
+    for condition in (Condition.B, Condition.C):
+        config = make_config(run={"condition": condition.value})
+        state = build_world(config)
+        with EventLogWriter(tmp_path / f"{condition.value}.jsonl", make_metadata(config)) as log:
+            engine = Engine(config, state, log)
+            # The canonical generator, not a hand-made dict: the renderer is the
+            # one A and C share, so it only accepts a real global summary.
+            engine.publish_bulletin(build_global_summary(config, engine))
+            messages = MessageBus(build_directory(engine))
+            agent, ledger = runner(config, engine, messages, always(json_action(action="wait")))
+            agent.activate(engine, "woodworking_1")
+            ledgers[condition] = ledger
+
+    # Published in both, but only Condition C puts it in a prompt.
+    assert ledgers[Condition.B].input_tokens(TokenBucket.BULLETIN) == 0
+    assert ledgers[Condition.C].input_tokens(TokenBucket.BULLETIN) > 0
+
+
+def test_buckets_reconcile_with_the_reported_usage(rig) -> None:
+    config, engine, messages = rig
+    messages.send(
+        sender_id="warrior_1",
+        recipient_id="woodworking_1",
+        message_type=MessageType.INFORM,
+        tick=0,
+        payload={"note": "iron is scarce"},
+    )
+    client = MockLLMClient(always(json_action(action="wait")))
+    ledger = TokenLedger()
+    agent = LLMAgentRunner(config, client, ledger, messages=messages)
+    agent.activate(engine, "woodworking_1")
+    engine.log.close()
+
+    calls = [e for e in read_events(engine.log.path) if e.type is EventType.LLM_CALL]
+    assert len(calls) == 1
+    reported_input = calls[0].payload["input_tokens"]
+    assert sum(calls[0].payload["input_by_bucket"].values()) == reported_input
+    assert ledger.input_tokens() == reported_input
+
+
+def test_every_llm_call_is_logged(rig) -> None:
+    config, engine, messages = rig
+    agent, _ = runner(config, engine, messages, always(json_action(action="wait")))
+    agent.activate(engine, "woodworking_1")
+    engine.log.close()
+
+    calls = [e for e in read_events(engine.log.path) if e.type is EventType.LLM_CALL]
+    assert len(calls) == 1
+    assert calls[0].payload["model"].startswith("mock")
+
+
+# ---------------------------------------------------------------------------
+# Parsing round-trips
+# ---------------------------------------------------------------------------
+def test_action_round_trips_through_json() -> None:
+    original = AgentAction(
+        action=ActionType.BUY,
+        target="iron",
+        quantity=4,
+        price=Decimal("11.25"),
+        priority=Priority.HIGH,
+        short_reason="stock up",
+    )
+    parsed = parse_action(json_action(**original.to_payload()), condition=Condition.B)
+    assert parsed.action is original.action
+    assert parsed.target == original.target
+    assert parsed.quantity == original.quantity
+    assert parsed.price == original.price
+    assert parsed.priority is original.priority
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "",
+        "no json",
+        '{"action": "teleport"}',
+        '{"action": "buy", "target": "iron"}',
+        '{"action": "buy", "target": "iron", "quantity": -1, "price": 5}',
+        '{"action": "produce"}',
+        '{"action": "start_expedition"}',
+    ],
+)
+def test_malformed_output_is_rejected(text: str) -> None:
+    with pytest.raises(InvalidAgentOutput):
+        parse_action(text, condition=Condition.B)
+
+
+def test_fenced_and_embedded_json_are_both_accepted() -> None:
+    fenced = '```json\n{"action":"wait","short_reason":"ok"}\n```'
+    embedded = 'I will wait. {"action":"wait","short_reason":"ok"} Done.'
+    for text in (fenced, embedded):
+        assert parse_action(text, condition=Condition.B).action is ActionType.WAIT
+
+
+@pytest.mark.invariant
+def test_condition_a_rejects_peer_messages(rig) -> None:
+    """Design s3.1: no P2P in Condition A, via the ordinary retry path."""
+    with pytest.raises(InvalidAgentOutput, match="Condition A"):
+        parse_action(
+            json_action(
+                action="send_message",
+                message_type="REQUEST",
+                target="iron",
+                quantity=1,
+                price="5",
+                recipient="warrior_1",
+            ),
+            condition=Condition.A,
+        )
+
+
+@pytest.mark.invariant
+@pytest.mark.parametrize("recipient", ["warrior_1", "", "none", "None", "NULL"])
+def test_condition_a_ignores_the_recipient_of_a_non_message_action(recipient: str) -> None:
+    """A stray recipient carries no decision in A, as in B and C: it is dropped."""
+    action = parse_action(json_action(action="wait", recipient=recipient), condition=Condition.A)
+    assert action.action is ActionType.WAIT
+    assert action.recipient is None
+
+
+@pytest.mark.parametrize("recipient", ["", "none", "None"])
+def test_a_blank_recipient_is_null_in_b_and_c(recipient: str) -> None:
+    action = parse_action(json_action(action="wait", recipient=recipient), condition=Condition.B)
+    assert action.recipient is None
+    with pytest.raises(InvalidAgentOutput, match="requires a recipient"):
+        parse_action(
+            json_action(
+                action="send_message",
+                recipient=recipient,
+                message_type="INFORM",
+                target="iron",
+            ),
+            condition=Condition.B,
+        )
+
+
+def test_prompt_sections_are_labelled_for_bucket_attribution(rig) -> None:
+    config, engine, messages = rig
+    messages.send(
+        sender_id="warrior_1",
+        recipient_id="woodworking_1",
+        message_type=MessageType.OFFER,
+        tick=0,
+    )
+    observation = build_observation(config, engine, "woodworking_1", messages=messages)
+    prompt = build_agent_prompt(observation, config)
+
+    assert SECTION_P2P in prompt.sections
+    assert SECTION_BULLETIN not in prompt.sections
+    assert prompt.section_sizes()[SECTION_P2P] > 0
+
+
+@pytest.mark.invariant
+def test_the_world_rules_state_what_peers_can_see() -> None:
+    """Design s7: the observability rule of s5.2 is world documentation.
+
+    Without it the agent's world model is incomplete in exactly the place that
+    governs whether messaging has any point. Descriptive only -- the clause says
+    what peers can see, never what to do about it; a tactical form of the same
+    idea is inadmissible because it would coach the coordination behaviour the
+    experiment measures (IMPLEMENTATION.md section 4.8.1).
+    """
+    from rpg_economy.agents.prompts import RULES
+
+    assert "Peers cannot see your needs" in RULES
+    # The inadmissible clause, in any recognisable form.
+    lowered = RULES.lower()
+    for coaching in ("order book only helps", "you should message", "ask a peer when"):
+        assert coaching not in lowered, f"tactical coaching leaked into the world rules: {coaching}"
+
+
+@pytest.mark.invariant
+def test_every_valid_action_documents_its_parameters() -> None:
+    """Every valid action, cancel_order included, has a parameter line.
+
+    cancel_order overloads `quantity` to carry an order id (IMPLEMENTATION.md
+    section 4.8.1). An action the schema names but never explains differentially
+    punishes whichever model tries it.
+    """
+    from rpg_economy.agents.prompts import ACTION_SCHEMA
+    from rpg_economy.domain import ActionType
+
+    documented = {
+        line.split()[1]
+        for line in ACTION_SCHEMA.splitlines()
+        if line.startswith("- ") and len(line.split()) > 1
+    }
+    missing = [
+        action.value
+        for action in ActionType
+        if action.value not in documented and action.value not in {"buy", "sell"}
+    ]
+    assert "buy/sell" in ACTION_SCHEMA, "buy and sell are documented as a pair"
+    assert not missing, f"actions named as valid but never explained: {missing}"
+
+
+# ---------------------------------------------------------------------------
+# Peer messages are structured (design s6)
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    ("fields", "reason"),
+    [
+        ({"message_type": "OFFER", "quantity": 1, "price": "5"}, "target"),
+        ({"message_type": "OFFER", "target": "gold", "quantity": 1, "price": "5"}, "good"),
+        ({"message_type": "REQUEST", "target": "iron", "price": "5"}, "quantity"),
+        ({"message_type": "OFFER", "target": "iron", "quantity": 1}, "price"),
+        ({"message_type": "TASK", "target": "iron"}, "peer-to-peer"),
+        ({"target": "iron"}, "message_type"),
+    ],
+)
+def test_an_incomplete_peer_message_is_invalid(fields, reason) -> None:
+    with pytest.raises(InvalidAgentOutput, match=reason):
+        parse_action(
+            json_action(action="send_message", recipient="warrior_1", **fields),
+            condition=Condition.B,
+        )
+
+
+def test_an_inform_needs_only_the_good() -> None:
+    action = parse_action(
+        json_action(
+            action="send_message", message_type="INFORM", target="iron", recipient="warrior_1"
+        ),
+        condition=Condition.B,
+    )
+    assert action.message_type is MessageType.INFORM
+    assert action.target == "iron"
+
+
+def test_a_stray_message_type_on_another_action_is_ignored() -> None:
+    """Pilot: a message_type left on a cancel_order discarded the whole decision."""
+    action = parse_action(json_action(action="wait", message_type="OFFER"), condition=Condition.B)
+    assert action.action is ActionType.WAIT
+    assert action.message_type is None
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"order_id": 23},
+        {"target": 23},
+        {"target": "#23"},
+        {"quantity": 23},
+    ],
+)
+def test_cancel_order_takes_the_id_where_models_put_it(fields: dict) -> None:
+    """Pilot: models wrote order_id, or a bare number in target."""
+    action = parse_action(json_action(action="cancel_order", **fields), condition=Condition.B)
+    assert action.action is ActionType.CANCEL_ORDER
+    assert action.quantity == 23
+
+
+def test_cancel_order_inside_place_orders_takes_order_id() -> None:
+    text = json_action(
+        action="place_orders",
+        orders=[
+            {"action": "cancel_order", "target": None, "order_id": 23},
+            {"action": "buy", "target": "herbs", "quantity": 2, "price": 3.2},
+        ],
+    )
+    action = parse_action(text, condition=Condition.B)
+    assert action.orders[0].quantity == 23
+
+
+def test_the_artisan_brief_says_artisans_do_not_go_on_expeditions() -> None:
+    from rpg_economy.agents.prompts import ROLE_BRIEF
+    from rpg_economy.domain import Role
+
+    assert "do not go on expeditions" in ROLE_BRIEF[Role.ARTISAN]
+
+
+def test_a_sent_message_logs_its_good_and_terms(rig) -> None:
+    config, engine, messages = rig
+    agent, _ = runner(
+        config,
+        engine,
+        messages,
+        always(
+            json_action(
+                action="send_message",
+                message_type="OFFER",
+                target="iron",
+                quantity=2,
+                price="7",
+                recipient="warrior_1",
+            )
+        ),
+    )
+    agent.activate(engine, "woodworking_1")
+    engine.log.close()
+    sent = [e for e in read_events(engine.log.path) if e.type is EventType.MESSAGE_SENT]
+    assert sent[-1].payload["good"] == "iron"
+    assert sent[-1].payload["quantity"] == 2
+    assert sent[-1].payload["type"] == "OFFER"
+
+
+# ---------------------------------------------------------------------------
+# Prompt content per condition (design s3.1, s5.2)
+# ---------------------------------------------------------------------------
+def test_condition_a_prompts_do_not_document_peer_messages(rig) -> None:
+    config, engine, messages = rig
+    observation = build_observation(config, engine, "woodworking_1", messages=messages)
+    a = build_agent_prompt(observation, config, condition=Condition.A)
+    b = build_agent_prompt(observation, config, condition=Condition.B)
+
+    assert "send_message" not in a.user
+    assert '"needs"' in a.user and "observations" in a.user
+    assert "send_message" in b.user
+    assert '"needs"' not in b.user
