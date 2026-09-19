@@ -27,6 +27,7 @@ from rpg_economy.domain import (
     MessageType,
     Priority,
     Product,
+    Role,
     TokenBucket,
 )
 from rpg_economy.engine import Engine, build_world
@@ -1134,3 +1135,271 @@ def test_condition_a_prompts_do_not_document_peer_messages(rig) -> None:
     assert '"needs"' in a.user and "observations" in a.user
     assert "send_message" in b.user
     assert '"needs"' not in b.user
+
+
+def test_every_condition_gets_the_same_world_rules(rig) -> None:
+    """Recipes and zones are rules of the world, not information one condition earns."""
+    config, engine, messages = rig
+    observation = build_observation(config, engine, "smithing_1", messages=messages)
+    systems = {
+        condition: build_agent_prompt(observation, config, condition=condition).system
+        for condition in Condition
+    }
+    assert len(set(systems.values())) == 1
+    assert "melee_weapon (smithing)" in systems[Condition.A]
+
+
+def test_an_agent_sees_its_own_recent_actions(rig) -> None:
+    config, engine, messages = rig
+    agent, _ = runner(
+        config,
+        engine,
+        messages,
+        always(json_action(action="sell", target="iron", quantity=99, price=10.0)),
+    )
+    agent.activate(engine, "warrior_1")
+    observation = build_observation(
+        config,
+        engine,
+        "warrior_1",
+        messages=messages,
+        history=list(agent._history["warrior_1"]),
+    )
+    prompt = build_agent_prompt(observation, config)
+    assert '"your_recent_actions"' in prompt.sections["state"]
+    assert '"accepted":false' in prompt.sections["state"]
+
+
+def test_nulls_and_unknown_keys_do_not_invalidate_an_action() -> None:
+    action = parse_action(
+        '{"action": "wait", "priority": null, "short_reason": null, "confidence": 0.9}',
+        condition=Condition.B,
+    )
+    assert action.priority is Priority.MEDIUM
+    assert action.short_reason == ""
+
+
+def test_the_role_briefs_give_no_tactical_advice() -> None:
+    from rpg_economy.agents.prompts import ROLE_BRIEF
+
+    assert set(ROLE_BRIEF) == {Role.ADVENTURER, Role.ARTISAN}
+    for brief in ROLE_BRIEF.values():
+        assert "buy below" not in brief.lower() and "sell above" not in brief.lower()
+
+
+# ---------------------------------------------------------------------------
+# Leniency: what carries no decision is not invalid output
+# ---------------------------------------------------------------------------
+def test_null_result_lists_read_as_empty() -> None:
+    from rpg_economy.agents.parsing import parse_activation
+
+    _, fields = parse_activation(
+        json_action(action="wait", needs=None, offers=None, observations=None),
+        condition=Condition.A,
+    )
+    assert fields.needs == [] and fields.offers == [] and fields.observations == []
+
+
+def test_result_entries_drop_unknown_keys_and_fold_case() -> None:
+    from rpg_economy.agents.parsing import parse_activation
+
+    _, fields = parse_activation(
+        json_action(
+            action="wait",
+            needs=[{"good": " IRON ", "quantity": 2, "priority": "HIGH", "why": "forge idle"}],
+            offers=[{"good": "Melee_Weapon", "quantity": 1, "price": 30, "note": "x"}],
+            observations=[{"signal": "SCARCE", "good": "Iron", "comment": "dear"}],
+        ),
+        condition=Condition.A,
+    )
+    assert fields.needs[0].good == "iron"
+    assert fields.needs[0].priority is Priority.HIGH
+    assert fields.offers[0].good == "melee_weapon"
+    assert fields.observations[0].signal.value == "scarce"
+    assert fields.observations[0].good == "iron"
+
+
+def test_normalize_entry_leaves_decisions_to_validation() -> None:
+    from rpg_economy.agents.parsing import NEED_FIELDS, normalize_entry
+
+    assert normalize_entry({"good": "gold", "quantity": 0, "x": 1}, NEED_FIELDS) == {
+        "good": "gold",
+        "quantity": 0,
+    }
+    assert normalize_entry({"good": "iron", "quantity": 1, "priority": None}, NEED_FIELDS) == {
+        "good": "iron",
+        "quantity": 1,
+    }
+    assert normalize_entry("not an entry", NEED_FIELDS) == "not an entry"
+
+
+def test_an_overlong_short_reason_is_cut_not_refused() -> None:
+    from rpg_economy.agents.parsing import SHORT_REASON_LIMIT
+
+    action = parse_action(
+        json_action(action="wait", short_reason="x" * (SHORT_REASON_LIMIT + 100)),
+        condition=Condition.B,
+    )
+    assert len(action.short_reason) == SHORT_REASON_LIMIT
+
+
+def test_cancel_order_accepts_the_order_id_in_target() -> None:
+    action = parse_action(json_action(action="cancel_order", target=" 17 "), condition=Condition.B)
+    assert action.action is ActionType.CANCEL_ORDER
+    assert action.quantity == 17
+
+
+def test_cancel_order_without_an_id_anywhere_is_invalid() -> None:
+    with pytest.raises(InvalidAgentOutput, match="order id"):
+        parse_action(json_action(action="cancel_order", target="iron"), condition=Condition.B)
+
+
+def test_an_empty_message_type_outside_send_message_is_ignored() -> None:
+    action = parse_action(json_action(action="wait", message_type=""), condition=Condition.B)
+    assert action.message_type is None
+
+
+# ---------------------------------------------------------------------------
+# A reply cut off by the output cap is told apart from a malformed one
+# ---------------------------------------------------------------------------
+class _TruncatingClient(MockLLMClient):
+    def complete(self, *, system: str, user: str):
+        import dataclasses
+
+        return dataclasses.replace(
+            super().complete(system=system, user=user), finish_reason="length"
+        )
+
+
+def test_a_truncated_reply_is_flagged_as_truncated(rig) -> None:
+    config, engine, messages = rig
+    client = _TruncatingClient(always('{"action": "wa'))
+    agent = LLMAgentRunner(config, client, TokenLedger(), messages=messages)
+    agent.activate(engine, "woodworking_1")
+    engine.log.close()
+
+    invalid = [e for e in read_events(engine.log.path) if e.type is EventType.AGENT_OUTPUT_INVALID]
+    assert invalid
+    assert all(e.payload["truncated"] is True for e in invalid)
+
+
+def test_a_malformed_complete_reply_is_not_flagged_as_truncated(rig) -> None:
+    config, engine, messages = rig
+    agent, _ = runner(config, engine, messages, always("garbage"))
+    agent.activate(engine, "woodworking_1")
+    engine.log.close()
+
+    invalid = [e for e in read_events(engine.log.path) if e.type is EventType.AGENT_OUTPUT_INVALID]
+    assert invalid
+    assert all(e.payload["truncated"] is False for e in invalid)
+
+
+# ---------------------------------------------------------------------------
+# The observation separates what is held from what is still free to use
+# ---------------------------------------------------------------------------
+def test_the_observation_shows_unreserved_inventory_apart_from_the_total(rig) -> None:
+    from rpg_economy.domain import OrderSide, Resource
+
+    config, engine, messages = rig
+    account = engine.state.account("woodworking_1")
+    account.inventory.clear()
+    account.receive(Resource.IRON, 5)
+    engine.submit_order("woodworking_1", OrderSide.SELL, Resource.IRON, 3, "500")
+
+    observation = build_observation(config, engine, "woodworking_1", messages=messages)
+
+    assert observation.inventory["iron"] == 5
+    assert observation.available_inventory["iron"] == 2
+    assert observation.to_payload()["available_inventory"]["iron"] == 2
+
+
+def test_fully_reserved_stock_is_absent_from_the_available_inventory(rig) -> None:
+    from rpg_economy.domain import OrderSide, Resource
+
+    config, engine, messages = rig
+    account = engine.state.account("woodworking_1")
+    account.inventory.clear()
+    account.receive(Resource.IRON, 3)
+    engine.submit_order("woodworking_1", OrderSide.SELL, Resource.IRON, 3, "500")
+
+    observation = build_observation(config, engine, "woodworking_1", messages=messages)
+
+    assert observation.inventory == {"iron": 3}
+    assert "iron" not in observation.available_inventory
+
+
+def test_the_observation_shows_unreserved_gold_apart_from_the_total(rig) -> None:
+    from rpg_economy.domain import OrderSide, Resource
+
+    config, engine, messages = rig
+    account = engine.state.account("woodworking_1")
+    total = account.gold
+    engine.submit_order("woodworking_1", OrderSide.BUY, Resource.IRON, 2, "10")
+
+    observation = build_observation(config, engine, "woodworking_1", messages=messages)
+
+    assert observation.gold == total
+    assert observation.available_gold == total - Decimal("20")
+
+
+# ---------------------------------------------------------------------------
+# place_orders: several market orders in one activation
+# ---------------------------------------------------------------------------
+def _orders_json(orders: list[dict], **extra) -> str:
+    import json
+
+    return json.dumps({"action": "place_orders", "orders": orders, "short_reason": "", **extra})
+
+
+def test_place_orders_parses_each_order_as_the_action_it_is() -> None:
+    action = parse_action(
+        _orders_json(
+            [
+                {"action": "sell", "target": "iron", "quantity": 3, "price": 10.5},
+                {"action": "buy", "target": "health_potion", "quantity": 2, "price": 15},
+                {"action": "cancel_order", "target": "7"},
+            ]
+        ),
+        condition=Condition.B,
+    )
+    assert action.action is ActionType.PLACE_ORDERS
+    assert [o.action for o in action.orders] == [
+        ActionType.SELL,
+        ActionType.BUY,
+        ActionType.CANCEL_ORDER,
+    ]
+    assert action.orders[0].price == Decimal("10.5")
+    assert action.orders[2].quantity == 7
+
+
+def test_place_orders_is_capped() -> None:
+    order = {"action": "sell", "target": "iron", "quantity": 1, "price": 10}
+    parse_action(_orders_json([order] * 4), condition=Condition.B, max_orders=4)
+    with pytest.raises(InvalidAgentOutput, match="at most 4"):
+        parse_action(_orders_json([order] * 5), condition=Condition.B, max_orders=4)
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        [],
+        [{"action": "produce", "target": "armor", "quantity": 1}],
+        [{"action": "start_expedition", "target": "green_hollow"}],
+        [{"action": "sell", "target": "iron", "quantity": 1}],  # no price
+        ["sell iron"],
+    ],
+)
+def test_place_orders_takes_only_complete_market_orders(bad: list) -> None:
+    with pytest.raises(InvalidAgentOutput):
+        parse_action(_orders_json(bad), condition=Condition.B)
+
+
+def test_a_stray_orders_list_beside_another_action_is_ignored() -> None:
+    """Like a stray message_type: the action named is the one the agent chose."""
+    action = parse_action(
+        json_action(action="wait")[:-1]
+        + ', "orders": [{"action": "sell", "target": "iron", "quantity": 1, "price": 9}]}',
+        condition=Condition.B,
+    )
+    assert action.action is ActionType.WAIT
+    assert not action.orders
