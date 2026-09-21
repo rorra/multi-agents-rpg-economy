@@ -5,6 +5,7 @@
   "error.locale.unsupported": "Idioma no soportado: {lang}. Soportados: {supported}.",
   "experiment.experiment_1": "Experimento 1 — actividad económica igualada",
   "experiment.experiment_2": "Experimento 2 — coste total igualado",
+  "metric.volume": "Volumen transado",
   "product.armor": "Armadura",
   "product.bow_gear": "Arco / equipo de exploración",
   "product.health_potion": "Poción de salud",

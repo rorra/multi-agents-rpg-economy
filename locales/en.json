@@ -5,6 +5,7 @@
   "error.locale.unsupported": "Unsupported locale {lang}. Supported: {supported}.",
   "experiment.experiment_1": "Experiment 1 — equal economic activity",
   "experiment.experiment_2": "Experiment 2 — equal total cost",
+  "metric.volume": "Traded volume",
   "product.armor": "Armor",
   "product.bow_gear": "Bow / exploration gear",
   "product.health_potion": "Health potion",
