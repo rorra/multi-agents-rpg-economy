@@ -14,17 +14,17 @@ every condition that recovers slowly toward looking better than it is.
 from __future__ import annotations
 
 import statistics
-from collections import deque
+from collections import Counter, deque
 from collections.abc import Iterable, Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
 from rpg_economy.config.models import SimulationConfig
-from rpg_economy.domain import OrderSide
+from rpg_economy.domain import ALL_GOODS, OrderSide, Resource, TokenBucket
 from rpg_economy.logging_ import Event, EventType, read_events, read_metadata
-from rpg_economy.metrics.targets import PrimaryTarget, TargetKind
+from rpg_economy.metrics.targets import PrimaryTarget, TargetKind, propagation_product
 
 ZERO = Decimal(0)
 
@@ -563,3 +563,558 @@ def net_gold(holding: dict[str, Any]) -> Decimal:
     arrears were recorded carries no field, read as nothing owed.
     """
     return Decimal(str(holding.get("gold", 0))) - Decimal(str(holding.get("tax_arrears") or 0))
+
+
+def gini(
+    log: RunLog,
+    config: SimulationConfig,
+    holdings: dict[str, dict[str, Any]],
+    *,
+    until: int | None = None,
+) -> float | None:
+    """Gini over net gold plus inventory at fixed reference prices (design s11.1).
+
+    Gold is net of tax arrears (:func:`net_gold`). Reserved and frozen gold stay
+    in: both are still the agent's.
+
+    Inventory is valued at each good's mean base-phase transaction price, or its
+    configured reference where it did not trade then. Valuing at concurrent
+    prices would make Gini partly an artifact of volatility, which is itself a
+    dependent variable of the study.
+
+    An agent whose arrears exceed everything it holds counts as holding
+    nothing: Gini is defined on non-negative wealth, and the lien cannot take
+    more than the agent has.
+
+    ``None`` when there are no holdings to measure. Zero would assert perfect
+    equality, which is the same fabrication s11.3 forbids for volatility.
+    ``until`` limits the valuation basis to the trades seen before that tick
+    (the common active horizon; pass the holdings at that tick).
+    """
+    reference = base_phase_reference_prices(log, config, until=until)
+    wealth: list[float] = []
+    for holding in holdings.values():
+        total = net_gold(holding)
+        for good, units in (holding.get("inventory") or {}).items():
+            total += reference.get(good, ZERO) * units
+        wealth.append(max(0.0, float(total)))
+
+    if not wealth or sum(wealth) <= 0:
+        # No measurable distribution: missing, not equal.
+        return None
+    wealth.sort()
+    n = len(wealth)
+    cumulative = sum((i + 1) * value for i, value in enumerate(wealth))
+    return (2 * cumulative) / (n * sum(wealth)) - (n + 1) / n
+
+
+def _holding_deltas(event: Event) -> Iterator[tuple[str, str | None, Decimal]]:
+    """``(agent, good or None for gold, change)`` for every holding an event moves.
+
+    The complete list of what changes an agent's gold or inventory, the same
+    flows the economy check reconciles gold against.
+    """
+    payload = event.payload
+    match event.type:
+        case EventType.TRADE_EXECUTED:
+            buyer = payload.get("buyer_id") or payload.get("buyer")
+            seller = payload.get("seller_id") or payload.get("seller")
+            value = Decimal(str(payload["value"]))
+            quantity = Decimal(int(payload["quantity"]))
+            if buyer:
+                yield buyer, None, -value
+                yield buyer, payload["good"], quantity
+            if seller:
+                yield seller, None, value
+                yield seller, payload["good"], -quantity
+        case EventType.EXPEDITION_RESOLVED if event.agent_id:
+            yield event.agent_id, None, Decimal(str(payload.get("gold", "0")))
+            for good, units in (payload.get("yielded") or {}).items():
+                yield event.agent_id, good, Decimal(int(units))
+        case EventType.TAX_PAID | EventType.STORAGE_PAID if event.agent_id:
+            yield event.agent_id, None, -Decimal(str(payload["amount"]))
+        case EventType.GOODS_CONFISCATED if event.agent_id:
+            yield event.agent_id, None, Decimal(str(payload["gold"]))
+            yield event.agent_id, payload["good"], -Decimal(int(payload["quantity"]))
+        case EventType.PRODUCTION_COMPLETED if event.agent_id:
+            yield event.agent_id, payload["product"], Decimal(int(payload.get("quantity", 0)))
+            for good, units in (payload.get("consumed") or {}).items():
+                yield event.agent_id, good, -Decimal(int(units))
+        case EventType.CONSUMPTION if event.agent_id:
+            yield event.agent_id, payload["product"], -Decimal(int(payload.get("quantity", 0)))
+        case EventType.EQUIPMENT_EQUIPPED if event.agent_id:
+            yield event.agent_id, payload["product"], Decimal(-1)
+
+
+def holdings_at(
+    log: RunLog, until: int, final: dict[str, dict[str, Any]] | None = None
+) -> dict[str, dict[str, Any]] | None:
+    """Every agent's gold, arrears and inventory at the start of tick ``until``.
+
+    Reconstructed from the log alone (s15): backwards from the final holdings
+    through every event at or after ``until`` that moves gold or goods. Arrears
+    are the ``owed`` recorded by the last wealth-tax event before ``until``
+    (none recorded: nothing owed).
+
+    ``None`` with no final holdings, or when the replay goes negative -- the
+    log would then be missing an event, and a Gini built on it would be wrong
+    rather than merely thin.
+    """
+    final = final if final is not None else log.final_holdings
+    if not final:
+        return None
+    gold = {agent: Decimal(str(h.get("gold", 0))) for agent, h in final.items()}
+    goods = {
+        agent: {good: Decimal(int(n)) for good, n in (h.get("inventory") or {}).items()}
+        for agent, h in final.items()
+    }
+    arrears = dict.fromkeys(final, ZERO)
+    for event in log.events:
+        if event.tick >= until:
+            for agent, good, change in _holding_deltas(event):
+                if good is None:
+                    gold[agent] = gold.get(agent, ZERO) - change
+                else:
+                    held = goods.setdefault(agent, {})
+                    held[good] = held.get(good, ZERO) - change
+        elif event.type is EventType.TAX_PAID and event.agent_id and "owed" in event.payload:
+            arrears[event.agent_id] = Decimal(str(event.payload["owed"]))
+    if any(v < ZERO for v in gold.values()) or any(
+        n < ZERO for held in goods.values() for n in held.values()
+    ):
+        return None
+    return {
+        agent: {
+            "gold": str(gold.get(agent, ZERO)),
+            "tax_arrears": str(arrears.get(agent, ZERO)),
+            "inventory": {good: int(n) for good, n in sorted(goods.get(agent, {}).items()) if n},
+        }
+        for agent in sorted(set(gold) | set(goods))
+    }
+
+
+def base_phase_reference_prices(
+    log: RunLog, config: SimulationConfig, *, until: int | None = None
+) -> dict[str, Decimal]:
+    """Per-good valuation basis, fixed for the run (design s11.1).
+
+    ``until`` hides the trades at or after that tick, so an analysis cut at the
+    common active horizon never values holdings with prices it did not observe.
+    """
+    cutoff = config.phases.shock_tick if until is None else min(config.phases.shock_tick, until)
+    prices: dict[str, list[Decimal]] = {}
+    for trade in log.trades:
+        if trade.tick < cutoff:
+            prices.setdefault(trade.good, []).append(trade.price)
+
+    reference: dict[str, Decimal] = {}
+    for good in ALL_GOODS:
+        traded = prices.get(good.value)
+        reference[good.value] = (
+            sum(traded, ZERO) / len(traded)
+            if traded
+            else config.economy.initial_reference_price.get(good.value, ZERO)
+        )
+    return reference
+
+
+# ---------------------------------------------------------------------------
+# Pre-registered secondary analyses (design s11.1, s11.3)
+# ---------------------------------------------------------------------------
+def volume_by_good(
+    log: RunLog, config: SimulationConfig, *, until: int | None = None
+) -> dict[str, dict[str, dict[str, Any]]]:
+    """Units and value traded per good and phase (design s11.1, "Volumen").
+
+    ``until`` leaves out the trades at or after that tick.
+    """
+    table: dict[str, dict[str, dict[str, Any]]] = {
+        good.value: {phase: {"units": 0, "value": 0.0} for phase in PHASES} for good in ALL_GOODS
+    }
+    for trade in log.trades:
+        if until is not None and trade.tick >= until:
+            continue
+        cell = table.setdefault(
+            trade.good, {phase: {"units": 0, "value": 0.0} for phase in PHASES}
+        )[phase_of(trade.tick, config)]
+        cell["units"] += trade.quantity
+        cell["value"] += float(trade.value)
+    return table
+
+
+def _mean_price_by_phase(
+    log: RunLog, config: SimulationConfig, good: str, *, until: int | None = None
+) -> dict[str, float | None]:
+    prices: dict[str, list[float]] = {phase: [] for phase in PHASES}
+    for trade in log.trades:
+        if trade.good == good and (until is None or trade.tick < until):
+            prices[phase_of(trade.tick, config)].append(float(trade.price))
+    # No trade in a phase: no price, missing rather than zero.
+    return {phase: (statistics.fmean(v) if v else None) for phase, v in prices.items()}
+
+
+def propagation(
+    log: RunLog, config: SimulationConfig, resource: str, *, until: int | None = None
+) -> tuple[dict[str, Any], Duration | None] | None:
+    """How a shock to a raw material reaches its main finished product (s11.3).
+
+    The pre-registered secondary propagation analysis: the product comes from
+    the fixed resource -> product mapping. Reported on that product: its mean
+    transaction price per phase, its stockout ticks per phase (primary
+    definition), and its recovery time, censored exactly like the target's.
+    ``None`` when the target is not a raw material (there is nothing upstream
+    to propagate from). ``until`` cuts every part of it at that tick, the
+    recovery included (censored there, as the target's is).
+    """
+    try:
+        product = propagation_product(Resource(resource))
+    except ValueError:
+        return None
+    if product is None:
+        return None
+    series = price_series(
+        log.trades, product.value, config.time.horizon_ticks, config.metrics.volatility_window_w
+    )
+    counted = stockouts(log, config, product.value, until=until)
+    payload = {
+        "source": resource,
+        "good": product.value,
+        "mean_price": _mean_price_by_phase(log, config, product.value, until=until),
+        "stockout_ticks": counted["by_phase"],
+    }
+    return payload, recovery_time(series, config, horizon=until)
+
+
+def _ratio(numerator: float | None, denominator: float | None) -> float | None:
+    if numerator is None or denominator is None or denominator <= 0:
+        return None
+    return numerator / denominator
+
+
+def multi_good_aggregate(
+    log: RunLog,
+    config: SimulationConfig,
+    volumes: dict[str, dict[str, dict[str, Any]]],
+    *,
+    until: int | None = None,
+) -> dict[str, Any]:
+    """Secondary metrics over every good, one value per run (design s11.3).
+
+    The pre-registered rule for metrics that involve several equivalent goods
+    and no directed shock: each good is normalized by its own base-phase value,
+    then the median across goods is the run's value. Normalizing first keeps a
+    good with high prices or volumes from dominating the aggregate.
+
+    * ``volatility``: phase-level shock volatility over base volatility;
+    * ``volume``: units traded per tick in the shock phase over the base phase
+      (per tick, so phases of different lengths compare);
+    * ``stockouts``: the share of shock-phase ticks without a resting ask
+      minus the share of base-phase ticks, a difference rather than a ratio:
+      a good that never stocked out in the base phase is exactly the one a
+      scarcity shock can empty, and a ratio would drop it. Where the scenario
+      has no target good (liquidity_loss) this is how stockouts enter as a
+      secondary metric (design s11.3).
+
+    For volatility and volume, a good with no base-phase value (no dispersion,
+    nothing traded) has no ratio and is left out of the median; with no value
+    at all the aggregate is missing.
+
+    ``until`` clips both phases at that tick (the common active horizon); the
+    rates are per tick of the clipped phases, and ``volumes`` must be clipped
+    the same way. A horizon at or before the shock tick leaves no shock phase,
+    so every ratio is missing.
+    """
+    bounds = _phase_bounds(config, until)
+    base_ticks = bounds[PHASE_BASE][1] - bounds[PHASE_BASE][0]
+    shock_ticks = bounds[PHASE_SHOCK][1] - bounds[PHASE_SHOCK][0]
+    per_good: dict[str, dict[str, float | None]] = {}
+    for good in ALL_GOODS:
+        volatility = volatility_phase_level(log, config, good.value, until=until)
+        units = volumes.get(good.value, {})
+        base_rate = units.get(PHASE_BASE, {}).get("units", 0) / base_ticks if base_ticks else None
+        shock_rate = (
+            units.get(PHASE_SHOCK, {}).get("units", 0) / shock_ticks if shock_ticks else None
+        )
+        out_ticks = stockouts(log, config, good.value, until=until)["by_phase"]
+        per_good[good.value] = {
+            "volatility": _ratio(volatility[PHASE_SHOCK], volatility[PHASE_BASE]),
+            "volume": _ratio(shock_rate, base_rate),
+            "stockouts": (
+                out_ticks[PHASE_SHOCK] / shock_ticks - out_ticks[PHASE_BASE] / base_ticks
+                if shock_ticks and base_ticks
+                else None
+            ),
+        }
+
+    def median_of(key: str) -> float | None:
+        values = [ratios[key] for ratios in per_good.values() if ratios[key] is not None]
+        return statistics.median(values) if values else None
+
+    return {
+        "volatility": median_of("volatility"),
+        "volume": median_of("volume"),
+        "stockouts": median_of("stockouts"),
+        "per_good": per_good,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Coordination and cost
+# ---------------------------------------------------------------------------
+def coordination(log: RunLog) -> dict[str, Any]:
+    """Activation and coordination metrics (design v1.0 s11.2)."""
+    activations = log.count(EventType.AGENT_OUTPUT)
+    wasted = log.count(EventType.ACTIVATION_WASTED)
+
+    per_agent: dict[str, int] = {}
+    for event in log.of_type(EventType.AGENT_OUTPUT):
+        per_agent[event.agent_id or ""] = per_agent.get(event.agent_id or "", 0) + 1
+    by_type: dict[str, int] = {}
+    for event in log.of_type(EventType.MESSAGE_SENT):
+        kind = str(event.payload.get("type", ""))
+        by_type[kind] = by_type.get(kind, 0) + 1
+    waits = [
+        int(e.payload.get("waiting_ticks", 0)) for e in log.of_type(EventType.ACTIVATION_SERVED)
+    ]
+    tasks = log.count(EventType.DIRECTOR_TASK_ASSIGNED)
+    cycle_ends = list(log.of_type(EventType.CYCLE_END))
+    director_calls = log.count(EventType.DIRECTOR_CALL)
+    director_errors = log.count(EventType.DIRECTOR_ERROR)
+
+    return {
+        "activations": activations,
+        "wasted_activations": wasted,
+        # None with no activations: no coordination to rate, not a 0% one.
+        "coordination_efficiency": ((activations - wasted) / activations) if activations else None,
+        # Herfindahl index of activations across agents: 1/n when spread evenly,
+        # 1 when one agent took every activation (s11.2, coordinator dependence).
+        "activation_concentration": (
+            sum((n / activations) ** 2 for n in per_agent.values()) if activations else None
+        ),
+        # Ticks between the trigger and the action it led to (s11.2). In B/C
+        # that is how long the request waited in the scheduler's queue; in A a
+        # TASK is carried out in the tick it is assigned.
+        "latency_mean": (statistics.mean(waits) if waits else (0.0 if tasks else None)),
+        "messages_by_type": dict(sorted(by_type.items())),
+        "director_retries": sum(int(e.payload.get("director_retries", 0)) for e in cycle_ends),
+        "cycles_closed_by_cap": sum(1 for e in cycle_ends if e.payload.get("closed_by_cap")),
+        "director_error_rate": (director_errors / director_calls) if director_calls else None,
+        "activation_requests": log.count(EventType.ACTIVATION_REQUESTED),
+        # Scheduler deferrals only: requests left over once K is used up. Those
+        # skipped because the token budget ran out are logged too, with their
+        # own reason, and are not a coordination outcome.
+        "activations_deferred": sum(
+            1
+            for e in log.of_type(EventType.ACTIVATION_DEFERRED)
+            if e.payload.get("reason", "k_limit") == "k_limit"
+        ),
+        "messages_sent": log.count(EventType.MESSAGE_SENT),
+        "director_calls": log.count(EventType.DIRECTOR_CALL),
+        "director_errors": log.count(EventType.DIRECTOR_ERROR),
+        "invalid_outputs": log.count(EventType.AGENT_OUTPUT_INVALID),
+        # Replies cut off by the output cap: the model ran out of room, which is
+        # not the same failure as a malformed answer.
+        "truncated_outputs": sum(
+            1 for e in log.of_type(EventType.AGENT_OUTPUT_INVALID) if e.payload.get("truncated")
+        )
+        + sum(
+            1
+            for e in log.of_type(EventType.DIRECTOR_CALL)
+            if e.payload.get("finish_reason") == "length"
+        ),
+        "llm_calls": log.count(EventType.LLM_CALL) + log.count(EventType.DIRECTOR_CALL),
+        # Share of cycles that used every one of the K activations: whether K
+        # actually limited this condition (design s8.1; K is calibrated so it
+        # binds in B and C too, not only under the Director).
+        "k_binding_rate": _k_binding_rate(cycle_ends),
+        "task_types": dict(
+            sorted(
+                Counter(
+                    str(e.payload.get("type"))
+                    for e in log.of_type(EventType.DIRECTOR_TASK_ASSIGNED)
+                ).items()
+            )
+        ),
+    }
+
+
+def _k_binding_rate(cycle_ends: list) -> float | None:
+    counted = [
+        e.payload
+        for e in cycle_ends
+        if e.payload.get("k")
+        and "effective_activations" in e.payload
+        and not e.payload.get("post_exhaustion")
+    ]
+    if not counted:
+        return None
+    return sum(1 for p in counted if p["effective_activations"] >= p["k"]) / len(counted)
+
+
+#: Messages that answer a REQUEST (design s11.2).
+ANSWER_TYPES = frozenset({"OFFER", "ACK", "REJECT"})
+
+
+def unanswered_requests(
+    log: RunLog, config: SimulationConfig, *, exhaustion_tick: int | None = None
+) -> int:
+    """REQUESTs with no compatible reply within D ticks (design v1.0 s11.2)."""
+    window = config.metrics.unanswered_request_ticks_d
+    sent = [
+        (
+            e.seq,
+            e.tick,
+            e.agent_id,
+            e.payload["recipient_id"],
+            e.payload["type"],
+            e.payload.get("good"),
+        )
+        for e in log.of_type(EventType.MESSAGE_SENT)
+    ]
+    requests = [(q, t, s, r, g) for q, t, s, r, kind, g in sent if kind == "REQUEST"]
+    # Replies can come only while agents are activated: up to the end of the
+    # run, or up to the budget's exhaustion (Experiment 2), whichever is first.
+    last_tick = config.time.horizon_ticks - 1
+    if exhaustion_tick is not None:
+        last_tick = min(last_tick, exhaustion_tick - 1)
+    unanswered = 0
+    for seq, tick, sender, recipient, good in requests:
+        # A compatible reply is an answer from the recipient about the same
+        # good (design s11.2): an OFFER, an ACK or a REJECT, never a REQUEST of
+        # its own. It may come in the same tick: delivery is immediate, so a
+        # reply can come from an agent activated later that cycle.
+        replied = any(
+            reply_seq > seq
+            and reply_tick <= tick + window
+            and reply_sender == recipient
+            and reply_recipient == sender
+            and reply_good == good
+            and reply_kind in ANSWER_TYPES
+            for reply_seq, reply_tick, reply_sender, reply_recipient, reply_kind, reply_good in sent
+        )
+        # Right-censored: a request whose reply window runs past the end of the
+        # run was never given its D ticks, so it is not counted as unanswered.
+        if not replied and tick + window <= last_tick:
+            unanswered += 1
+    return unanswered
+
+
+def token_totals(log: RunLog) -> dict[str, Any]:
+    """Token consumption by bucket, plus the authoritative total (design s8.4)."""
+    for event in log.of_type(EventType.TOKENS_CONSUMED):
+        payload = event.payload
+        return {
+            "by_bucket": payload["total"],
+            # Kept separate because input and output are priced differently, so
+            # a cost projection cannot work from the combined total.
+            "input_by_bucket": payload.get("input", {}),
+            "output_by_bucket": payload.get("output", {}),
+            "calls_by_bucket": payload.get("calls", {}),
+            "authoritative_total": payload.get("authoritative_total", payload["grand_total"]),
+            "budget": payload.get("budget", {}),
+        }
+    empty = dict.fromkeys((b.value for b in TokenBucket), 0)
+    return {
+        "by_bucket": dict(empty),
+        "input_by_bucket": dict(empty),
+        "output_by_bucket": dict(empty),
+        "calls_by_bucket": dict(empty),
+        "authoritative_total": 0,
+        "budget": {},
+    }
+
+
+# ---------------------------------------------------------------------------
+# The whole run
+# ---------------------------------------------------------------------------
+@dataclass
+class RunMetrics:
+    """One run's metrics. Language-neutral; rendering happens elsewhere."""
+
+    run_id: str
+    condition: str
+    scenario: str
+    experiment: str
+    seed: int
+    target_good: str | None
+    target_kind: str
+
+    volatility: dict[str, float | None]
+    volatility_phase: dict[str, float | None]
+    volatility_windows: dict[str, dict[str, int]]
+    stockouts: dict[str, Any]
+    volume_units: dict[str, int]
+    volume_value: dict[str, float]
+    recovery: Duration | None
+    recovery_common_horizon: Duration | None
+    useful_production: dict[str, Any]
+    gini: float | None
+    coordination: dict[str, Any]
+    unanswered_requests: int
+    tokens: dict[str, Any]
+    exhaustion_tick: int | None
+    primary_metrics: tuple[str, ...] = field(default_factory=tuple)
+    #: True for a run made with the offline mock: never evidence about a model.
+    mock: bool = False
+    #: Economic metrics cut at the trio's common active horizon (Experiment 2
+    #: secondary analysis, design s8.4). ``None`` when no horizon was given.
+    common_horizon: dict[str, Any] | None = None
+    #: Units and value traded per good and phase (design s11.1).
+    volume_by_good: dict[str, dict[str, dict[str, Any]]] = field(default_factory=dict)
+    #: Secondary stockout definition: no unit of the target held in the world.
+    #: ``None`` with no target good, or when the log cannot support the replay.
+    stockouts_inventory: dict[str, Any] | None = None
+    #: The shock's propagation to the resource's main product (secondary, s11.3).
+    #: ``None`` when the target is not a raw material.
+    propagation: dict[str, Any] | None = None
+    propagation_recovery: Duration | None = None
+    #: The propagated product's recovery at the common active horizon (s8.4).
+    propagation_recovery_common_horizon: Duration | None = None
+    #: Secondary multi-good aggregates, normalized by base phase (s11.3).
+    multi_good: dict[str, Any] = field(default_factory=dict)
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            "run_id": self.run_id,
+            "condition": self.condition,
+            "scenario": self.scenario,
+            "experiment": self.experiment,
+            "seed": self.seed,
+            "target_good": self.target_good,
+            "target_kind": self.target_kind,
+            "primary_metrics": list(self.primary_metrics),
+            "volatility": self.volatility,
+            "volatility_phase": self.volatility_phase,
+            "volatility_windows": self.volatility_windows,
+            "stockouts": self.stockouts,
+            "volume_units": self.volume_units,
+            "volume_value": self.volume_value,
+            "recovery": None if self.recovery is None else self.recovery.to_payload(),
+            "recovery_common_horizon": (
+                None
+                if self.recovery_common_horizon is None
+                else self.recovery_common_horizon.to_payload()
+            ),
+            "useful_production": self.useful_production,
+            "gini": self.gini,
+            "coordination": self.coordination,
+            "unanswered_requests": self.unanswered_requests,
+            "tokens": self.tokens,
+            "exhaustion_tick": self.exhaustion_tick,
+            "common_horizon": self.common_horizon,
+            "volume_by_good": self.volume_by_good,
+            "stockouts_inventory": self.stockouts_inventory,
+            "propagation": self.propagation,
+            "propagation_recovery": (
+                None
+                if self.propagation_recovery is None
+                else self.propagation_recovery.to_payload()
+            ),
+            "propagation_recovery_common_horizon": (
+                None
+                if self.propagation_recovery_common_horizon is None
+                else self.propagation_recovery_common_horizon.to_payload()
+            ),
+            "multi_good": self.multi_good,
+            "mock": self.mock,
+        }
