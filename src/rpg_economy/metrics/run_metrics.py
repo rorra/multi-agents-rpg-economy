@@ -24,7 +24,12 @@ from typing import Any
 from rpg_economy.config.models import SimulationConfig
 from rpg_economy.domain import ALL_GOODS, OrderSide, Resource, TokenBucket
 from rpg_economy.logging_ import Event, EventType, read_events, read_metadata
-from rpg_economy.metrics.targets import PrimaryTarget, TargetKind, propagation_product
+from rpg_economy.metrics.targets import (
+    PrimaryTarget,
+    TargetKind,
+    primary_target,
+    propagation_product,
+)
 
 ZERO = Decimal(0)
 
@@ -1118,3 +1123,180 @@ class RunMetrics:
             "multi_good": self.multi_good,
             "mock": self.mock,
         }
+
+
+def compute_run_metrics(
+    log_path: Path | str,
+    config: SimulationConfig,
+    *,
+    holdings: dict[str, dict[str, Any]] | None = None,
+    common_active_horizon: int | None = None,
+) -> RunMetrics:
+    """Compute every per-run metric from a completed run's log."""
+    log = RunLog(log_path)
+    target = primary_target(config)
+    series = target_series(log, config, target)
+    good = target.good.value if target.good is not None else None
+
+    volume_units = dict.fromkeys(PHASES, 0)
+    volume_value = dict.fromkeys(PHASES, 0.0)
+    for trade in log.trades:
+        phase = phase_of(trade.tick, config)
+        volume_units[phase] += trade.quantity
+        volume_value[phase] += float(trade.value)
+
+    tokens = token_totals(log)
+    budget = tokens.get("budget") or {}
+
+    final = holdings or log.final_holdings
+    common: dict[str, Any] | None = None
+    propagated_common: tuple[dict[str, Any], Duration | None] | None = None
+    if common_active_horizon is not None:
+        if good is not None:
+            propagated_common = propagation(log, config, good, until=common_active_horizon)
+        common = common_horizon_metrics(
+            log,
+            config,
+            good,
+            common_active_horizon,
+            holdings=final,
+            propagated=propagated_common,
+        )
+
+    volumes = volume_by_good(log, config)
+    propagated = propagation(log, config, good) if good is not None else None
+
+    return RunMetrics(
+        run_id=log.metadata.run_id,
+        condition=log.metadata.condition.value,
+        scenario=log.metadata.scenario.value,
+        experiment=log.metadata.experiment.value,
+        seed=log.metadata.seed,
+        target_good=good,
+        target_kind=target.kind.value,
+        primary_metrics=target.primary_metrics,
+        volatility=(
+            volatility_by_phase(log, config, good)
+            if good
+            else dict.fromkeys(PHASES, None)  # no target good: missing, not zero
+        ),
+        volatility_phase=(
+            volatility_phase_level(log, config, good) if good else dict.fromkeys(PHASES, None)
+        ),
+        volatility_windows=volatility_windows(log, config, good),
+        stockouts=stockouts(log, config, good)
+        if good
+        else {
+            "good": None,
+            "episodes": 0,
+            "total_ticks": 0,
+            "longest": 0,
+            "by_phase": dict.fromkeys(PHASES, 0),
+        },
+        volume_units=volume_units,
+        volume_value=volume_value,
+        recovery=recovery_time(series, config),
+        recovery_common_horizon=(
+            None
+            if common_active_horizon is None
+            else recovery_time(series, config, horizon=common_active_horizon)
+        ),
+        useful_production=useful_production(log, config),
+        gini=gini(log, config, final),
+        coordination=coordination(log),
+        unanswered_requests=unanswered_requests(
+            log, config, exhaustion_tick=budget.get("exhausted_tick")
+        ),
+        tokens=tokens,
+        exhaustion_tick=budget.get("exhausted_tick"),
+        common_horizon=common,
+        volume_by_good=volumes,
+        stockouts_inventory=inventory_stockouts(log, config, good) if good else None,
+        propagation=None if propagated is None else propagated[0],
+        propagation_recovery=None if propagated is None else propagated[1],
+        propagation_recovery_common_horizon=(
+            None if propagated_common is None else propagated_common[1]
+        ),
+        multi_good=multi_good_aggregate(log, config, volumes),
+        mock=log.metadata.llm_mock,
+    )
+
+
+def common_horizon_metrics(
+    log: RunLog,
+    config: SimulationConfig,
+    good: str | None,
+    horizon: int,
+    *,
+    holdings: dict[str, dict[str, Any]] | None = None,
+    propagated: tuple[dict[str, Any], Duration | None] | None = None,
+) -> dict[str, Any]:
+    """Every economic metric recomputed over the trio's common active horizon (s8.4).
+
+    The secondary analysis of Experiment 2 compares the three runs of a trio
+    only over the stretch where all of them still had decision capacity, so
+    every economic metric is cut at ``horizon``, not only the primary ones
+    (design s8.4, s11.2). Each key holds the same one value per run as the
+    full-horizon metric of that name.
+
+    Shock-phase metrics use the part of the shock phase before ``horizon``.
+    When the horizon ends at or before the shock tick that interval is empty
+    and every shock metric is missing -- never zero. Zero traded value or zero
+    stockout ticks would state that the market was idle or always supplied
+    over an interval that was never observed.
+
+    Useful production and Gini are not shock-phase metrics: they are measured
+    on ``[0, horizon)`` and on the holdings at ``horizon`` respectively.
+    """
+    shock_lo = config.phases.shock_tick
+    shock_hi = min(config.phases.reversion_tick, horizon)
+    observed = shock_hi > shock_lo
+
+    inventory = inventory_stockouts(log, config, good, until=horizon) if good is not None else None
+    if propagated is None and good is not None:
+        propagated = propagation(log, config, good, until=horizon)
+    multi = multi_good_aggregate(
+        log, config, volume_by_good(log, config, until=horizon), until=horizon
+    )
+    at_horizon = holdings_at(log, horizon, holdings)
+
+    def shock_only(value: Any) -> Any:
+        return value if observed else None
+
+    return {
+        "horizon": horizon,
+        "traded_value": shock_only(
+            sum(float(t.value) for t in log.trades if shock_lo <= t.tick < shock_hi)
+        ),
+        "stockout_ticks": (
+            shock_only(stockouts(log, config, good, until=horizon)["by_phase"][PHASE_SHOCK])
+            if good is not None
+            else None
+        ),
+        # The window-mean definition and its phase-level companion, both clipped
+        # at the horizon (the last window is cut short there).
+        "volatility_shock": (
+            volatility_by_phase(log, config, good, until=horizon)[PHASE_SHOCK]
+            if good is not None
+            else None
+        ),
+        "volatility_shock_phase": (
+            volatility_phase_level(log, config, good, until=horizon)[PHASE_SHOCK]
+            if good is not None
+            else None
+        ),
+        "stockout_ticks_inventory": (
+            shock_only(inventory["by_phase"][PHASE_SHOCK]) if inventory is not None else None
+        ),
+        "useful_production": useful_production(log, config, until=horizon)["useful_fraction"],
+        "gini": None if at_horizon is None else gini(log, config, at_horizon, until=horizon),
+        "volatility_all_goods": shock_only(multi["volatility"]),
+        "volume_all_goods": shock_only(multi["volume"]),
+        "stockouts_all_goods": shock_only(multi["stockouts"]),
+        "propagation_price_shock": (
+            shock_only(propagated[0]["mean_price"][PHASE_SHOCK]) if propagated else None
+        ),
+        "propagation_stockout_ticks": (
+            shock_only(propagated[0]["stockout_ticks"][PHASE_SHOCK]) if propagated else None
+        ),
+    }
