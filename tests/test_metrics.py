@@ -15,6 +15,7 @@ from rpg_economy.metrics.run_metrics import (
     PHASE_SHOCK,
     Duration,
     RunLog,
+    Trade,
     compute_run_metrics,
     gini,
     phase_of,
@@ -548,3 +549,511 @@ def test_coordination_reports_messages_concentration_and_director_figures() -> N
     assert result["director_retries"] == 1
     assert result["cycles_closed_by_cap"] == 1
     assert result["director_error_rate"] == pytest.approx(0.5)
+
+
+def test_a_reply_in_the_same_tick_answers_a_request() -> None:
+    """Delivery is immediate, so an agent activated later that cycle can reply."""
+    from rpg_economy.metrics.run_metrics import unanswered_requests
+
+    log = _synthetic_log(
+        [
+            (
+                EventType.MESSAGE_SENT,
+                5,
+                "a",
+                {"type": "REQUEST", "recipient_id": "b", "good": "iron"},
+            ),
+            (
+                EventType.MESSAGE_SENT,
+                5,
+                "b",
+                {"type": "OFFER", "recipient_id": "a", "good": "iron"},
+            ),
+            (
+                EventType.MESSAGE_SENT,
+                6,
+                "c",
+                {"type": "REQUEST", "recipient_id": "d", "good": "wood"},
+            ),
+        ]
+    )
+    assert unanswered_requests(log, short_config()) == 1
+
+
+def test_a_reply_about_another_good_does_not_answer_a_request() -> None:
+    from rpg_economy.metrics.run_metrics import unanswered_requests
+
+    log = _synthetic_log(
+        [
+            (
+                EventType.MESSAGE_SENT,
+                5,
+                "a",
+                {"type": "REQUEST", "recipient_id": "b", "good": "iron"},
+            ),
+            (
+                EventType.MESSAGE_SENT,
+                6,
+                "b",
+                {"type": "OFFER", "recipient_id": "a", "good": "wood"},
+            ),
+        ]
+    )
+    assert unanswered_requests(log, short_config()) == 1
+
+
+def test_common_horizon_metrics_stop_at_the_horizon(tmp_path: Path) -> None:
+    config = short_config(run={"condition": "B"})
+    result = run_condition(config, tmp_path / "run.jsonl", cycles=config.time.total_cycles)
+    cut = config.phases.reversion_tick
+    metrics = compute_run_metrics(result.log_path, config, common_active_horizon=cut)
+    full = compute_run_metrics(result.log_path, config)
+
+    assert full.common_horizon is None
+    assert metrics.common_horizon is not None
+    assert metrics.common_horizon["horizon"] == cut
+    assert metrics.common_horizon["traded_value"] <= sum(full.volume_value.values())
+    assert metrics.common_horizon["stockout_ticks"] <= full.stockouts["total_ticks"]
+
+
+def test_k_binding_rate_is_the_share_of_cycles_that_used_all_of_k() -> None:
+    from rpg_economy.metrics.run_metrics import coordination
+
+    def cycle_end(effective: int, **extra):
+        return (EventType.CYCLE_END, 1, None, {"k": 4, "effective_activations": effective, **extra})
+
+    log = _synthetic_log(
+        [
+            cycle_end(4),
+            cycle_end(2),
+            cycle_end(5),
+            cycle_end(0),
+            # Not counted: after budget exhaustion nothing could bind.
+            cycle_end(0, post_exhaustion=True),
+            # Not counted: no K recorded.
+            (EventType.CYCLE_END, 1, None, {"effective_activations": 3}),
+        ]
+    )
+    assert coordination(log)["k_binding_rate"] == pytest.approx(2 / 4)
+
+
+def test_k_binding_rate_is_missing_without_cycle_records() -> None:
+    from rpg_economy.metrics.run_metrics import coordination
+
+    assert coordination(_synthetic_log([]))["k_binding_rate"] is None
+
+
+def test_truncated_outputs_count_agent_and_director_replies_cut_off() -> None:
+    from rpg_economy.metrics.run_metrics import coordination
+
+    log = _synthetic_log(
+        [
+            (EventType.AGENT_OUTPUT_INVALID, 1, "a", {"truncated": True}),
+            (EventType.AGENT_OUTPUT_INVALID, 1, "a", {"truncated": False}),
+            (EventType.AGENT_OUTPUT_INVALID, 1, "b", {}),
+            (EventType.DIRECTOR_CALL, 1, None, {"finish_reason": "length"}),
+            (EventType.DIRECTOR_CALL, 1, None, {"finish_reason": "stop"}),
+        ]
+    )
+    result = coordination(log)
+    assert result["truncated_outputs"] == 2
+    assert result["invalid_outputs"] == 3
+
+
+def test_k_binding_rate_comes_from_a_real_log(tmp_path: Path) -> None:
+    from rpg_economy.metrics.run_metrics import coordination
+
+    result = run_condition(short_config(), tmp_path / "run.jsonl")
+
+    rate = coordination(RunLog(result.log_path))["k_binding_rate"]
+    assert rate is not None
+    assert 0.0 <= rate <= 1.0
+
+
+# ---------------------------------------------------------------------------
+# The common active horizon: missing, never zero (design s8.4, s11.3)
+# ---------------------------------------------------------------------------
+def test_a_common_horizon_before_the_shock_leaves_every_shock_metric_missing(
+    tmp_path: Path,
+) -> None:
+    """No shock tick was observed, so nothing about the shock phase is zero."""
+    config = short_config()
+    trades = [(t, Decimal("10") + t % 3) for t in range(0, 30)]
+    path = tmp_path / "run.jsonl"
+    _log_with_iron_trades(path, config, trades)
+
+    for horizon in (config.phases.shock_tick, config.phases.shock_tick - 3):
+        common = compute_run_metrics(path, config, common_active_horizon=horizon).common_horizon
+        assert common["horizon"] == horizon
+        assert common["traded_value"] is None
+        assert common["stockout_ticks"] is None
+        assert common["volatility_shock"] is None
+        assert common["volatility_shock_phase"] is None
+
+
+def test_the_window_volatility_is_clipped_at_the_common_horizon(tmp_path: Path) -> None:
+    """Both volatility definitions stop at the horizon, not only the phase-level one."""
+    # Iron trades below: the scarce resource is pinned to iron here.
+    config = short_config(shocks={"resource_scarcity": {"target_resource": "iron"}})
+    trades = [
+        (10, Decimal("10")),
+        (11, Decimal("12")),
+        (15, Decimal("10")),
+        (16, Decimal("30")),
+    ]
+    path = tmp_path / "run.jsonl"
+    log = _log_with_iron_trades(path, config, trades)
+
+    common = compute_run_metrics(path, config, common_active_horizon=15).common_horizon
+    first_window = volatility_by_phase(log, config, "iron", until=15)[PHASE_SHOCK]
+    assert common["volatility_shock"] == pytest.approx(first_window)
+    assert common["volatility_shock"] == pytest.approx(2**0.5)  # stdev(10, 12)
+    assert volatility_by_phase(log, config, "iron")[PHASE_SHOCK] > common["volatility_shock"]
+    assert common["volatility_shock_phase"] == pytest.approx(2**0.5)
+    assert common["traded_value"] == pytest.approx(22.0)
+
+
+def test_recovery_short_of_the_reversion_tick_is_censored_not_missing() -> None:
+    """s8.4: the censoring rule applies on the common active horizon too."""
+    config = short_config()
+    series = flat_series(10.0, config.time.horizon_ticks)
+    # Every horizon that has observed the reference at the last base tick.
+    for horizon in (
+        config.phases.reversion_tick,
+        config.phases.shock_tick + 1,
+        config.phases.shock_tick,
+    ):
+        observed = recovery_time(series, config, horizon=horizon)
+        assert observed == Duration(value=0, censored=True)
+
+
+def test_recovery_without_a_reference_is_missing_once_the_base_phase_is_observed() -> None:
+    """Missing, not censored, on any horizon that saw the last base tick (s11.3).
+
+    A horizon that ends before it never observed the reference, so it censors
+    at zero ticks like any other horizon without a recovery phase.
+    """
+    config = short_config()
+    series: list[Decimal | None] = [None] * config.time.horizon_ticks
+    for horizon in (config.phases.shock_tick, config.phases.reversion_tick, None):
+        assert recovery_time(series, config, horizon=horizon) is None
+    early = recovery_time(series, config, horizon=config.phases.shock_tick - 1)
+    assert early == Duration(value=0, censored=True)
+
+
+# ---------------------------------------------------------------------------
+# The productivity-drop target comes from an explicit table (design s11.3)
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    ("specialization", "product"),
+    [("smithing", "melee_weapon"), ("woodworking", "bow_gear"), ("alchemy", "health_potion")],
+)
+def test_each_specialization_has_one_pre_registered_main_product(
+    specialization: str, product: str
+) -> None:
+    config = make_config(
+        run={"scenario": "productivity_drop"},
+        shocks={"productivity_drop": {"target_specialization": specialization}},
+    )
+    assert primary_target(config).good.value == product
+
+
+def test_a_specialization_without_a_main_product_fails_loudly(monkeypatch) -> None:
+    from rpg_economy.domain import ArtisanSpecialization
+    from rpg_economy.metrics import targets
+
+    monkeypatch.delitem(targets.SPECIALIZATION_MAIN_PRODUCT, ArtisanSpecialization.WOODWORKING)
+    config = make_config(
+        run={"scenario": "productivity_drop"},
+        shocks={"productivity_drop": {"target_specialization": "woodworking"}},
+    )
+    with pytest.raises(ValueError, match="woodworking"):
+        primary_target(config)
+
+
+def test_a_main_product_of_another_specialization_fails_loudly(monkeypatch) -> None:
+    from rpg_economy.domain import ArtisanSpecialization, Product
+    from rpg_economy.metrics import targets
+
+    monkeypatch.setitem(
+        targets.SPECIALIZATION_MAIN_PRODUCT, ArtisanSpecialization.ALCHEMY, Product.MELEE_WEAPON
+    )
+    config = make_config(
+        run={"scenario": "productivity_drop"},
+        shocks={"productivity_drop": {"target_specialization": "alchemy"}},
+    )
+    with pytest.raises(ValueError, match="not a alchemy recipe"):
+        primary_target(config)
+
+
+# ---------------------------------------------------------------------------
+# Pre-registered secondary analyses (design s11.1, s11.3)
+# ---------------------------------------------------------------------------
+def test_volume_is_reported_per_good_and_phase(tmp_path: Path) -> None:
+    config = short_config(run={"condition": "B"})
+    result = run_condition(config, tmp_path / "run.jsonl", cycles=config.time.total_cycles)
+    metrics = compute_run_metrics(result.log_path, config)
+
+    for phase in (PHASE_BASE, PHASE_SHOCK, PHASE_RECOVERY):
+        units = sum(cells[phase]["units"] for cells in metrics.volume_by_good.values())
+        value = sum(cells[phase]["value"] for cells in metrics.volume_by_good.values())
+        assert units == metrics.volume_units[phase]
+        assert value == pytest.approx(metrics.volume_value[phase])
+
+
+def test_the_scarcity_shock_propagates_to_the_main_product(tmp_path: Path) -> None:
+    config = short_config(run={"condition": "B"})
+    result = run_condition(config, tmp_path / "run.jsonl", cycles=config.time.total_cycles)
+    metrics = compute_run_metrics(result.log_path, config)
+
+    assert metrics.propagation is not None
+    assert metrics.propagation["source"] == "herbs"
+    assert metrics.propagation["good"] == "health_potion"
+    assert set(metrics.propagation["mean_price"]) == {PHASE_BASE, PHASE_SHOCK, PHASE_RECOVERY}
+    assert set(metrics.propagation["stockout_ticks"]) == {PHASE_BASE, PHASE_SHOCK, PHASE_RECOVERY}
+    payload = metrics.to_payload()
+    assert payload["propagation"]["good"] == "health_potion"
+    assert "propagation_recovery" in payload
+
+
+def test_a_product_target_has_no_propagation_block(tmp_path: Path) -> None:
+    config = short_config(run={"condition": "B", "scenario": "demand_surge"})
+    result = run_condition(config, tmp_path / "run.jsonl", cycles=config.time.total_cycles)
+    metrics = compute_run_metrics(result.log_path, config)
+    assert metrics.propagation is None
+    assert metrics.propagation_recovery is None
+
+
+def test_the_inventory_stockout_variant_replays_the_world_inventory(tmp_path: Path) -> None:
+    """Reconstructed from the log alone, and consistent with the starting world."""
+    from rpg_economy.engine import build_world
+    from rpg_economy.metrics.run_metrics import _inventory_delta, inventory_stockouts
+
+    config = short_config(run={"condition": "B"})
+    result = run_condition(config, tmp_path / "run.jsonl", cycles=config.time.total_cycles)
+    log = RunLog(result.log_path)
+    world = build_world(config)
+
+    for good in ("iron", "melee_weapon", "health_potion"):
+        variant = inventory_stockouts(log, config, good)
+        assert variant is not None
+        assert variant["total_ticks"] == sum(variant["by_phase"].values())
+        final = sum(h["inventory"].get(good, 0) for h in log.final_holdings.values())
+        initial = final - sum(_inventory_delta(e, good) for e in log.events)
+        from rpg_economy.domain import parse_good
+
+        assert initial == sum(world.account(a).quantity(parse_good(good)) for a in world.agent_ids)
+
+
+def test_the_inventory_stockout_counts_ticks_with_nothing_held(tmp_path: Path) -> None:
+    from rpg_economy.metrics.run_metrics import inventory_stockouts
+
+    config = short_config()
+    log = _synthetic_log(
+        [
+            (EventType.TICK, 0, None, {}),
+            (EventType.EXPEDITION_RESOLVED, 1, "warrior_1", {"yielded": {"iron": 2}}),
+            (EventType.TICK, 1, None, {}),
+            (
+                EventType.PRODUCTION_COMPLETED,
+                2,
+                "smithing_1",
+                {"product": "melee_weapon", "quantity": 1, "consumed": {"iron": 2}},
+            ),
+            (EventType.TICK, 2, None, {}),
+            (EventType.TICK, 3, None, {}),
+            (EventType.RUN_END, 3, None, {"holdings": {"a": {"gold": "0", "inventory": {}}}}),
+        ]
+    )
+    variant = inventory_stockouts(log, config, "iron")
+    assert variant["total_ticks"] == 3  # ticks 0, 2 and 3: nothing held
+    assert variant["episodes"] == 2
+    assert variant["longest"] == 2
+
+
+def test_the_inventory_stockout_is_missing_without_final_holdings(tmp_path: Path) -> None:
+    from rpg_economy.metrics.run_metrics import inventory_stockouts
+
+    log = _synthetic_log([(EventType.TICK, 0, None, {})])
+    assert inventory_stockouts(log, short_config(), "iron") is None
+
+
+def test_the_multi_good_aggregate_is_the_median_of_base_normalized_goods(tmp_path: Path) -> None:
+    """s11.3: normalize each good by its base phase, then the median across goods."""
+    from rpg_economy.metrics.run_metrics import multi_good_aggregate, volume_by_good
+
+    config = short_config()  # base [0, 10), shock [10, 20)
+
+    def trade(tick: int, good: str, price: str):
+        return (
+            EventType.TRADE_EXECUTED,
+            tick,
+            None,
+            {"good": good, "quantity": 1, "price": price, "value": price},
+        )
+
+    events = [
+        # iron: 2 base trades, 4 shock trades -> volume ratio 2.0
+        trade(1, "iron", "10"),
+        trade(2, "iron", "12"),
+        *(trade(t, "iron", "11") for t in (11, 12, 13, 14)),
+        # wood: 2 base, 1 shock -> 0.5
+        trade(1, "wood", "5"),
+        trade(2, "wood", "7"),
+        trade(11, "wood", "6"),
+        # leather: 2 base, 2 shock -> 1.0
+        trade(1, "leather", "8"),
+        trade(2, "leather", "8"),
+        trade(11, "leather", "8"),
+        trade(12, "leather", "8"),
+    ]
+    log = _synthetic_log(events)
+    log.trades = [
+        Trade(
+            tick=tick,
+            good=payload["good"],
+            quantity=1,
+            price=Decimal(payload["price"]),
+            value=Decimal(payload["value"]),
+        )
+        for _, tick, _, payload in events
+    ]
+    aggregate = multi_good_aggregate(log, config, volume_by_good(log, config))
+
+    assert aggregate["per_good"]["iron"]["volume"] == pytest.approx(2.0)
+    assert aggregate["per_good"]["wood"]["volume"] == pytest.approx(0.5)
+    assert aggregate["per_good"]["leather"]["volume"] == pytest.approx(1.0)
+    # Goods that never traded in the base phase have no ratio, and no vote.
+    assert aggregate["per_good"]["armor"]["volume"] is None
+    assert aggregate["volume"] == pytest.approx(1.0)
+    # Volatility: iron's shock dispersion is 0 over a base of stdev(10, 12);
+    # wood has one shock trade (missing), leather a base of 0 (missing).
+    assert aggregate["per_good"]["iron"]["volatility"] == pytest.approx(0.0)
+    assert aggregate["per_good"]["wood"]["volatility"] is None
+    assert aggregate["per_good"]["leather"]["volatility"] is None
+    assert aggregate["volatility"] == pytest.approx(0.0)
+
+
+# ---------------------------------------------------------------------------
+# Useful production is strictly first-in first-out (design s11.1)
+# ---------------------------------------------------------------------------
+def test_a_late_sale_consumes_the_oldest_lot_not_a_newer_one() -> None:
+    """An expired lot that still holds units is sold first; the sale is late."""
+    config = short_config()
+    window = config.metrics.useful_production_ticks_t
+    first, second = 1, 2
+    assert second + window < config.time.horizon_ticks  # neither lot is right-censored
+    log = _synthetic_log(
+        [
+            _produced(first, "smith_1"),
+            _produced(second, "smith_1"),
+            # Past the first lot's window, inside the second's: under FIFO it
+            # sells the first lot's unit, late. Crediting the second lot would
+            # count a unit as placed that is still on the shelf.
+            _trade(first + window + 1, "smith_1"),
+        ]
+    )
+    result = useful_production(log, config)
+
+    assert result["produced"] == 2
+    assert result["useful"] == 0
+    assert result["overproduction"] == 2
+
+
+def test_fifo_moves_on_to_the_next_lot_once_the_oldest_is_sold() -> None:
+    config = short_config()
+    window = config.metrics.useful_production_ticks_t
+    log = _synthetic_log(
+        [
+            _produced(1, "smith_1", quantity=2),
+            _produced(3, "smith_1", quantity=2),
+            _trade(2, "smith_1", quantity=3),  # both units of lot 1, one of lot 2
+            _trade(3 + window, "smith_1"),  # the last unit of lot 2, on its last tick
+            _trade(3 + window + 1, "smith_1"),  # nothing left to sell from a lot
+        ]
+    )
+    result = useful_production(log, config)
+
+    assert result["produced"] == 4
+    assert result["useful"] == 4
+
+
+# ---------------------------------------------------------------------------
+# Recovery unobserved within the common horizon is censored (design s8.4)
+# ---------------------------------------------------------------------------
+@pytest.mark.invariant
+def test_a_horizon_before_the_reference_tick_is_censored_not_missing() -> None:
+    config = short_config()
+    series = flat_series(10.0, config.time.horizon_ticks)
+    last_base = config.phases.shock_tick - 1
+
+    # The reference sits at the last base tick; a horizon ending on or before
+    # it never observed that tick, and recovery was not observed either.
+    assert recovery_time(series, config, horizon=last_base) == Duration(0, True)
+    assert recovery_time(series, config, horizon=last_base - 3) == Duration(0, True)
+    assert recovery_time(series, config, horizon=0) == Duration(0, True)
+    # One tick later it has; there is no recovery phase yet, so it is censored.
+    assert recovery_time(series, config, horizon=last_base + 1) == Duration(0, True)
+
+
+@pytest.mark.invariant
+def test_a_horizon_before_the_reference_tick_reads_nothing_past_it() -> None:
+    """Censoring there needs no reference: ticks past the horizon are not read."""
+    config = short_config()
+    last_base = config.phases.shock_tick - 1
+
+    class Guarded(list):
+        def __getitem__(self, index):  # type: ignore[no-untyped-def]
+            if isinstance(index, int) and index >= last_base:
+                raise AssertionError(f"read tick {index} past the horizon")
+            return super().__getitem__(index)
+
+    series = Guarded(flat_series(10.0, config.time.horizon_ticks))
+    # Even a series with no reference at all is censored, not missing.
+    series_without_reference: list[Decimal | None] = [None] * config.time.horizon_ticks
+
+    assert recovery_time(series, config, horizon=last_base) == Duration(0, True)
+    assert recovery_time(series_without_reference, config, horizon=last_base) == Duration(0, True)
+
+
+# ---------------------------------------------------------------------------
+# Stockouts over every good, the liquidity_loss secondary (design s11.3)
+# ---------------------------------------------------------------------------
+def test_the_multi_good_aggregate_carries_stockouts_net_of_base() -> None:
+    from rpg_economy.metrics.run_metrics import multi_good_aggregate, volume_by_good
+
+    config = short_config()  # base [0, 10), shock [10, 20)
+    events: list = []
+    order_id = 0
+    # iron has an ask resting in ticks [0, 8) and [10, 14): stocked out 2 of 10
+    # base ticks and 6 of 10 shock ticks, a difference of 0.4. wood rests on
+    # [0, 9) and [10, 19): 1 and 1, a difference of 0. Every other good is never
+    # offered, so it is stocked out throughout: difference 0.
+    spans = {"iron": [(0, 8), (10, 14)], "wood": [(0, 9), (10, 19)]}
+    closing: dict[int, list[int]] = {}
+    for good, ranges in spans.items():
+        for lo, hi in ranges:
+            order_id += 1
+            events.append(
+                (
+                    EventType.ORDER_PLACED,
+                    lo,
+                    None,
+                    {"good": good, "side": "sell", "order_id": order_id},
+                )
+            )
+            closing.setdefault(hi, []).append(order_id)
+    by_tick: list = []
+    for tick in range(config.time.horizon_ticks):
+        for oid in closing.get(tick, []):
+            by_tick.append((EventType.ORDER_EXPIRED, tick, None, {"order_id": oid}))
+        by_tick.extend(e for e in events if e[1] == tick)
+        by_tick.append((EventType.TICK, tick, None, {}))
+    log = _synthetic_log(by_tick)
+
+    aggregate = multi_good_aggregate(log, config, volume_by_good(log, config))
+
+    assert aggregate["per_good"]["iron"]["stockouts"] == pytest.approx(0.4)
+    assert aggregate["per_good"]["wood"]["stockouts"] == pytest.approx(0.0)
+    assert aggregate["per_good"]["armor"]["stockouts"] == pytest.approx(0.0)
+    assert aggregate["stockouts"] == pytest.approx(0.0)
