@@ -9,12 +9,23 @@ language can drift from the other's numbers (IMPLEMENTATION.md section 2).
 from __future__ import annotations
 
 import json
-from collections.abc import Iterable
+import statistics
+from collections import Counter
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from rpg_economy.metrics.run_metrics import PHASE_SHOCK, RunMetrics
+from rpg_economy.analysis.contrasts import contrasts_for_metric, holm
+from rpg_economy.analysis.survival import (
+    Observation,
+    censoring_rate,
+    kaplan_meier,
+    mcnemar_exact,
+    paired_binary_test,
+    stratified_logrank,
+)
+from rpg_economy.metrics.run_metrics import PHASE_SHOCK, PHASES, Duration, RunMetrics
 
 RESULTS_SCHEMA_VERSION = "1.0"
 
@@ -390,3 +401,392 @@ class Results:
             encoding="utf-8",
         )
         return destination
+
+
+def build_results(
+    runs: Iterable[RunMetrics],
+    *,
+    bootstrap_seed: int = 0,
+    final_seeds: Iterable[int] | None = None,
+) -> Results:
+    """Compute every contrast and survival summary for one scenario.
+
+    ``final_seeds``, when given, is the configured final seed set: a run on any
+    other seed is refused, because pilot seeds are never used for inference
+    (design s12).
+    """
+    collected = list(runs)
+    if not collected:
+        raise ValueError("no runs to analyse")
+
+    scenarios = {run.scenario for run in collected}
+    if len(scenarios) > 1:
+        # Design v1.0 s11.4: contrasts are per scenario; primary values from
+        # different shocks are never pooled into one test.
+        raise ValueError(f"runs span several scenarios: {sorted(scenarios)}")
+    experiments = {run.experiment for run in collected}
+    if len(experiments) > 1:
+        # Experiment 1 and 2 answer different questions under different
+        # budgets; pooling them would pair runs that were never comparable.
+        raise ValueError(f"runs span several experiments: {sorted(experiments)}")
+
+    seen: set[tuple[str, int]] = set()
+    for run in collected:
+        key = (run.condition, run.seed)
+        if key in seen:
+            raise ValueError(f"duplicate run for condition {run.condition} seed {run.seed}")
+        seen.add(key)
+
+    if final_seeds is not None:
+        allowed = set(final_seeds)
+        foreign = sorted({run.seed for run in collected} - allowed)
+        if foreign:
+            raise ValueError(f"runs on seeds outside the final set: {foreign}")
+
+    results = Results(
+        scenario=collected[0].scenario,
+        experiment=collected[0].experiment,
+        runs=collected,
+    )
+
+    present = results.seeds_by_condition()
+    for metric in applicable_metrics(collected):
+        census = results.metric_measurability(metric)
+        if any(entry["missing"] for entry in census.values()):
+            # Only recorded where it can actually happen, so the file does not
+            # carry a census for every metric that is always measurable.
+            results.measurability[metric] = census
+
+        table = results.by_condition(metric)
+        pairs = [
+            (left, right)
+            for left, right in METRIC_PAIRS.get(metric, CONDITION_PAIRS)
+            if left in table and right in table
+        ]
+        suppressed: list[tuple[str, str]] = []
+        if metric in SELECTION_SENSITIVE_METRICS:
+            # Decided pair by pair: A and B may be measurable on the same seeds
+            # while C is not, and then only the contrasts involving C compare a
+            # treatment-selected subset.
+            suppressed = [pair for pair in pairs if _measurability_differs(table, present, *pair)]
+        if suppressed:
+            # Design s11.3: contrasting the surviving pairs would compare the runs in
+            # which the treatment did not suppress trading, which is not the
+            # comparison the design asks for. Say so in the results file rather
+            # than emitting a number that looks like an answer.
+            results.suppressed_contrasts[metric] = {
+                "reason": "measurability_differs_by_condition",
+                "companion_metric": SELECTION_SENSITIVE_METRICS[metric],
+                "pairs": [{"left": left, "right": right} for left, right in suppressed],
+                "measurability": census,
+            }
+        kept = tuple(pair for pair in pairs if pair not in suppressed)
+        # The Holm family is the metric's three contrasts (design s11.4). A
+        # suppressed pair is withheld, not untestable, so it stays in the family;
+        # only a contrast with no measurable pair at all leaves it.
+        withheld = sum(1 for pair in suppressed if _measurable_pairs(table, present, *pair))
+        if suppressed:
+            results.suppressed_contrasts[metric]["holm_withheld"] = withheld
+        if not kept:
+            continue
+        computed = contrasts_for_metric(
+            metric,
+            table,
+            pairs=kept,
+            seeds_run=present,
+            bootstrap_seed=bootstrap_seed,
+            withheld=withheld,
+        )
+        family = withheld + sum(1 for contrast in computed if contrast.p_value is not None)
+        results.contrasts[metric] = [
+            {**contrast.to_payload(), "holm_family_size": family} for contrast in computed
+        ]
+
+    results.companion_outcomes = _measurability_outcomes(results)
+
+    results.survival = _survival_summary(collected, lambda run: run.recovery)
+    if any(run.recovery_common_horizon is not None for run in collected):
+        results.survival_common_horizon = _survival_summary(
+            collected, lambda run: run.recovery_common_horizon
+        )
+    if any(run.propagation is not None for run in collected):
+        results.survival_propagation = _survival_summary(
+            collected, lambda run: run.propagation_recovery
+        )
+    if any(run.propagation_recovery_common_horizon is not None for run in collected):
+        results.survival_propagation_common_horizon = _survival_summary(
+            collected, lambda run: run.propagation_recovery_common_horizon
+        )
+    results.volume_by_good = _volume_by_good_summary(collected)
+    results.system = _system_summary(collected)
+    return results
+
+
+def _measurable_pairs(
+    table: dict[str, dict[int, float]], present: dict[str, set[int]], left: str, right: str
+) -> int:
+    """Seeds both conditions ran on which both carry a usable value."""
+    shared = present.get(left, set()) & present.get(right, set())
+    return len(set(table.get(left, {})) & set(table.get(right, {})) & shared)
+
+
+def _measurability_differs(
+    table: dict[str, dict[int, float]], present: dict[str, set[int]], left: str, right: str
+) -> bool:
+    """Did two conditions differ in *which* seeds the metric was measurable on?
+
+    Only this pair's seeds count: the seeds both conditions ran. Compared seed
+    by seed, not by count: A measurable on seeds {1, 2} and B on {3, 4} have
+    equal counts yet no pair in common, and the pairs that survive are
+    selected by the treatment all the same. Any difference matters, not a
+    significant one, since even a small imbalance means the surviving pairs
+    are not a random subset.
+    """
+    shared = present.get(left, set()) & present.get(right, set())
+    return set(table.get(left, {})) & shared != set(table.get(right, {})) & shared
+
+
+def _measurability_outcomes(results: Results) -> dict[str, Any]:
+    """Measurability as a reported companion outcome (design s11.3).
+
+    A market too thin to price is a *result* of the orchestration architecture,
+    not a gap in the data about it. Reported, for each selection-sensitive
+    metric, as the fraction of runs where it could be measured, and contrasted
+    with the paired exact test used for recovered-within-horizon (s11.4): the
+    same shape of outcome, binary and paired by seed. Holm-corrected across the
+    three condition pairs, like every other family.
+    """
+    outcomes: dict[str, Any] = {}
+    applicable = applicable_metrics(results.runs)
+    for metric in MEASURABILITY_OUTCOME_METRICS:
+        if metric not in applicable:
+            continue  # no target good, or no common horizon: nothing to measure
+        measurable: dict[str, dict[int, bool]] = {}
+        for run in results.runs:
+            measurable.setdefault(run.condition, {})[run.seed] = (
+                metric_value(run, metric) is not None
+            )
+        rows = []
+        for left, right in CONDITION_PAIRS:
+            if left not in measurable or right not in measurable:
+                continue
+            test = mcnemar_exact(measurable[left], measurable[right])
+            rows.append({"left": left, "right": right, **test.to_payload()})
+        for row, adjusted in zip(rows, holm([r["p_value"] for r in rows]), strict=True):
+            row["p_value_holm"] = adjusted
+        outcomes[metric] = {
+            "metric": metric,
+            "fraction": {
+                condition: (sum(seeds.values()) / len(seeds) if seeds else None)
+                for condition, seeds in sorted(measurable.items())
+            },
+            "counts": {
+                condition: {"measurable": sum(seeds.values()), "runs": len(seeds)}
+                for condition, seeds in sorted(measurable.items())
+            },
+            "paired_binary": rows,
+        }
+    return outcomes
+
+
+def _survival_summary(
+    runs: list[RunMetrics], duration_of: Callable[[RunMetrics], Duration | None]
+) -> dict[str, Any]:
+    """Recovery-time analysis, respecting censoring throughout (s11.1, s11.4).
+
+    A run whose recovery could not be measured (no reference price) is left out
+    and counted as unmeasurable: it is missing, neither a recovery nor a
+    censored non-recovery (s11.3).
+
+    Measurability is itself an effect of the treatment -- the reference price
+    comes from each run's own base-phase trades -- so the rule of the
+    selection-sensitive metrics applies: where it differs between the two
+    conditions of a pair on any seed, that pair's survival tests are withheld
+    (they stay in the Holm family) and measurability, tested with the paired
+    exact test, carries the comparison.
+    """
+    observations: dict[str, list[Observation]] = {}
+    unmeasurable: dict[str, int] = {}
+    measurable: dict[str, dict[int, bool]] = {}
+    for run in runs:
+        observations.setdefault(run.condition, [])
+        unmeasurable.setdefault(run.condition, 0)
+        duration = duration_of(run)
+        measurable.setdefault(run.condition, {})[run.seed] = duration is not None
+        if duration is None:
+            unmeasurable[run.condition] += 1
+            continue
+        observations[run.condition].append(Observation(seed=run.seed, duration=duration))
+
+    summary: dict[str, Any] = {
+        "unmeasurable": dict(sorted(unmeasurable.items())),
+        # Reported per condition always: a favourable median must be read
+        # alongside how often recovery failed outright (s11.1).
+        "censoring_rate": {
+            condition: censoring_rate(obs) for condition, obs in sorted(observations.items())
+        },
+        # An empty group recovered neither always nor never: missing.
+        "recovered_fraction": {
+            condition: (sum(1 for o in obs if o.event) / len(obs) if obs else None)
+            for condition, obs in sorted(observations.items())
+        },
+        "observed_times": {
+            condition: sorted(o.time for o in obs if o.event)
+            for condition, obs in sorted(observations.items())
+        },
+        "kaplan_meier": {
+            condition: kaplan_meier(obs) for condition, obs in sorted(observations.items())
+        },
+        "paired_binary": [],
+        "stratified_logrank": [],
+        "suppressed_pairs": [],
+        "no_pairs": [],
+        "measurability": [],
+    }
+
+    withheld = 0
+    for left, right in CONDITION_PAIRS:
+        if left not in observations or right not in observations:
+            continue
+        shared = set(measurable[left]) & set(measurable[right])
+        if any(measurable[left][seed] != measurable[right][seed] for seed in shared):
+            # Only a pair with measurable seeds in both conditions was a test
+            # to withhold; one with none is no test and leaves the family.
+            in_family = any(measurable[left][seed] and measurable[right][seed] for seed in shared)
+            summary["suppressed_pairs"].append(
+                {"left": left, "right": right, "in_family": in_family}
+            )
+            withheld += int(in_family)
+        elif not any(measurable[left][seed] and measurable[right][seed] for seed in shared):
+            # Neither condition measurable on any shared seed: said, not silent.
+            summary["no_pairs"].append({"left": left, "right": right})
+        else:
+            binary = paired_binary_test(observations[left], observations[right])
+            summary["paired_binary"].append({"left": left, "right": right, **binary.to_payload()})
+            logrank = stratified_logrank(observations[left], observations[right])
+            summary["stratified_logrank"].append(
+                {"left": left, "right": right, **logrank.to_payload()}
+            )
+        test = mcnemar_exact(measurable[left], measurable[right])
+        summary["measurability"].append({"left": left, "right": right, **test.to_payload()})
+    # Each test is its own family of the three condition pairs (design s11.4).
+    for family in (summary["paired_binary"], summary["stratified_logrank"]):
+        adjusted = holm([r["p_value"] for r in family], withheld=withheld)
+        for row, value in zip(family, adjusted, strict=True):
+            row["p_value_holm"] = value
+    family = summary["measurability"]
+    for row, value in zip(family, holm([r["p_value"] for r in family]), strict=True):
+        row["p_value_holm"] = value
+
+    return summary
+
+
+def _volume_by_good_summary(runs: list[RunMetrics]) -> dict[str, Any]:
+    """Median units and value per good and phase, per condition (s11.1).
+
+    Descriptive: the pre-registered volume by good and phase, reported beside
+    the contrasts rather than tested good by good.
+    """
+    by_condition: dict[str, list[RunMetrics]] = {}
+    for run in runs:
+        by_condition.setdefault(run.condition, []).append(run)
+    summary: dict[str, Any] = {}
+    for condition, group in sorted(by_condition.items()):
+        goods = sorted({good for run in group for good in run.volume_by_good})
+        summary[condition] = {
+            good: {
+                phase: {
+                    field_name: _median(
+                        [
+                            run.volume_by_good.get(good, {}).get(phase, {}).get(field_name, 0)
+                            for run in group
+                        ]
+                    )
+                    for field_name in ("units", "value")
+                }
+                for phase in PHASES
+            }
+            for good in goods
+        }
+    return summary
+
+
+def _median(values: list[Any]) -> float | None:
+    present = [v for v in values if v is not None]
+    return statistics.median(present) if present else None
+
+
+def _bucket_medians(group: list[RunMetrics], key: str) -> dict[str, float | None]:
+    """Per bucket, the median across runs of one of ``run.tokens``' bucket tables."""
+    buckets = sorted({b for run in group for b in (run.tokens.get(key) or {})})
+    return {
+        bucket: _median([(run.tokens.get(key) or {}).get(bucket) for run in group])
+        for bucket in buckets
+    }
+
+
+def _system_summary(runs: list[RunMetrics]) -> dict[str, Any]:
+    """Descriptive system metrics per condition (design s11.2).
+
+    Reported, not contrasted: several only exist in one condition (Director
+    retries and cap closures in A), so a paired test would have nothing to pair.
+    """
+    by_condition: dict[str, list[RunMetrics]] = {}
+    for run in runs:
+        by_condition.setdefault(run.condition, []).append(run)
+
+    summary: dict[str, Any] = {}
+    for condition, group in sorted(by_condition.items()):
+        messages: dict[str, int] = {}
+        for run in group:
+            for kind, count in run.coordination.get("messages_by_type", {}).items():
+                messages[kind] = messages.get(kind, 0) + count
+        rates = [
+            run.coordination["director_error_rate"]
+            for run in group
+            if run.coordination.get("director_error_rate") is not None
+        ]
+        latencies = [
+            run.coordination["latency_mean"]
+            for run in group
+            if run.coordination.get("latency_mean") is not None
+        ]
+        exhausted = [run.exhaustion_tick for run in group if run.exhaustion_tick is not None]
+        summary[condition] = {
+            "runs": len(group),
+            "messages_by_type": dict(sorted(messages.items())),
+            "director_retries": sum(run.coordination.get("director_retries", 0) for run in group),
+            "cycles_closed_by_cap": sum(
+                run.coordination.get("cycles_closed_by_cap", 0) for run in group
+            ),
+            "director_error_rate": statistics.median(rates) if rates else None,
+            "latency_mean": statistics.median(latencies) if latencies else None,
+            "unanswered_requests": sum(run.unanswered_requests for run in group),
+            "exhausted_runs": len(exhausted),
+            "exhaustion_tick_median": statistics.median(exhausted) if exhausted else None,
+            "activations_median": _median([run.coordination.get("activations") for run in group]),
+            "wasted_median": _median([run.coordination.get("wasted_activations") for run in group]),
+            "k_binding_rate_median": _median(
+                [run.coordination.get("k_binding_rate") for run in group]
+            ),
+            "invalid_outputs": sum(run.coordination.get("invalid_outputs", 0) for run in group),
+            "truncated_outputs": sum(run.coordination.get("truncated_outputs", 0) for run in group),
+            "tokens_by_bucket_median": _bucket_medians(group, "by_bucket"),
+            # Per-actor detail (design s11.2): input and output separately, as
+            # they are priced separately, and the calls behind them.
+            "input_tokens_by_bucket_median": _bucket_medians(group, "input_by_bucket"),
+            "output_tokens_by_bucket_median": _bucket_medians(group, "output_by_bucket"),
+            "calls_by_bucket_median": _bucket_medians(group, "calls_by_bucket"),
+            "budget_fraction_median": _median(
+                [(run.tokens.get("budget") or {}).get("fraction_consumed") for run in group]
+            ),
+            "task_types": dict(
+                sorted(
+                    sum(
+                        (Counter(run.coordination.get("task_types", {})) for run in group),
+                        Counter(),
+                    ).items()
+                )
+            ),
+        }
+    return summary
