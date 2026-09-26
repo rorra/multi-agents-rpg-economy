@@ -533,3 +533,527 @@ def _liquidity_results():
     from tests.test_statistics import _liquidity_run
 
     return build_results([_liquidity_run(c, s) for c in "ABC" for s in SEEDS])
+
+
+def test_a_liquidity_loss_report_has_no_empty_target_good_tables() -> None:
+    from rpg_economy.i18n import set_locale, t
+
+    report = render_report(_liquidity_results(), locale="en", figure_paths={})
+    set_locale("en")
+    assert t("report.note.no_pairs") not in report
+    assert t("report.metric.volatility_shock") not in report
+    assert t("report.metric.stockout_ticks") not in report
+    assert t("report.section.companion_outcome") not in report
+    assert t("report.metric.traded_value") in report
+
+
+def test_the_liquidity_loss_figure_plots_traded_value(tmp_path: Path, monkeypatch) -> None:
+    from rpg_economy.analysis import figures
+
+    calls: list[dict] = []
+    original = figures.price_trajectory
+
+    def spy(series, **kwargs):
+        calls.append(kwargs)
+        return original(series, **kwargs)
+
+    monkeypatch.setattr(figures, "price_trajectory", spy)
+    series = {c: [1.0, 2.0, None, 3.0] for c in "ABC"}
+    generate_all_locales(
+        _liquidity_results(), tmp_path, price_series=series, shock_tick=1, reversion_tick=2
+    )
+    assert calls and all(call["traded_value"] for call in calls)
+
+    calls.clear()
+    generate_all_locales(
+        sample_results(), tmp_path / "price", price_series=series, shock_tick=1, reversion_tick=2
+    )
+    assert calls and not any(call["traded_value"] for call in calls)
+
+
+def test_the_report_renders_the_secondary_analyses(tmp_path: Path) -> None:
+    from rpg_economy.i18n import set_locale, t
+
+    runs = [fake_run(c, s, volatility=1.0) for c in "ABC" for s in SEEDS]
+    for run in runs:
+        run.propagation = {
+            "source": "iron",
+            "good": "melee_weapon",
+            "mean_price": {"base": 30.0, "shock": 35.0 + run.seed, "recovery": 31.0},
+            "stockout_ticks": {"base": 0, "shock": run.seed % 3, "recovery": 0},
+        }
+        run.propagation_recovery = Duration(5 + run.seed, False)
+        run.volume_by_good = {
+            "iron": {
+                "base": {"units": 10, "value": 100.0},
+                "shock": {"units": 4, "value": 60.0},
+                "recovery": {"units": 8, "value": 80.0},
+            }
+        }
+    results = build_results(runs)
+    for locale in ("en", "es"):
+        report = render_report(results, locale=locale, figure_paths={})
+        set_locale(locale)
+        assert (
+            t(
+                "report.section.propagation",
+                good=t("product.melee_weapon"),
+                resource=t("resource.iron"),
+            )
+            in report
+        )
+        assert t("report.section.volume_by_good") in report
+        assert t("report.metric.propagation_price_shock") in report
+
+
+# ---------------------------------------------------------------------------
+# The economy check uses the pre-registered target (design s11.3)
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    ("scenario", "expected"),
+    [
+        ("resource_scarcity", "herbs"),
+        ("demand_surge", "health_potion"),
+        ("productivity_drop", "melee_weapon"),
+        ("liquidity_loss", None),
+    ],
+)
+def test_the_economy_check_targets_the_primary_target(scenario: str, expected) -> None:
+    from rpg_economy.analysis.economy_check import target_good_for
+    from rpg_economy.metrics.targets import primary_target
+    from tests.conftest import make_config
+
+    config = make_config(run={"scenario": scenario})
+    good = target_good_for(config)
+    assert good == primary_target(config).good
+    assert (None if good is None else good.value) == expected
+
+
+def test_the_economy_check_renders_traded_value_without_a_target_good(tmp_path: Path) -> None:
+    from rpg_economy.analysis.render import render
+    from rpg_economy.i18n import set_locale, t
+
+    path, config, final, initial, _, check = _economy_run(tmp_path)
+    result = check(path, config, final, initial, None)
+    set_locale("en")
+    text = render(result, config)
+    assert result.target_good is None
+    assert result.stockouts == []
+    assert t("check.section.traded_value") in text
+    assert t("check.section.stockouts") not in text
+
+
+def test_stockout_episodes_are_a_whole_run_row(tmp_path: Path) -> None:
+    from rpg_economy.analysis.economy_check import StockoutStats
+    from rpg_economy.analysis.render import render
+    from rpg_economy.i18n import set_locale, t
+
+    path, config, final, initial, target, check = _economy_run(tmp_path)
+    result = check(path, config, final, initial, target)
+    result.stockouts = [
+        StockoutStats(
+            good="iron",
+            episodes=3,
+            total_ticks=9,
+            longest=5,
+            by_phase={"base": 2, "shock": 5, "recovery": 2},
+        )
+    ]
+    set_locale("en")
+    lines = render(result, config).splitlines()
+    base = next(line for line in lines if line.startswith(t("phase.base")) and "[" not in line)
+    whole = next(line for line in lines if line.startswith(t("check.row.whole_run")))
+    assert base.split()[1:] == ["2"]
+    assert whole[len(t("check.row.whole_run")) :].split() == ["9", "3", "5"]
+
+
+# ---------------------------------------------------------------------------
+# What the report renders from the results it was given
+# ---------------------------------------------------------------------------
+def _cells(line: str) -> list[str]:
+    """A rendered table row's cells: columns are separated by two spaces or more."""
+    import re
+
+    return re.split(r"\s{2,}", line.strip())
+
+
+def _section(text: str, heading: str) -> list[str]:
+    """The lines from ``heading`` to the next blank line after its table."""
+    lines = text.splitlines()
+    start = lines.index(heading)
+    block: list[str] = []
+    for line in lines[start + 1 :]:
+        if not line and block:
+            break
+        if line:
+            block.append(line)
+    return block
+
+
+def test_the_system_section_shows_tokens_per_bucket() -> None:
+    from rpg_economy.i18n import set_locale, t
+
+    runs = []
+    for seed in SEEDS:
+        for condition in "ABC":
+            run = fake_run(condition, seed, volatility=1.0 + seed * 0.01)
+            run.tokens = {
+                "by_bucket": {"agent": 900 + seed, "director": 100 if condition == "A" else 0},
+                "authoritative_total": 1000 + seed,
+                "budget": {},
+            }
+            runs.append(run)
+    results = build_results(runs)
+    assert results.system["A"]["tokens_by_bucket_median"]["agent"] > 0
+
+    text = render_report(results, locale="en", figure_paths={})
+    set_locale("en")
+    agent = next(
+        line
+        for line in text.splitlines()
+        if line.startswith(t("report.system.tokens_bucket", bucket=t("bucket.agent")))
+    )
+    director = next(
+        line
+        for line in text.splitlines()
+        if line.startswith(t("report.system.tokens_bucket", bucket=t("bucket.director")))
+    )
+    assert _cells(agent)[1:] == ["906"] * 3  # median of 901..912, no decimals
+    assert _cells(director)[1:] == ["100", "0", "0"]
+
+
+def _secondary_recovery_results():
+    runs = []
+    for seed in SEEDS:
+        for condition in "ABC":
+            run = fake_run(condition, seed, volatility=1.0 + seed * 0.01)
+            run.recovery_common_horizon = Duration(10 + seed, condition == "B" and seed % 2 == 0)
+            run.propagation = {
+                "source": "iron",
+                "good": "melee_weapon",
+                "mean_price": {"base": 30.0, "shock": 35.0, "recovery": 31.0},
+                "stockout_ticks": {"base": 0, "shock": 2, "recovery": 0},
+            }
+            run.propagation_recovery = Duration(5 + seed, condition == "C" and seed % 3 == 0)
+            runs.append(run)
+    return build_results(runs)
+
+
+@pytest.mark.parametrize("locale", ["en", "es"])
+def test_secondary_recoveries_report_their_paired_tests(locale: str) -> None:
+    """The common-horizon and propagation recoveries show both tests, like the primary."""
+    from rpg_economy.i18n import set_locale, t
+
+    results = _secondary_recovery_results()
+    assert results.survival_common_horizon["paired_binary"]
+    assert results.survival_propagation["stratified_logrank"]
+
+    text = render_report(results, locale=locale, figure_paths={})
+    set_locale(locale)
+    lines = text.splitlines()
+    binary = [i for i, line in enumerate(lines) if line == t("report.test.paired_binary")]
+    logrank = [i for i, line in enumerate(lines) if line == t("report.test.logrank")]
+    # Primary, common horizon and propagation: three of each.
+    assert len(binary) == 3
+    assert len(logrank) == 3
+
+    common = lines.index(t("report.section.recovery_common"))
+    propagation = lines.index(
+        t(
+            "report.section.propagation",
+            good=t("product.melee_weapon"),
+            resource=t("resource.iron"),
+        )
+    )
+    assert common < binary[1] < logrank[1] < propagation < binary[2] < logrank[2]
+
+
+def test_each_contrast_row_shows_its_pairs_used_and_dropped() -> None:
+    """Design s11.3: pairs used and pairs dropped, reported per contrast."""
+    from rpg_economy.i18n import set_locale, t
+
+    runs = []
+    for seed in range(1, 11):
+        runs.append(fake_run("A", seed, volatility=2.0 + seed * 0.01))
+        b = fake_run("B", seed, volatility=1.0 + seed * 0.02)
+        if seed <= 4:
+            b.volatility_phase["shock"] = None
+        runs.append(b)
+        runs.append(fake_run("C", seed, volatility=1.5 + seed * 0.03))
+    results = build_results(runs)
+
+    text = render_report(results, locale="en", figure_paths={})
+    set_locale("en")
+    heading = t("report.section.contrasts_for", metric=t("report.metric.volatility_shock_phase"))
+    block = _section(text, heading)
+    header = _cells(block[0])
+    n_col = header.index(t("report.col.n"))
+    dropped_col = header.index(t("report.col.dropped"))
+    rows = {
+        _cells(line)[0]: _cells(line)
+        for line in block[2:]
+        if " / " in line and not line.startswith("-")
+    }
+    ab = rows[f"{t('condition.A')} / {t('condition.B')}"]
+    ac = rows[f"{t('condition.A')} / {t('condition.C')}"]
+    bc = rows[f"{t('condition.B')} / {t('condition.C')}"]
+    assert (ab[n_col], ab[dropped_col]) == ("6", "4")
+    assert (ac[n_col], ac[dropped_col]) == ("10", "0")
+    assert (bc[n_col], bc[dropped_col]) == ("6", "4")
+    assert t("report.note.dropped_pairs_column") in text
+
+
+@pytest.mark.invariant
+@pytest.mark.parametrize("locale", ["en", "es"])
+def test_a_suppressed_metric_prints_no_medians(locale: str) -> None:
+    """The median table must not show the comparison the suppression withholds."""
+    from rpg_economy.i18n import set_locale, t
+
+    runs = []
+    for seed in range(1, 11):
+        runs.append(fake_run("A", seed, volatility=2.0 + seed * 0.01))
+        b = fake_run("B", seed, volatility=1.0 + seed * 0.01)
+        if seed <= 4:
+            b.volatility["shock"] = None
+        runs.append(b)
+    results = build_results(runs)
+    assert "volatility_shock" in results.suppressed_contrasts
+
+    text = render_report(results, locale=locale, figure_paths={})
+    set_locale(locale)
+    label = t("report.metric.volatility_shock")
+    row = next(line for line in text.splitlines() if _cells(line)[0] == label)
+    cells = _cells(row)
+    assert cells[1:3] == [t("report.value.suppressed")] * 2
+    assert cells[3] == "6"  # the pairable seeds are still counted
+    assert t("report.note.median_suppressed") in text
+    # The companion is not suppressed, so it keeps its medians.
+    companion = next(
+        line
+        for line in text.splitlines()
+        if _cells(line)[0] == t("report.metric.volatility_shock_phase")
+    )
+    assert t("report.value.suppressed") not in companion
+
+
+def test_no_suppression_note_without_a_suppressed_metric() -> None:
+    from rpg_economy.i18n import set_locale, t
+
+    text = render_report(sample_results(), locale="en", figure_paths={})
+    set_locale("en")
+    assert t("report.note.median_suppressed") not in text
+
+
+# ---------------------------------------------------------------------------
+# The economy check's header and numbers
+# ---------------------------------------------------------------------------
+def test_the_economy_check_names_the_regime_it_ran(tmp_path: Path) -> None:
+    """Rule-based agents under the decentralized regime, not the configured condition."""
+    from rpg_economy.analysis.render import render
+    from rpg_economy.i18n import set_locale, t
+
+    path, config, final, initial, target, check = _economy_run(tmp_path)
+    assert config.run.condition.value == "A"
+    set_locale("en")
+    header = render(check(path, config, final, initial, target), config).splitlines()[1]
+    assert header.startswith(t("check.regime.rule_based"))
+    assert t("condition.A") not in header
+
+
+def test_the_economy_check_formats_money_in_spanish(tmp_path: Path) -> None:
+    from decimal import Decimal
+
+    from rpg_economy.analysis.render import _money, render
+    from rpg_economy.i18n import format_number, set_locale
+
+    set_locale("es")
+    assert _money(Decimal("1035.456")) == "1.035,46"
+    assert _money(Decimal("-3.5")) == "-3,50"
+    set_locale("en")
+    assert _money(Decimal("1035.456")) == "1,035.46"
+
+    path, config, final, initial, target, check = _economy_run(tmp_path)
+    result = check(path, config, final, initial, target)
+    set_locale("es")
+    spanish = render(result, config)
+    start = format_number(result.total_gold_start.quantize(Decimal("0.01")), 2)
+    assert "," in start
+    assert start in spanish
+    set_locale("en")
+    assert format_number(result.total_gold_start.quantize(Decimal("0.01")), 2) in render(
+        result, config
+    )
+
+
+# ---------------------------------------------------------------------------
+# Numbers are localized, counts included
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    ("value", "english", "spanish"),
+    [
+        (0.125, "12.5%", "12,5%"),
+        (0.0625, "6.3%", "6,3%"),  # half up, not float half-to-even
+        (0.5, "50.0%", "50,0%"),
+        (1.0, "100.0%", "100,0%"),
+        (0.0, "0.0%", "0,0%"),
+        (12.345, "1,234.5%", "1.234,5%"),
+    ],
+)
+def test_percentages_are_localized_and_rounded_half_up(
+    value: float, english: str, spanish: str
+) -> None:
+    from rpg_economy.analysis.report import _percent
+    from rpg_economy.i18n import set_locale
+
+    set_locale("en")
+    assert _percent(value) == english
+    set_locale("es")
+    assert _percent(value) == spanish
+
+
+@pytest.mark.parametrize(
+    ("value", "places", "english", "spanish"),
+    [
+        (1234.5678, 3, "1,235", "1.235"),
+        (-2500.0, 3, "-2,500", "-2.500"),
+        (12.5, 3, "12.5", "12,5"),
+        (0.25, 2, "0.25", "0,25"),
+        (3.0, 3, "3", "3"),
+        (100.0, 3, "100", "100"),
+        (-0.0001, 3, "0", "0"),
+        (7.0, 0, "7", "7"),
+        # Rounds up across the thousands boundary: grouped, and no stray decimals.
+        (999.9996, 3, "1,000", "1.000"),
+        (None, 3, None, None),
+        (float("nan"), 3, None, None),
+    ],
+)
+def test_numbers_are_localized_through_the_shared_formatter(
+    value: float | None, places: int, english: str | None, spanish: str | None
+) -> None:
+    from rpg_economy.analysis.report import _fmt
+    from rpg_economy.i18n import set_locale, t
+
+    for locale, expected in (("en", english), ("es", spanish)):
+        set_locale(locale)
+        assert _fmt(value, places) == (expected or t("report.value.missing"))
+
+
+def test_p_values_are_localized_and_nan_is_missing() -> None:
+    from rpg_economy.analysis.report import _p
+    from rpg_economy.i18n import set_locale, t
+
+    set_locale("en")
+    assert _p(0.0421) == "0.042"
+    assert _p(0.0001) == "<0.001"
+    assert _p(float("nan")) == t("report.value.missing")
+    assert _p(None) == t("report.value.missing")
+    set_locale("es")
+    assert _p(0.0421) == "0,042"
+    assert _p(0.0001) == "<0,001"
+    assert _p(float("nan")) == t("report.value.missing")
+
+
+def test_counts_in_the_system_section_are_localized() -> None:
+    runs = []
+    for seed in SEEDS:
+        for condition in "ABC":
+            run = fake_run(condition, seed, volatility=1.0 + seed * 0.01)
+            run.coordination["messages_by_type"] = {"REQUEST": 200}
+            run.coordination["invalid_outputs"] = 150
+            run.unanswered_requests = 100
+            runs.append(run)
+    results = build_results(runs)
+
+    from rpg_economy.i18n import set_locale, t
+
+    # Summed over 12 seeds: 2400 messages, 1800 invalid, 1200 unanswered.
+    for locale, sep in (("en", ","), ("es", ".")):
+        text = render_report(results, locale=locale, figure_paths={})
+        set_locale(locale)
+        rows = {_cells(line)[0]: _cells(line)[1:] for line in text.splitlines() if line}
+        for key, kwargs, expected in (
+            ("report.system.messages", {"kind": t("message.REQUEST")}, f"2{sep}400"),
+            ("report.system.invalid", {}, f"1{sep}800"),
+            ("report.system.unanswered", {}, f"1{sep}200"),
+        ):
+            assert rows[t(key, **kwargs)] == [expected] * 3, (locale, key)
+
+
+# ---------------------------------------------------------------------------
+# Per-actor token detail (design s11.2)
+# ---------------------------------------------------------------------------
+def test_the_system_section_shows_input_output_and_calls_per_bucket() -> None:
+    from rpg_economy.i18n import set_locale, t
+
+    runs = []
+    for seed in SEEDS:
+        for condition in "ABC":
+            run = fake_run(condition, seed, volatility=1.0 + seed * 0.01)
+            director = condition == "A"
+            run.tokens = {
+                "by_bucket": {"agent": 900, "director": 100 if director else 0, "bulletin": 0},
+                "input_by_bucket": {"agent": 800, "director": 90 if director else 0, "bulletin": 0},
+                "output_by_bucket": {
+                    "agent": 100,
+                    "director": 10 if director else 0,
+                    "bulletin": 0,
+                },
+                "calls_by_bucket": {"agent": 20 + seed, "director": 5 if director else 0},
+                "authoritative_total": 1000,
+                "budget": {},
+            }
+            runs.append(run)
+    results = build_results(runs)
+    system = results.system
+    assert system["A"]["input_tokens_by_bucket_median"] == {
+        "agent": 800,
+        "bulletin": 0,
+        "director": 90,
+    }
+    assert system["B"]["calls_by_bucket_median"]["director"] == 0
+    assert results.to_payload()["system"]["A"]["output_tokens_by_bucket_median"]["agent"] == 100
+
+    text = render_report(results, locale="en", figure_paths={})
+    set_locale("en")
+    lines = text.splitlines()
+
+    def cells(key: str, bucket: str) -> list[str]:
+        label = t(key, bucket=t(f"bucket.{bucket}"))
+        return _cells(next(line for line in lines if line.startswith(label)))[1:]
+
+    assert cells("report.system.input_tokens_bucket", "agent") == ["800"] * 3
+    assert cells("report.system.output_tokens_bucket", "director") == ["10", "0", "0"]
+    assert cells("report.system.calls_bucket", "agent") == ["26"] * 3  # median of 21..32
+    assert cells("report.system.calls_bucket", "director") == ["5", "0", "0"]
+    # A bucket no condition used gets no row.
+    bulletin = t("report.system.input_tokens_bucket", bucket=t("bucket.bulletin"))
+    assert not any(line.startswith(bulletin) for line in lines)
+
+
+# ---------------------------------------------------------------------------
+# Seeds left out are named (design s11.3)
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("locale", ["en", "es"])
+def test_the_report_names_the_seeds_of_incomplete_trios(locale: str) -> None:
+    from rpg_economy.i18n import set_locale, t
+
+    results = sample_results()
+    clean = render_report(results, locale=locale, figure_paths={})
+    for key in ("incomplete_trios", "skipped_seeds"):
+        assert t(f"report.note.{key}", locale=locale, seeds="", count="").strip() not in clean
+    assert t("report.note.skipped_cells", locale=locale, cells="", count="").strip() not in clean
+    results.incomplete_trios = [2014, 2003]
+    results.skipped_seeds = [1001]
+    results.skipped_cells = {"demand_surge/experiment_1": ["A", "B"]}
+    text = render_report(results, locale=locale, figure_paths={})
+    set_locale(locale)
+    assert t("report.note.incomplete_trios", seeds="2003, 2014", count="2") in text
+    assert t("report.note.skipped_seeds", seeds="1001", count="1") in text
+    cell = f"{t('scenario.demand_surge')} / {t('experiment.experiment_1')} (A, B)"
+    assert t("report.note.skipped_cells", cells=cell, count="1") in text
+
+    payload = results.to_payload()
+    assert payload["incomplete_trios"] == [2003, 2014]
+    assert payload["skipped_seeds"] == [1001]
+    assert payload["skipped_cells"] == {"demand_surge/experiment_1": ["A", "B"]}
