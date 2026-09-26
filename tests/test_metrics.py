@@ -1057,3 +1057,467 @@ def test_the_multi_good_aggregate_carries_stockouts_net_of_base() -> None:
     assert aggregate["per_good"]["wood"]["stockouts"] == pytest.approx(0.0)
     assert aggregate["per_good"]["armor"]["stockouts"] == pytest.approx(0.0)
     assert aggregate["stockouts"] == pytest.approx(0.0)
+
+
+def test_a_good_never_stocked_out_in_the_base_phase_still_counts() -> None:
+    """The scarcity case: offered all through the base, emptied by the shock."""
+    from rpg_economy.domain import ALL_GOODS
+    from rpg_economy.metrics.run_metrics import multi_good_aggregate
+
+    config = short_config()  # base [0, 10), shock [10, 20)
+    events = [
+        (EventType.ORDER_PLACED, 0, None, {"good": good.value, "side": "sell", "order_id": i})
+        for i, good in enumerate(ALL_GOODS)
+    ]
+    iron = next(i for i, good in enumerate(ALL_GOODS) if good.value == "iron")
+    by_tick = []
+    for tick in range(config.time.horizon_ticks):
+        if tick == 10:
+            by_tick.append((EventType.ORDER_EXPIRED, tick, None, {"order_id": iron}))
+        by_tick.extend(e for e in events if e[1] == tick)
+        by_tick.append((EventType.TICK, tick, None, {}))
+    aggregate = multi_good_aggregate(_synthetic_log(by_tick), config, {})
+
+    assert aggregate["per_good"]["iron"]["stockouts"] == pytest.approx(1.0)
+    assert aggregate["per_good"]["wood"]["stockouts"] == pytest.approx(0.0)
+    assert aggregate["stockouts"] == pytest.approx(0.0)
+
+
+# ---------------------------------------------------------------------------
+# Tax arrears are a lien on gold (user ruling): wealth is net of them
+# ---------------------------------------------------------------------------
+def _log_with_run_end(path: Path, config, holdings: dict, events=()) -> RunLog:
+    """A synthetic log: the given events, then a run_end carrying ``holdings``."""
+    from tests.conftest import make_metadata
+
+    with EventLogWriter(path, make_metadata(config)) as log:
+        for kind, tick, agent, payload in events:
+            log.write(kind, tick=tick, cycle=0, agent_id=agent, payload=payload)
+        log.write(
+            EventType.RUN_END,
+            tick=config.time.horizon_ticks - 1,
+            cycle=0,
+            payload={"holdings": holdings},
+        )
+    return RunLog(path)
+
+
+@pytest.mark.invariant
+def test_gini_uses_gold_net_of_tax_arrears(tmp_path: Path) -> None:
+    config = short_config()
+    holdings = {
+        "a": {"gold": "100", "tax_arrears": "0", "inventory": {}},
+        "b": {"gold": "100", "tax_arrears": "60", "inventory": {}},
+    }
+    log = _log_with_run_end(tmp_path / "run.jsonl", config, holdings)
+    # Net wealth 100 and 40: Gini = (2 * (1*40 + 2*100)) / (2 * 140) - 3/2.
+    expected = (2 * (40 + 200)) / (2 * 140) - 1.5
+    assert gini(log, config, log.final_holdings) == pytest.approx(expected)
+    # Reserved and frozen gold are still the agent's: they change nothing.
+    holdings["a"] |= {"reserved_gold": "50", "frozen_gold": "30"}
+    assert gini(log, config, holdings) == pytest.approx(expected)
+
+
+def test_gini_reads_a_log_without_arrears_as_owing_nothing(tmp_path: Path) -> None:
+    config = short_config()
+    holdings = {"a": {"gold": "100", "inventory": {}}, "b": {"gold": "100", "inventory": {}}}
+    log = _log_with_run_end(tmp_path / "run.jsonl", config, holdings)
+    assert gini(log, config, log.final_holdings) == pytest.approx(0.0, abs=1e-9)
+
+
+def test_arrears_beyond_everything_held_count_as_nothing_held(tmp_path: Path) -> None:
+    """Gini is defined on non-negative wealth; the lien cannot take more than all."""
+    config = short_config()
+    holdings = {
+        "a": {"gold": "100", "tax_arrears": "0", "inventory": {}},
+        "b": {"gold": "10", "tax_arrears": "50", "inventory": {}},
+    }
+    log = _log_with_run_end(tmp_path / "run.jsonl", config, holdings)
+    # Wealth 100 and 0: the maximum Gini for two agents.
+    assert gini(log, config, holdings) == pytest.approx(0.5)
+
+
+def test_compute_run_metrics_takes_the_arrears_from_run_end(tmp_path: Path) -> None:
+    config = short_config()
+    even = {"a": {"gold": "100", "inventory": {}}, "b": {"gold": "100", "inventory": {}}}
+    lien = {
+        "a": {"gold": "100", "tax_arrears": "0", "inventory": {}},
+        "b": {"gold": "100", "tax_arrears": "50", "inventory": {}},
+    }
+    _log_with_run_end(tmp_path / "even.jsonl", config, even)
+    _log_with_run_end(tmp_path / "lien.jsonl", config, lien)
+    assert compute_run_metrics(tmp_path / "even.jsonl", config).gini == pytest.approx(0.0)
+    assert compute_run_metrics(tmp_path / "lien.jsonl", config).gini > 0.0
+
+
+# ---------------------------------------------------------------------------
+# The common active horizon recomputes every economic metric (s8.4, s11.2)
+# ---------------------------------------------------------------------------
+COMMON_KEYS = {
+    "horizon",
+    "traded_value",
+    "stockout_ticks",
+    "volatility_shock",
+    "volatility_shock_phase",
+    "stockout_ticks_inventory",
+    "useful_production",
+    "gini",
+    "volatility_all_goods",
+    "volume_all_goods",
+    "stockouts_all_goods",
+    "propagation_price_shock",
+    "propagation_stockout_ticks",
+}
+
+
+def test_every_economic_metric_is_recomputed_at_the_common_horizon(tmp_path: Path) -> None:
+    config = short_config(run={"condition": "B"})
+    result = run_condition(config, tmp_path / "run.jsonl", cycles=config.time.total_cycles)
+    full = compute_run_metrics(result.log_path, config)
+    at_end = compute_run_metrics(
+        result.log_path, config, common_active_horizon=config.time.horizon_ticks
+    )
+    cut = compute_run_metrics(
+        result.log_path, config, common_active_horizon=config.phases.reversion_tick - 3
+    )
+
+    assert set(at_end.common_horizon) == COMMON_KEYS
+    # At the full horizon the recomputation agrees with the full-run metrics.
+    common = at_end.common_horizon
+    assert common["gini"] == pytest.approx(full.gini)
+    assert common["useful_production"] == full.useful_production["useful_fraction"]
+    assert common["stockout_ticks_inventory"] == full.stockouts_inventory["by_phase"][PHASE_SHOCK]
+    assert common["volatility_all_goods"] == full.multi_good["volatility"]
+    assert common["volume_all_goods"] == full.multi_good["volume"]
+    assert common["stockouts_all_goods"] == full.multi_good["stockouts"]
+    assert common["propagation_price_shock"] == full.propagation["mean_price"][PHASE_SHOCK]
+    assert common["propagation_stockout_ticks"] == full.propagation["stockout_ticks"][PHASE_SHOCK]
+    assert at_end.propagation_recovery_common_horizon == full.propagation_recovery
+
+    # Cut inside the shock phase: the shock-phase counts can only shrink.
+    clipped = cut.common_horizon
+    assert clipped["stockout_ticks_inventory"] <= common["stockout_ticks_inventory"]
+    assert clipped["propagation_stockout_ticks"] <= common["propagation_stockout_ticks"]
+    # Cut before the reversion tick: censored at zero where a reference exists,
+    # missing where the product never traded at the end of the base phase.
+    expected = None if full.propagation_recovery is None else Duration(0, censored=True)
+    assert cut.propagation_recovery_common_horizon == expected
+    assert cut.to_payload()["propagation_recovery_common_horizon"] == (
+        None if expected is None else expected.to_payload()
+    )
+
+
+def test_the_new_common_horizon_shock_metrics_are_missing_before_the_shock(
+    tmp_path: Path,
+) -> None:
+    """The rule already in place: no shock tick observed, no shock metric."""
+    config = short_config(run={"condition": "B"})
+    result = run_condition(config, tmp_path / "run.jsonl", cycles=config.time.total_cycles)
+    for horizon in (config.phases.shock_tick, config.phases.shock_tick - 3):
+        common = compute_run_metrics(
+            result.log_path, config, common_active_horizon=horizon
+        ).common_horizon
+        for key in (
+            "stockout_ticks_inventory",
+            "volatility_all_goods",
+            "volume_all_goods",
+            "stockouts_all_goods",
+            "propagation_price_shock",
+            "propagation_stockout_ticks",
+        ):
+            assert common[key] is None, key
+        # Not shock metrics: measured on [0, horizon) and at the horizon.
+        assert common["gini"] is not None
+
+
+def test_useful_production_stops_at_the_horizon() -> None:
+    config = short_config(
+        metrics={
+            "volatility_window_w": 5,
+            "recovery_hold_ticks_m": 3,
+            "useful_production_ticks_t": 5,
+        }
+    )
+    log = _synthetic_log(
+        [
+            _produced(2, "smithing_1", quantity=2),
+            _trade(4, "smithing_1"),
+            _produced(12, "smithing_1"),
+            _trade(14, "smithing_1"),  # at the horizon: unseen
+            _trade(16, "smithing_1"),
+        ]
+    )
+    # FIFO: the sale at 14 takes the old lot's second unit, too late for it.
+    assert useful_production(log, config)["useful"] == 2
+    cut = useful_production(log, config, until=14)
+    # The lot at tick 12 is inside the last T ticks before 14: censored.
+    assert cut["produced"] == 2
+    assert cut["useful"] == 1
+    assert cut["useful_fraction"] == pytest.approx(0.5)
+
+
+def test_holdings_are_replayed_back_to_the_horizon(tmp_path: Path) -> None:
+    from rpg_economy.metrics.run_metrics import holdings_at
+
+    config = short_config()
+    events = [
+        (EventType.TAX_PAID, 3, "a", {"tax": "wealth", "amount": "5", "owed": "7"}),
+        (
+            EventType.TRADE_EXECUTED,
+            12,
+            None,
+            {
+                "good": "iron",
+                "quantity": 2,
+                "price": "10",
+                "value": "20",
+                "buyer_id": "a",
+                "seller_id": "b",
+            },
+        ),
+        (
+            EventType.TAX_PAID,
+            13,
+            "a",
+            {"tax": "wealth", "amount": "7", "arrears": True, "owed": "0"},
+        ),
+        (EventType.EXPEDITION_RESOLVED, 14, "b", {"gold": "4", "yielded": {"wood": 3}}),
+    ]
+    final = {
+        "a": {"gold": "73", "tax_arrears": "0", "inventory": {"iron": 2}},
+        "b": {"gold": "124", "tax_arrears": "0", "inventory": {"wood": 3}},
+    }
+    log = _log_with_run_end(tmp_path / "run.jsonl", config, final, events)
+
+    before = holdings_at(log, 12)
+    assert before["a"] == {"gold": "100", "tax_arrears": "7", "inventory": {}}
+    assert before["b"] == {"gold": "100", "tax_arrears": "0", "inventory": {"iron": 2}}
+    assert holdings_at(log, config.time.horizon_ticks)["a"]["gold"] == "73"
+    # A replay that goes negative means a missing event: no holdings, not zero.
+    broken = {**final, "b": {"gold": "1", "inventory": {"wood": 3}}}
+    assert holdings_at(log, 12, broken) is None
+
+
+# ---------------------------------------------------------------------------
+# Deferrals from an exhausted budget are not a coordination outcome
+# ---------------------------------------------------------------------------
+def test_coordination_does_not_count_budget_exhausted_deferrals() -> None:
+    from rpg_economy.metrics.run_metrics import coordination
+
+    log = _synthetic_log(
+        [
+            (EventType.ACTIVATION_DEFERRED, 1, "a", {"reason": "k_limit"}),
+            (EventType.ACTIVATION_DEFERRED, 1, "b", {}),  # older logs: K was the only reason
+            (EventType.ACTIVATION_DEFERRED, 2, "a", {"reason": "budget_exhausted"}),
+            (EventType.ACTIVATION_DEFERRED, 3, "b", {"reason": "budget_exhausted"}),
+        ]
+    )
+    assert coordination(log)["activations_deferred"] == 2
+
+
+def test_the_holdings_replay_reaches_the_initial_world(tmp_path: Path) -> None:
+    """Every flow of gold and goods is in the log (s15): replayed to tick 0, the
+    holdings are exactly the world the run started from."""
+    from rpg_economy.engine import build_world
+    from rpg_economy.metrics.run_metrics import holdings_at
+
+    config = short_config(run={"condition": "B"})
+    result = run_condition(config, tmp_path / "run.jsonl", cycles=config.time.total_cycles)
+    log = RunLog(result.log_path)
+    initial = build_world(config)
+
+    start = holdings_at(log, 0)
+    assert start is not None
+    for agent_id, account in initial.accounts.items():
+        assert Decimal(start[agent_id]["gold"]) == account.gold
+        assert start[agent_id]["inventory"] == {
+            good.value: units for good, units in account.inventory.items() if units
+        }
+        assert start[agent_id]["tax_arrears"] == "0"
+    for tick in (config.phases.shock_tick, config.phases.reversion_tick):
+        assert holdings_at(log, tick) is not None
+
+
+def _live_holdings(state) -> dict[str, dict]:
+    """The world's holdings in the replay's shape, values as decimals."""
+    return {
+        agent_id: {
+            "gold": account.gold,
+            "tax_arrears": account.tax_arrears,
+            "inventory": {good.value: n for good, n in sorted(account.inventory.items()) if n},
+        }
+        for agent_id, account in sorted(state.accounts.items())
+    }
+
+
+def _as_decimals(holdings: dict[str, dict]) -> dict[str, dict]:
+    return {
+        agent_id: {
+            "gold": Decimal(h["gold"]),
+            "tax_arrears": Decimal(h["tax_arrears"]),
+            "inventory": h["inventory"],
+        }
+        for agent_id, h in holdings.items()
+    }
+
+
+@pytest.mark.invariant
+def test_the_holdings_replay_matches_the_live_world_under_arrears(tmp_path: Path) -> None:
+    """Replayed from the log, holdings at a mid-run tick are the live world's.
+
+    A high wealth rate and gold parked behind bids nobody fills force arrears,
+    so the replay's arrears are checked too. A wealth-tax event at exactly the
+    replayed tick belongs after it: holdings are at the *start* of the tick.
+    """
+    from rpg_economy.domain import OrderSide
+    from rpg_economy.engine import Engine, build_world
+    from rpg_economy.logging_ import EventLogWriter
+    from rpg_economy.metrics.run_metrics import holdings_at
+    from tests.conftest import make_metadata
+
+    config = short_config(
+        run={"condition": "B"},
+        time={"horizon_ticks": 40, "ticks_per_cycle": 2},
+        economy={"taxes": {"wealth_rate": "0.5", "wealth_every_ticks": 4, "wealth_exemption": "0"}},
+    )
+    per_cycle = config.time.ticks_per_cycle
+
+    from rpg_economy.domain import Product
+
+    def park_gold(engine: Engine) -> None:
+        # Bids at a price nobody sells at: the gold rests reserved, out of the
+        # tax's reach, so the tax falls into arrears.
+        for agent_id in engine.state.agent_ids:
+            units = int(engine.state.account(agent_id).available_gold)
+            if units > 0:
+                engine.submit_order(agent_id, OrderSide.BUY, Product.HEALTH_POTION, units, 1)
+
+    live: dict[int, dict[str, dict]] = {}
+
+    def after_first_tick(engine: Engine) -> None:
+        # The end of a cycle's first tick is the start of the next tick.
+        if engine.tick % per_cycle == 0:
+            live[engine.tick + 1] = _live_holdings(engine.state)
+
+    path = tmp_path / "run.jsonl"
+    with EventLogWriter(path, make_metadata(config)) as writer:
+        engine = Engine(config, build_world(config), writer)
+        engine.add_tick_observer(after_first_tick)
+        for _ in range(config.time.total_cycles):
+            live[engine.tick] = _live_holdings(engine.state)
+            engine.run_cycle(park_gold)
+        engine.log_run_end()
+    log = RunLog(path)
+
+    # Arrears did occur, and were still owed at a mid-run tick.
+    assert any(
+        h["tax_arrears"] > 0 for tick, snap in live.items() for h in snap.values() if tick > 0
+    )
+    for tick, snapshot in sorted(live.items()):
+        replayed = holdings_at(log, tick)
+        assert replayed is not None, tick
+        assert _as_decimals(replayed) == snapshot, tick
+
+    # The boundary: a wealth-tax event at exactly tick == until.
+    boundary = sorted(
+        {
+            event.tick
+            for event in log.events
+            if event.type is EventType.TAX_PAID and event.agent_id and 0 < event.tick < 38
+        }
+    )
+    assert boundary
+    tick = boundary[len(boundary) // 2]
+    at = [e for e in log.events if e.type is EventType.TAX_PAID and e.tick == tick]
+    changed = {e.agent_id for e in at}
+    before = _as_decimals(holdings_at(log, tick))
+    after = _as_decimals(holdings_at(log, tick + 1))
+    assert before == live[tick]
+    assert after == live[tick + 1]
+    # The events at that tick are excluded at ``until == tick``, included one later.
+    for agent_id in changed:
+        owed = Decimal([e for e in at if e.agent_id == agent_id][-1].payload["owed"])
+        assert after[agent_id]["tax_arrears"] == owed
+    assert any(before[a] != after[a] for a in changed)
+
+
+def test_the_propagated_recovery_is_censored_at_the_common_horizon(tmp_path: Path) -> None:
+    from rpg_economy.metrics.run_metrics import propagation
+    from tests.conftest import make_metadata
+
+    config = short_config()  # shock [10, 20), W = 5, M = 3
+    path = tmp_path / "run.jsonl"
+    with EventLogWriter(path, make_metadata(config)) as log:
+        for tick in range(0, 40):
+            log.write(
+                EventType.TRADE_EXECUTED,
+                tick=tick,
+                cycle=0,
+                payload={
+                    "good": "melee_weapon",
+                    "quantity": 1,
+                    "price": "30",
+                    "value": "30",
+                    "buyer_id": "warrior_1",
+                    "seller_id": "smithing_1",
+                },
+            )
+    run = RunLog(path)
+    full = propagation(run, config, "iron")
+    cut = propagation(run, config, "iron", until=config.phases.reversion_tick - 2)
+    assert full[1] == Duration(0, censored=False)
+    assert cut[1] == Duration(0, censored=True)
+    assert cut[0]["mean_price"][PHASE_RECOVERY] is None  # nothing observed there
+
+
+def test_unanswered_requests_are_censored_at_the_end_and_at_exhaustion() -> None:
+    """A request whose D-tick reply window was never observed is not counted."""
+    from rpg_economy.metrics.run_metrics import unanswered_requests
+
+    config = short_config(  # horizon 40
+        metrics={
+            "volatility_window_w": 5,
+            "recovery_hold_ticks_m": 3,
+            "unanswered_request_ticks_d": 5,
+        }
+    )
+
+    def request(tick: int) -> tuple:
+        payload = {"type": "REQUEST", "recipient_id": "smithing_1", "good": "iron"}
+        return (EventType.MESSAGE_SENT, tick, "warrior_1", payload)
+
+    log = _synthetic_log([request(10), request(30), request(36)])
+    assert unanswered_requests(log, config) == 2  # 36 + 5 runs past tick 39
+    # Budget gone at tick 32: nobody could answer the request at 30 either.
+    assert unanswered_requests(log, config, exhaustion_tick=32) == 1
+
+
+def test_a_request_answered_with_another_request_is_still_unanswered() -> None:
+    from rpg_economy.metrics.run_metrics import unanswered_requests
+
+    config = short_config(
+        metrics={
+            "volatility_window_w": 5,
+            "recovery_hold_ticks_m": 3,
+            "unanswered_request_ticks_d": 5,
+        }
+    )
+
+    def message(tick: int, kind: str, sender: str, recipient: str) -> tuple:
+        payload = {"type": kind, "recipient_id": recipient, "good": "iron"}
+        return (EventType.MESSAGE_SENT, tick, sender, payload)
+
+    asked_back = _synthetic_log(
+        [
+            message(10, "REQUEST", "warrior_1", "smithing_1"),
+            message(11, "REQUEST", "smithing_1", "warrior_1"),
+        ]
+    )
+    offered = _synthetic_log(
+        [
+            message(10, "REQUEST", "warrior_1", "smithing_1"),
+            message(11, "OFFER", "smithing_1", "warrior_1"),
+        ]
+    )
+    assert unanswered_requests(asked_back, config) == 2
+    assert unanswered_requests(offered, config) == 0
