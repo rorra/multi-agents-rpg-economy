@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import statistics
 from pathlib import Path
 
 import pytest
@@ -504,3 +505,451 @@ def test_holm_leaves_missing_tests_out_of_the_family() -> None:
 
     assert holm([None, 0.02, None]) == [None, pytest.approx(0.02), None]
     assert holm([]) == []
+
+
+def test_holm_agrees_with_the_contrast_correction() -> None:
+    from rpg_economy.analysis.contrasts import holm
+
+    contrasts = [
+        paired_contrast("m", "A", right, {s: 1.0 + s * k for s in SEEDS}, dict.fromkeys(SEEDS, 1.0))
+        for right, k in (("B", 0.01), ("C", -0.02))
+    ]
+    corrected = holm_correct(contrasts)
+    assert holm([c.p_value for c in contrasts]) == pytest.approx(
+        [c.p_value_holm for c in corrected]
+    )
+
+
+@pytest.mark.invariant
+def test_measurability_contrasts_are_holm_corrected_per_metric() -> None:
+    from rpg_economy.analysis.contrasts import holm
+
+    runs = []
+    for seed in range(1, 11):
+        runs.append(fake_run("A", seed, volatility=2.0))
+        b = fake_run("B", seed, volatility=1.0)
+        if seed <= 6:
+            b.volatility["shock"] = None
+            b.volatility_phase["shock"] = None
+        runs.append(b)
+        runs.append(fake_run("C", seed, volatility=1.5))
+
+    results = build_results(runs)
+
+    for metric in ("volatility_shock", "volatility_shock_phase"):
+        rows = results.companion_outcomes[metric]["paired_binary"]
+        assert {(r["left"], r["right"]) for r in rows} == {("A", "B"), ("A", "C"), ("B", "C")}
+        for row in rows:
+            assert row["p_value_holm"] >= row["p_value"]
+        tested = [r["p_value"] for r in rows]
+        assert [r["p_value_holm"] for r in rows] == pytest.approx(holm(tested))
+    # The common-horizon variant only exists where a common horizon was computed.
+    assert "volatility_shock_phase_common" not in results.companion_outcomes
+
+
+# ---------------------------------------------------------------------------
+# Suppression is decided pair by pair (design s11.3)
+# ---------------------------------------------------------------------------
+@pytest.mark.invariant
+def test_suppression_is_decided_per_contrast_pair() -> None:
+    """A and B measured on the same seeds keep their contrast when only C differs."""
+    runs = []
+    for seed in SEEDS:
+        a = fake_run("A", seed, volatility=1.0 + seed * 0.01)
+        b = fake_run("B", seed, volatility=2.0 + seed * 0.01)
+        c = fake_run("C", seed, volatility=1.5 + seed * 0.01)
+        if seed <= 3:
+            c.volatility["shock"] = None
+        runs += [a, b, c]
+    results = build_results(runs)
+
+    kept = results.contrasts["volatility_shock"]
+    assert [(c["left"], c["right"]) for c in kept] == [("A", "B")]
+    assert kept[0]["n_pairs"] == len(SEEDS)
+    # The suppressed pairs are withheld, not untestable: they stay in the Holm
+    # family, so A-B is corrected as one of three (design s11.4, user ruling).
+    assert kept[0]["holm_family_size"] == 3
+    assert kept[0]["p_value_holm"] == pytest.approx(min(1.0, 3 * kept[0]["p_value"]))
+
+    suppressed = results.suppressed_contrasts["volatility_shock"]
+    assert suppressed["pairs"] == [{"left": "A", "right": "C"}, {"left": "B", "right": "C"}]
+    assert suppressed["companion_metric"] == "volatility_shock_phase"
+    assert suppressed["holm_withheld"] == 2
+
+
+def test_holm_counts_withheld_tests_in_the_family() -> None:
+    from rpg_economy.analysis.contrasts import holm
+
+    reported = [
+        paired_contrast("m", "A", "B", {s: 1.0 + s for s in SEEDS}, dict.fromkeys(SEEDS, 1.0)),
+        paired_contrast(
+            "m", "A", "C", {s: 1.0 + s * 0.5 for s in SEEDS}, {s: 1.0 + (s % 3) for s in SEEDS}
+        ),
+    ]
+    corrected = holm_correct(reported, withheld=1)
+    ps = [c.p_value for c in reported]
+    order = sorted(range(2), key=lambda i: ps[i])
+    first = min(1.0, 3 * ps[order[0]])
+    second = max(first, min(1.0, 2 * ps[order[1]]))
+    assert corrected[order[0]].p_value_holm == pytest.approx(first)
+    assert corrected[order[1]].p_value_holm == pytest.approx(second)
+    # Without withheld tests it is plain Holm over the reported ones.
+    assert [c.p_value_holm for c in holm_correct(reported)] == pytest.approx(holm(ps))
+
+
+def test_a_withheld_contrast_without_measurable_pairs_leaves_the_family() -> None:
+    """Only a contrast with no measurable pairs at all leaves the family (s11.4)."""
+    runs = []
+    for seed in SEEDS:
+        a = fake_run("A", seed, volatility=1.0 + seed * 0.01)
+        b = fake_run("B", seed, volatility=2.0 + seed * 0.01)
+        c = fake_run("C", seed, volatility=1.5 + seed * 0.01)
+        c.volatility["shock"] = None  # C never measurable: A-C and B-C have no pairs
+        runs += [a, b, c]
+    results = build_results(runs)
+
+    assert results.suppressed_contrasts["volatility_shock"]["holm_withheld"] == 0
+    (kept,) = results.contrasts["volatility_shock"]
+    assert kept["holm_family_size"] == 1
+    assert kept["p_value_holm"] == pytest.approx(kept["p_value"])
+
+
+@pytest.mark.invariant
+def test_the_phase_level_volatility_is_never_suppressed() -> None:
+    """s11.3: the volatility comparison is sustained by the phase volatility."""
+    runs = []
+    for seed in SEEDS:
+        a = fake_run("A", seed, volatility=1.0 + seed * 0.01)
+        b = fake_run("B", seed, volatility=2.0 + seed * 0.01)
+        c = fake_run("C", seed, volatility=1.5 + seed * 0.01)
+        if seed <= 4:
+            b.volatility_phase["shock"] = None
+        runs += [a, b, c]
+    results = build_results(runs)
+
+    assert "volatility_shock_phase" not in results.suppressed_contrasts
+    by_pair = {(c["left"], c["right"]): c for c in results.contrasts["volatility_shock_phase"]}
+    assert set(by_pair) == {("A", "B"), ("A", "C"), ("B", "C")}
+    assert by_pair[("A", "B")]["n_pairs"] == len(SEEDS) - 4
+    assert by_pair[("A", "B")]["n_dropped"] == 4
+    assert by_pair[("A", "C")]["n_dropped"] == 0
+    # Its measurability is still reported as an outcome.
+    assert results.companion_outcomes["volatility_shock_phase"]["counts"]["B"] == {
+        "measurable": len(SEEDS) - 4,
+        "runs": len(SEEDS),
+    }
+
+
+def test_the_common_horizon_window_volatility_is_suppressed_per_pair() -> None:
+    runs = [fake_run(c, s, volatility=1.0) for c in "ABC" for s in SEEDS]
+    for run in runs:
+        window = None if (run.condition == "B" and run.seed <= 2) else 1.0 + run.seed * 0.1
+        run.common_horizon = {
+            "horizon": 30,
+            "traded_value": 10.0 + run.seed,
+            "stockout_ticks": 2,
+            "volatility_shock": window,
+            "volatility_shock_phase": 1.0 + run.seed * 0.1,
+        }
+    results = build_results(runs)
+
+    suppressed = results.suppressed_contrasts["volatility_shock_common"]
+    assert suppressed["companion_metric"] == "volatility_shock_phase_common"
+    assert {(p["left"], p["right"]) for p in suppressed["pairs"]} == {("A", "B"), ("B", "C")}
+    assert [(c["left"], c["right"]) for c in results.contrasts["volatility_shock_common"]] == [
+        ("A", "C")
+    ]
+    assert "volatility_shock_phase_common" in results.contrasts
+
+
+# ---------------------------------------------------------------------------
+# Metrics that do not exist for a scenario are skipped (design s11.3)
+# ---------------------------------------------------------------------------
+def _liquidity_run(condition: str, seed: int) -> RunMetrics:
+    run = fake_run(condition, seed, volatility=1.0)
+    run.scenario = "liquidity_loss"
+    run.target_good = None
+    run.target_kind = "traded_value"
+    run.primary_metrics = ("traded_value", "recovery_time")
+    run.volatility = dict.fromkeys(("base", "shock", "recovery"))
+    run.volatility_phase = dict.fromkeys(("base", "shock", "recovery"))
+    run.stockouts = {**run.stockouts, "good": None, "total_ticks": 0}
+    run.volume_value = {"base": 100.0, "shock": 50.0 + seed, "recovery": 80.0}
+    run.coordination = {**run.coordination, "activation_concentration": 0.1}
+    return run
+
+
+def test_liquidity_loss_has_no_target_good_contrasts_or_measurability_rows() -> None:
+    results = build_results([_liquidity_run(c, s) for c in "ABC" for s in SEEDS])
+
+    for metric in ("volatility_shock", "volatility_shock_phase", "stockout_ticks"):
+        assert metric not in results.contrasts
+        assert metric not in results.measurability
+        assert metric not in results.suppressed_contrasts
+        assert metric not in results.companion_outcomes
+    assert "traded_value" in results.contrasts
+    assert results.primary_metrics == ("traded_value",)
+
+
+# ---------------------------------------------------------------------------
+# Secondary analyses are carried into the results (design s11.1, s11.3)
+# ---------------------------------------------------------------------------
+def test_secondary_analyses_are_contrasted_and_summarised() -> None:
+    runs = [fake_run(c, s, volatility=1.0) for c in "ABC" for s in SEEDS]
+    offset = {"A": 0.0, "B": 1.0, "C": 0.5}
+    for run in runs:
+        shift = offset[run.condition] + run.seed * 0.01
+        run.stockouts_inventory = {
+            "good": "iron",
+            "total_ticks": 3,
+            "by_phase": {"base": 0, "shock": 3, "recovery": 0},
+        }
+        run.multi_good = {"volatility": 1.0 + shift, "volume": 0.8 + shift, "per_good": {}}
+        run.propagation = {
+            "source": "iron",
+            "good": "melee_weapon",
+            "mean_price": {"base": 30.0, "shock": 35.0 + shift, "recovery": 31.0},
+            "stockout_ticks": {"base": 0, "shock": 2, "recovery": 0},
+        }
+        run.propagation_recovery = Duration(5 + run.seed, run.condition == "B")
+        run.volume_by_good = {
+            "iron": {
+                "base": {"units": 10, "value": 100.0},
+                "shock": {"units": 4 + run.seed, "value": 60.0},
+                "recovery": {"units": 8, "value": 80.0},
+            }
+        }
+    results = build_results(runs)
+
+    for metric in (
+        "stockout_ticks_inventory",
+        "volatility_all_goods",
+        "volume_all_goods",
+        "propagation_price_shock",
+        "propagation_stockout_ticks",
+    ):
+        assert metric in results.contrasts, metric
+    assert results.survival_propagation["censoring_rate"]["B"] == 1.0
+    assert results.survival_propagation["recovered_fraction"]["A"] == 1.0
+    assert results.volume_by_good["A"]["iron"]["shock"]["units"] == pytest.approx(
+        4 + statistics.median(SEEDS)
+    )
+    payload = results.to_payload()
+    assert payload["survival_propagation"] is not None
+    assert payload["volume_by_good"]
+
+
+def test_there_is_no_propagation_block_without_a_raw_material_target() -> None:
+    results = sample_results()
+    assert results.survival_propagation is None
+    assert "propagation_price_shock" not in results.contrasts
+
+
+# ---------------------------------------------------------------------------
+# Empty groups and the Kaplan-Meier median
+# ---------------------------------------------------------------------------
+def test_an_empty_recovery_group_has_no_rate_or_fraction() -> None:
+    runs = [fake_run(c, s, volatility=1.0) for c in "ABC" for s in SEEDS]
+    for run in runs:
+        if run.condition == "B":
+            run.recovery = None
+    results = build_results(runs)
+
+    assert results.survival["censoring_rate"]["B"] is None
+    assert results.survival["recovered_fraction"]["B"] is None
+    assert results.survival["kaplan_meier"]["B"]["median"] is None
+    assert results.survival["recovered_fraction"]["A"] == 1.0
+
+
+def test_the_kaplan_meier_median_counts_censored_runs() -> None:
+    from rpg_economy.analysis.survival import km_median
+
+    # Two recoveries at 10 and 20, three runs censored beyond: the curve falls
+    # to 0.8 and 0.6 and never reaches one half.
+    curve = kaplan_meier(
+        observations([(1, 10, False), (2, 20, False), (3, 30, True), (4, 30, True), (5, 30, True)])
+    )
+    assert curve["median"] is None
+    # The median of the observed times alone would have said 15.
+
+    curve = kaplan_meier(observations([(1, 10, False), (2, 20, False), (3, 30, True)]))
+    assert curve["median"] == pytest.approx(20.0)
+    assert km_median([5.0, 9.0], [0.5, 0.0]) == 5.0
+    assert km_median([], []) is None
+
+
+def test_the_results_file_records_whether_pilot_seeds_were_included() -> None:
+    results = sample_results()
+    assert results.to_payload()["pilot_seeds_included"] is False
+    results.pilot_seeds_included = True
+    assert results.to_payload()["pilot_seeds_included"] is True
+
+
+def test_stockouts_over_every_good_are_a_contrasted_secondary() -> None:
+    """liquidity_loss has no target good, so stockouts enter as this aggregate (s11.3)."""
+    runs = [fake_run(c, s, volatility=1.0) for c in "ABC" for s in SEEDS]
+    offset = {"A": 0.0, "B": 1.0, "C": 0.5}
+    for run in runs:
+        shift = offset[run.condition] + run.seed * 0.01
+        run.multi_good = {
+            "volatility": 1.0,
+            "volume": 1.0,
+            "stockouts": 1.2 + shift,
+            "per_good": {},
+        }
+    results = build_results(runs)
+
+    assert "stockouts_all_goods" in results.contrasts
+    ab = next(c for c in results.contrasts["stockouts_all_goods"] if c["right"] == "B")
+    assert ab["median_difference"] == pytest.approx(-1.0)
+
+
+def test_results_without_the_stockout_aggregate_do_not_list_it() -> None:
+    runs = [fake_run(c, s, volatility=1.0) for c in "ABC" for s in SEEDS]
+    for run in runs:
+        run.multi_good = {"volatility": 1.0, "volume": 1.0, "per_good": {}}
+    results = build_results(runs)
+    assert "stockouts_all_goods" not in results.contrasts
+
+
+# ---------------------------------------------------------------------------
+# Propagated price and all-goods volatility: selection-sensitive too (ruling)
+# ---------------------------------------------------------------------------
+def _propagated(run: RunMetrics, shock_price: float | None) -> RunMetrics:
+    run.propagation = {
+        "source": "iron",
+        "good": "melee_weapon",
+        "mean_price": {"base": 30.0, "shock": shock_price, "recovery": 31.0},
+        "stockout_ticks": {"base": 0, "shock": run.seed % 3, "recovery": 0},
+    }
+    return run
+
+
+@pytest.mark.invariant
+def test_the_propagated_price_contrast_is_suppressed_per_pair_when_measurability_differs() -> None:
+    runs = []
+    for seed in SEEDS:
+        for condition, offset in (("A", 0.0), ("B", 1.0), ("C", 2.0)):
+            price = None if (condition == "B" and seed <= 4) else 35.0 + offset + seed * 0.1
+            runs.append(_propagated(fake_run(condition, seed, volatility=1.0), price))
+    results = build_results(runs)
+
+    suppressed = results.suppressed_contrasts["propagation_price_shock"]
+    assert suppressed["reason"] == "measurability_differs_by_condition"
+    assert suppressed["companion_metric"] is None
+    assert {(p["left"], p["right"]) for p in suppressed["pairs"]} == {("A", "B"), ("B", "C")}
+    (kept,) = results.contrasts["propagation_price_shock"]
+    assert (kept["left"], kept["right"]) == ("A", "C")
+    # Holm keeps the metric's three contrasts: the two withheld pairs count.
+    assert suppressed["holm_withheld"] == 2
+    assert kept["holm_family_size"] == 3
+    # Its measurability is reported per condition as an outcome of its own.
+    outcome = results.companion_outcomes["propagation_price_shock"]
+    assert outcome["counts"]["B"] == {"measurable": len(SEEDS) - 4, "runs": len(SEEDS)}
+    assert outcome["counts"]["A"] == {"measurable": len(SEEDS), "runs": len(SEEDS)}
+    assert len(outcome["paired_binary"]) == 3
+
+
+@pytest.mark.invariant
+def test_the_all_goods_volatility_contrast_is_suppressed_per_pair() -> None:
+    runs = []
+    for seed in SEEDS:
+        for condition in "ABC":
+            run = fake_run(condition, seed, volatility=1.0)
+            volatility = None if (condition == "C" and seed <= 3) else 1.0 + seed * 0.05
+            run.multi_good = {"volatility": volatility, "volume": 0.8, "stockouts": 1.0}
+            runs.append(run)
+    results = build_results(runs)
+
+    suppressed = results.suppressed_contrasts["volatility_all_goods"]
+    assert suppressed["companion_metric"] is None
+    assert {(p["left"], p["right"]) for p in suppressed["pairs"]} == {("A", "C"), ("B", "C")}
+    (kept,) = results.contrasts["volatility_all_goods"]
+    assert (kept["left"], kept["right"]) == ("A", "B")
+    assert kept["holm_family_size"] == 3
+    assert results.companion_outcomes["volatility_all_goods"]["fraction"]["C"] == pytest.approx(
+        (len(SEEDS) - 3) / len(SEEDS)
+    )
+    # A secondary metric measurable everywhere keeps all three contrasts.
+    assert "volume_all_goods" not in results.suppressed_contrasts
+    assert len(results.contrasts["volume_all_goods"]) == 3
+
+
+def test_the_common_horizon_variants_are_suppressed_too() -> None:
+    runs = []
+    for seed in SEEDS:
+        for condition in "ABC":
+            run = _propagated(fake_run(condition, seed, volatility=1.0), 35.0 + seed)
+            run.multi_good = {"volatility": 1.0 + seed * 0.05, "volume": 0.8, "stockouts": 1.0}
+            thin = condition == "A" and seed <= 2
+            run.common_horizon = {
+                "horizon": 30,
+                "traded_value": 10.0 + seed,
+                "stockout_ticks": 2,
+                "volatility_shock": 1.0 + seed * 0.1,
+                "volatility_shock_phase": 1.0 + seed * 0.1,
+                "volatility_all_goods": None if thin else 1.1 + seed * 0.01,
+                "propagation_price_shock": None if thin else 30.0 + seed,
+            }
+            runs.append(run)
+    results = build_results(runs)
+
+    for metric in ("volatility_all_goods_common", "propagation_price_shock_common"):
+        suppressed = results.suppressed_contrasts[metric]
+        assert {(p["left"], p["right"]) for p in suppressed["pairs"]} == {("A", "B"), ("A", "C")}
+        (kept,) = results.contrasts[metric]
+        assert (kept["left"], kept["right"]) == ("B", "C")
+        assert kept["holm_family_size"] == 3
+        assert results.companion_outcomes[metric]["counts"]["A"]["measurable"] == len(SEEDS) - 2
+
+
+def test_equal_measurability_keeps_every_propagated_price_contrast() -> None:
+    runs = [
+        _propagated(fake_run(c, s, volatility=1.0), None if s <= 2 else 35.0 + s)
+        for c in "ABC"
+        for s in SEEDS
+    ]
+    results = build_results(runs)
+    assert "propagation_price_shock" not in results.suppressed_contrasts
+    assert len(results.contrasts["propagation_price_shock"]) == 3
+    assert "propagation_price_shock" in results.companion_outcomes
+
+
+def test_a_pair_with_no_measurable_seeds_is_not_tested() -> None:
+    """Design s11.4: a contrast with no measurable pairs is not a test."""
+    runs = [fake_run(c, s, volatility=1.0) for c in "ABC" for s in SEEDS]
+    for run in runs:
+        if run.condition in "BC":
+            run.recovery = None
+    survival = build_results(runs).survival
+    for family in ("paired_binary", "stratified_logrank"):
+        assert survival[family] == []
+    withheld = {(p["left"], p["right"]) for p in survival["suppressed_pairs"]}
+    assert withheld == {("A", "B"), ("A", "C")}
+    # No seed measurable in both: withheld, but not counted in Holm.
+    assert all(not p["in_family"] for p in survival["suppressed_pairs"])
+    # B-C: neither measurable anywhere, so no test, and said so.
+    assert survival["no_pairs"] == [{"left": "B", "right": "C"}]
+
+
+def test_a_withheld_recovery_pair_hides_its_medians_and_curves(tmp_path: Path) -> None:
+    from rpg_economy.analysis import report
+    from rpg_economy.i18n import t
+
+    runs = [fake_run(c, s, volatility=1.0) for c in "ABC" for s in SEEDS]
+    for run in runs:
+        if run.condition == "B" and run.seed == SEEDS[0]:
+            run.recovery = None
+    results = build_results(runs)
+    table = "\n".join(report._recovery_table(results, results.survival))
+    # A-B and B-C are withheld, so all three conditions sit in a withheld pair.
+    assert table.count(t("report.value.suppressed")) == 3
+
+
+def test_unanswered_requests_are_contrasted_between_b_and_c_only() -> None:
+    """A sends no peer messages: A-B and A-C would test a constant zero."""
+    runs = [fake_run(c, s, volatility=1.0) for c in "ABC" for s in SEEDS]
+    for run in runs:
+        run.unanswered_requests = 0 if run.condition == "A" else run.seed % 4
+    contrasts = build_results(runs).contrasts["unanswered_requests"]
+    assert [(c["left"], c["right"]) for c in contrasts] == [("B", "C")]
