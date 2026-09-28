@@ -1057,3 +1057,206 @@ def test_the_report_names_the_seeds_of_incomplete_trios(locale: str) -> None:
     assert payload["incomplete_trios"] == [2003, 2014]
     assert payload["skipped_seeds"] == [1001]
     assert payload["skipped_cells"] == {"demand_surge/experiment_1": ["A", "B"]}
+
+
+# ---------------------------------------------------------------------------
+# The common-horizon section carries every economic metric (s8.4, s11.2)
+# ---------------------------------------------------------------------------
+def _common_horizon_results():
+    runs = []
+    for seed in SEEDS:
+        for condition in "ABC":
+            run = fake_run(condition, seed, volatility=1.0 + seed * 0.01)
+            offset = {"A": 0.0, "B": 0.1, "C": 0.2}[condition]
+            run.multi_good = {"volatility": 1.2, "volume": 0.8, "stockouts": 1.5}
+            run.stockouts_inventory = {"by_phase": {"base": 0, "shock": 2, "recovery": 0}}
+            run.common_horizon = {
+                "horizon": 30,
+                "traded_value": 40.0 + seed,
+                "stockout_ticks": 2,
+                "volatility_shock": 1.0 + seed * 0.01,
+                "volatility_shock_phase": 1.0 + seed * 0.01,
+                "stockout_ticks_inventory": 1 + seed % 2,
+                "useful_production": 0.5 + offset + seed * 0.001,
+                "gini": 0.3 + offset + seed * 0.002,
+                "volatility_all_goods": 1.1,
+                "volume_all_goods": 0.7 + offset,
+                "stockouts_all_goods": 1.4,
+                "propagation_price_shock": None,
+                "propagation_stockout_ticks": None,
+            }
+            run.recovery_common_horizon = Duration(10 + seed, False)
+            runs.append(run)
+    return build_results(runs)
+
+
+def test_every_common_horizon_metric_is_contrasted() -> None:
+    results = _common_horizon_results()
+    for metric in (
+        "useful_production_common",
+        "gini_common",
+        "stockout_ticks_inventory_common",
+        "volatility_all_goods_common",
+        "volume_all_goods_common",
+        "stockouts_all_goods_common",
+    ):
+        assert metric in results.contrasts, metric
+    # No propagation block in these runs: its common-horizon twin does not exist.
+    assert "propagation_price_shock_common" not in results.contrasts
+    by_pair = {(c["left"], c["right"]): c for c in results.contrasts["gini_common"]}
+    assert by_pair[("A", "C")]["median_difference"] == pytest.approx(-0.2)
+
+
+@pytest.mark.parametrize("locale", ["en", "es"])
+def test_the_common_horizon_section_lists_every_metric(locale: str) -> None:
+    from rpg_economy.i18n import set_locale, t
+
+    results = _common_horizon_results()
+    text = render_report(results, locale=locale, figure_paths={})
+    set_locale(locale)
+    section = text.index(t("report.section.common_horizon"))
+    secondary = text.index(t("report.section.secondary"))
+    recovery = text.index(t("report.section.recovery_common"))
+    assert section < recovery
+    for metric in ("gini_common", "useful_production_common", "volume_all_goods_common"):
+        label = t(f"report.metric.{metric}")
+        # The median row sits in the common-horizon section, not the secondary table.
+        first = next(i for i, line in enumerate(text.splitlines()) if line.startswith(label))
+        assert sum(len(line) + 1 for line in text.splitlines()[:first]) > section, metric
+    assert secondary < section
+
+
+# ---------------------------------------------------------------------------
+# The volume-by-good table is in the reader's alphabet
+# ---------------------------------------------------------------------------
+def test_collation_ignores_case_and_accents() -> None:
+    from rpg_economy.analysis.report import _collation_key
+
+    assert sorted(["zeta", "Árbol", "arco", "Bastón", "barco"], key=_collation_key) == [
+        "Árbol",
+        "arco",
+        "barco",
+        "Bastón",
+        "zeta",
+    ]
+
+
+@pytest.mark.parametrize("locale", ["en", "es"])
+def test_the_volume_by_good_table_is_sorted_by_localized_name(locale: str) -> None:
+    from rpg_economy.analysis.report import _collation_key, good_label
+    from rpg_economy.i18n import set_locale, t
+
+    goods = [
+        "iron",
+        "wood",
+        "leather",
+        "herbs",
+        "arcane_crystal",
+        "melee_weapon",
+        "armor",
+        "bow_gear",
+        "staff_focus",
+        "health_potion",
+        "mana_potion",
+    ]
+    runs = [fake_run(c, s, volatility=1.0) for c in "ABC" for s in SEEDS]
+    for run in runs:
+        run.volume_by_good = {
+            good: {phase: {"units": 5, "value": 50.0} for phase in ("base", "shock", "recovery")}
+            for good in goods
+        }
+    text = render_report(build_results(runs), locale=locale, figure_paths={})
+    set_locale(locale)
+    section = text.split(t("report.section.volume_by_good"), 1)[1].split("\n\n", 2)[1]
+    rows = section.splitlines()[2:]
+    labels = [good_label(good) for good in goods]
+    shown = [next(label for label in labels if row.startswith(label + " ")) for row in rows]
+    assert shown == sorted(labels, key=_collation_key)
+
+
+# ---------------------------------------------------------------------------
+# The report states the metric parameters and what the checks left out
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("locale", ["en", "es"])
+def test_the_report_states_the_metric_parameters_in_one_line(locale: str) -> None:
+    from rpg_economy.i18n import set_locale, t
+
+    results = sample_results()
+    assert "metric_parameters" in results.to_payload()
+    results.metric_parameters = {
+        "volatility_window_w": 20,
+        "recovery_band_pct_x": "0.15",
+        "recovery_hold_ticks_m": 10,
+        "useful_production_ticks_t": 30,
+        "unanswered_request_ticks_d": 12,
+    }
+    text = render_report(results, locale=locale, figure_paths={})
+    set_locale(locale)
+    band = "0.15" if locale == "en" else "0,15"
+    params = f"W = 20, X = {band}, M = 10, T = 30, D = 12"
+    assert t("report.note.metric_parameters", params=params) in text
+    assert results.to_payload()["metric_parameters"]["recovery_band_pct_x"] == "0.15"
+
+
+@pytest.mark.parametrize("locale", ["en", "es"])
+def test_the_report_names_what_the_checks_left_out(locale: str) -> None:
+    from rpg_economy.i18n import set_locale, t
+
+    results = sample_results()
+    clean = render_report(results, locale=locale, figure_paths={})
+    results.skipped_logs = [
+        {"seed": 2002, "reason": "phase_adhoc"},
+        {"seed": 2002, "reason": "phase_adhoc"},
+        {"seed": 1001, "reason": "seed_not_analysed"},
+    ]
+    results.rejected_trios = {
+        "resource_scarcity/experiment_1": [{"seed": 2003, "reason": "horizon_mismatch"}]
+    }
+    results.refused_cells = {"demand_surge/experiment_1": ["code_digest", "python_version"]}
+    text = render_report(results, locale=locale, figure_paths={})
+    set_locale(locale)
+    reasons = (
+        f"{t('report.skip_reason.phase_adhoc')}: 2; {t('report.skip_reason.seed_not_analysed')}: 1"
+    )
+    lines = (
+        t("report.note.skipped_logs", reasons=reasons, count="3"),
+        t(
+            "report.note.rejected_trios",
+            trios=f"{t('scenario.resource_scarcity')} / {t('experiment.experiment_1')} 2003 "
+            f"({t('report.reject_reason.horizon_mismatch')})",
+            count="1",
+        ),
+        t(
+            "report.note.refused_cells",
+            cells=f"{t('scenario.demand_surge')} / {t('experiment.experiment_1')} "
+            "(code_digest, python_version)",
+            count="1",
+        ),
+    )
+    for line in lines:
+        assert line in text
+        assert line not in clean
+    payload = results.to_payload()
+    assert payload["refused_cells"] == {
+        "demand_surge/experiment_1": ["code_digest", "python_version"]
+    }
+    assert payload["rejected_trios"]["resource_scarcity/experiment_1"][0]["seed"] == 2003
+
+
+# ---------------------------------------------------------------------------
+# The economy check's counts use the shared formatter
+# ---------------------------------------------------------------------------
+def test_economy_check_counts_are_localized() -> None:
+    import importlib
+    import inspect
+
+    from rpg_economy.i18n import set_locale
+
+    render_module = importlib.import_module("rpg_economy.analysis.render")
+
+    set_locale("es")
+    assert render_module._count(12345) == "12.345"
+    set_locale("en")
+    assert render_module._count(12345) == "12,345"
+    assert render_module._count(None) == "-"
+    assert "str(" not in inspect.getsource(render_module)
