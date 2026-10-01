@@ -314,3 +314,187 @@ Serialization is compact without changing content: the directory is one
 `id:role/specialization` record per agent, and the global view is a columnar
 table rendered by the same function for the Director and the bulletin.
 
+### 4.9 Communication
+Message types: `REQUEST`, `OFFER`, `INFORM`, `TASK`/`RESULT` (A only),
+`REJECT`/`ACK`. Structured payloads, single recipient, static public
+directory. No strategic P2P in A. Every peer message names the good it is about;
+`REQUEST` and `OFFER` also carry quantity and price. A message missing any of
+these is invalid output and goes through the retry. A `REQUEST` or `OFFER`
+expires after the same number of ticks as a market order; an `ACK` or `REJECT`
+to an expired proposal is refused by the engine as not a reply
+(`not_a_reply`): a wasted activation, with no retry. There is at most one open proposal per
+(sender, recipient, good): a new `REQUEST` or `OFFER` replaces the previous
+one, and an `ACK` or `REJECT` answers the latest.
+
+In B and C an agent's observation lists the still-open `REQUEST` and `OFFER`
+proposals addressed to it (sender, type, good, quantity, price, ticks left)
+until they expire or are answered. Their tokens count as `p2p_content`. A has
+no P2P, so they are not shown there.
+
+### 4.10 Scenarios
+Each run has a base phase, exactly one shock and a recovery phase. The
+primary scenario is `resource_scarcity`; `demand_surge`, `productivity_drop`
+and `liquidity_loss` are secondary.
+
+`liquidity_loss` freezes the configured fraction of each affected agent's
+available gold at the shock (free gold net of tax owed), plus the same fraction
+of the gold already reserved in bids at that moment, as that gold is released,
+also net of the arrears it will pay. The claim holds when such a bid is
+released (it expires or is cancelled) during the freeze: the agent then ends
+the freeze with the same gold frozen as one that held that gold free at the
+shock. The reason is pairing: freezing only the gold free at the shock would
+make the shock's size depend on whether the agent happened to have a bid out,
+which differs between the conditions of one trio. A pre-freeze bid that fills
+spends its reservation unfrozen, because the purchase was committed before the
+freeze. Gold reserved in bids placed after the shock is not frozen. Everything
+frozen is released at reversion.
+
+`economy-check --shock-efficacy` runs each pilot seed with and without the
+shock, offline, with rule-based agents under the experiment's own activation
+regime (triggers, neutral scheduler, K). A shock passes if it moves its
+primary target's price by 10% or adds 10 stockout ticks over the shock phase
+(liquidity_loss: traded value by 10%). The rule-based agents are the proxy
+this check stands on. They are not held to the LLM agents' observation: they
+read zone stock, every resource's price and whether other agents are away,
+none of which an LLM agent sees. How many potions a trip needs they learn from
+their own trips, as an LLM agent would, not from the shock. A shock magnitude calibrated offline is
+therefore calibrated against better-informed agents, which is why
+`economy-check --shock-efficacy --pilot-logs` repeats the check on real
+LLM runs. They are written to make a
+two-sided market:
+adventurers offer what they gather, artisans raise stale bids and stop
+sourcing lines that are not selling. Adventurers trade while resting
+after a trip: they equip, then in one place_orders replace gear, restock
+potions and put the whole haul up for sale, holding back briefly when a price
+has collapsed. They set out once rested, whatever orders are still open; with
+no chance to trade during the rest they take one trade action first, never
+more. They stop asking for gear nobody is selling. Artisans offer all their
+finished stock and bid for every missing input in one action, and price a
+unit from its share of the batch's inputs. Prices come from beliefs anchored
+partly to each good's starting price, so the base phase is stationary. A buyer
+that goes unfilled raises its bid faster
+than an unsold seller lowers its ask, and a seller whose offers keep selling
+asks more, so a shortage shows in the price; no buyer bids more than 60% over a
+good's starting price, so a lasting shortage cannot spiral. Artisans make one
+batch at a time, to replace what sold.
+
+### 4.11 Metrics and statistics
+Metrics follow design §11. Recovery that doesn't happen within the horizon
+(full or common active) is censored, never replaced by an invented value and
+never treated as missing; censoring rates are reported,
+and the analysis uses a paired recovered-within-horizon test plus
+Kaplan–Meier / log-rank. The recovery table reports the Kaplan–Meier median.
+Contrasts: paired Wilcoxon per scenario with Holm
+correction, rank-biserial effect sizes and bootstrap CIs. The Holm family is
+the three contrasts (A–B, A–C, B–C) of one metric within one scenario. A
+contrast withheld by measurability suppression stays in the family (m = 3);
+only a contrast with no measurable pairs leaves it. Pilot and final seeds are
+disjoint.
+
+On the common active horizon every economic metric is recomputed, the
+secondary ones included (useful production, Gini, inventory stockouts, the
+all-goods aggregates and propagation). There, shock-phase metrics are missing when the horizon
+ends at or before the shock, never zero. A recovery not observed within the
+common horizon is censored, even when the horizon ends before the reference
+window. Measurability
+suppression is decided per contrast pair, on the seeds both conditions ran; the
+window volatility can be suppressed, the phase-level volatility is always
+contrasted. The price of the propagated product and the all-goods volatility
+get the same treatment as the target volatility: measurability is reported per
+condition as a companion outcome, and a pair's contrast is suppressed when
+measurability differs between its two conditions. Recovery follows the same
+rule: its reference price comes from each run's own base-phase trades, so where
+recovery is measurable in one condition of a pair and not the other on any
+seed, that pair's paired binary and log-rank tests are withheld, its
+conditions show no Kaplan-Meier median, the Kaplan-Meier figure is left out, and
+measurability is tested with McNemar's exact test. Holm keeps m = 3.
+A request counts as answered only by an OFFER, ACK or REJECT from its recipient
+about the same good. Unanswered requests are contrasted on B-C only: A has no peer-to-peer messages,
+so its count is always 0 and is reported descriptively. A seed
+without a complete A/B/C trio is left out of the cell, with a warning.
+
+Each run records its phase (`pilot`, `final` or `adhoc`) in its metadata.
+Inference admits only final runs; `--include-pilot` also admits pilot runs, and
+a report that includes them says so in a banner and in `results.json`
+(`pilot_seeds_included`): it is exploration, not inference. `derive-budget`
+requires pilot runs. The report requires every admitted trio to have passed the
+integrity check (`integrity.json`) and cross-checks the common active horizon
+recorded there against the one it computes from the logs.
+
+The analysis-only metric parameters (X, M, T, D) are left out of the run's
+configuration hash: they do not change a run, only how it is measured. The
+values used are recorded in `results.json` with the report. W stays in the
+hash, because the global view uses it at run time.
+
+The pre-registered secondary analyses are reported too: propagation from the
+scarce resource to its main product (price, stockouts, recovery), stockout
+ticks with no world inventory of the good, the median across goods of each
+good's shock/base ratio (for stockouts, the shock-phase share of ticks
+without an offer minus the base-phase share), and volume per good and phase. The shock-efficacy
+check on pilot logs compares the shock phase with the last W base ticks,
+rescaled to the length of the shock phase.
+
+### 4.12 Logging
+Each run logs enough to be fully reconstructed: observations, messages,
+outputs and final actions of every activation; trigger firings; activation
+requests; Director calls and RESULTs; tokens per bucket; budget exhaustion.
+Run metadata records model, parameters, prompt hashes, config hash, seed,
+condition, scenario and experiment, plus the setup hash: the config hash without
+its `run` section, shared by every run of one setup. That is what ties a
+result to the exact configuration, prompts and interpreter that produced it.
+Run metadata also records `code_digest`, a digest of the modules that determine
+a run's behaviour (`__init__.py`, `agents`, `cli_support.py`, `config`,
+`domain`, `engine`, `llm`, `logging_`, `messaging`, `orchestration`, `runner`),
+computed once per process; the
+prompt hashes are also computed once per process. The config hash leaves out
+the seed list and the `campaign` section, and the budget for Experiment 1
+cells, so adding seeds to a campaign keeps the trios already finished.
+Execution-only settings (mock, pricing, request timeout, retry delays) are left
+out of the hash: changing them does not change the experiment. The raw text of
+every model completion is logged in full, and the run metadata records the
+global view version. `activation_deferred` carries its reason (`k_limit`
+or `budget_exhausted`), and requests withdrawn because their trigger condition
+ended are logged as `activation_request_resolved`.
+
+A trio counts as complete only when its three logs passed the integrity check,
+recorded as `integrity.json` with each log's hash. The check also requires A, B
+and C to share code digest, prompt hashes, Python version and setup hash, and
+all three logs to be all mock or all real.
+`integrity.json` records the common active horizon, each condition's exhaustion
+tick and the post-exhaustion mechanical ticks. On a transient provider
+failure only the failed condition is re-run; the set-aside logs stay in
+`previous-N/` and their billed tokens appear in `billing.json`. A resumed real
+batch is priced on the trios still to run. Resume refuses logs written under
+another prompt version, global view version, Python version or code digest. An
+output directory (campaign, pilot, trio, smoke, derisk) is locked while a run
+uses it. A lock whose `flock` is free is taken over: a free flock is enough to
+show that no process holds it. Under the lock, the batch must match what was
+confirmed at the cost gate. `derive-budget` uses only trios that passed the
+integrity check and refuses logs written by other code.
+
+Ctrl-C works in two levels. The first starts nothing new: each running trio
+finishes the condition it is on and does not start the next, what was paid for
+is kept, and resume runs only the missing conditions. A second Ctrl-C aborts at
+the next macro-cycle; that run is logged as `run_aborted`, which carries the token
+totals it spent, and has no `run_end`, so resume runs it again. The runner
+reports either case as `RunInterrupted`, with the conditions that finished. The
+folder lock is held until everything has stopped, and the command exits with
+code 130. A third Ctrl-C exits immediately: the lock is released when the
+process ends, and the unfinished runs keep their spend and are re-run on
+resume. `billing.json` is written even when the batch raises; it counts the
+spend of unfinished runs (`unfinished_spend`: from `tokens_consumed`, else the
+ledger in `run_aborted`, else the call events and their `billed` flag), and
+`billed_total_all` adds finished, unfinished and set-aside logs. The lock is an
+`flock` on `.campaign.lock`. A lock left on this host whose flock is free is
+taken over, even when its recorded pid was reused; `--break-lock` is only for a
+lock left on another host or an unreadable one; a lock held by a running process
+is never replaced. Under the lock, pilot and campaign-run recompute what is
+pending and refuse with exit 5 if it is not what was confirmed. The trio
+integrity check also requires the three logs to agree on `llm_mock`. A real rerun
+with nothing pending skips the cost gate but still verifies and writes
+`billing.json`; `derive-budget --layer-out` refuses to
+overwrite a file without `--force`, and its `--out` JSON records
+`derived_from_mock`.
+Exit code 7 means a run, stage or verification did not complete cleanly: an
+integrity failure, a failed trio or a failed billing check.
+
