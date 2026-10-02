@@ -539,4 +539,197 @@
     return out;
   }
 
+  function stepItem(tr, s, t, showTick) {
+    var key = t + ":" + s.n;
+    var li = el("li", "step" + (tr.ui.open[key] ? " open" : ""));
+    var b = add(li, el("button", "summary"));
+    b.type = "button";
+    // Stable across re-renders, so focus can return to it (see renderColumn).
+    b.setAttribute("data-key", "step:" + key);
+    b.setAttribute("aria-expanded", tr.ui.open[key] ? "true" : "false");
+    add(b, el("span", "num", String(s.n)));
+    var body = add(b, el("span", ""));
+    var who = add(body, el("span", "who"));
+    add(who, el("span", "agent", s.a));
+    add(who, el("span", "role", roleOf(tr, s.a)));
+    var w = s.w || {};
+    if (w.task) {
+      var c = add(who, el("span", "chip task", S.task[w.task.ty] || w.task.ty));
+      c.title = tpl("replay.why.task") + " · " + (S.priority[w.task.pr] || w.task.pr || "");
+    } else if (w.tr) {
+      w.tr.forEach(function (name) {
+        var ch = add(who, el("span", "chip", trigShort(name)));
+        ch.title = S.trigger[name] || name;
+      });
+    }
+    if (showTick) add(who, el("span", "tickref", "t" + t));
+    add(body, el("span", "decision", decisionText(s.d)));
+    if (s.d && s.d.why) add(body, el("span", "reason", "“" + s.d.why + "”"));
+    var marks = add(body, el("span", "marks"));
+    marksFor(s, tr).forEach(function (m) { add(marks, el("span", "mark " + m[0], m[1])); });
+
+    b.onclick = function () {
+      tr.ui.open[key] = !tr.ui.open[key];
+      renderColumn(tr.col, tr);
+    };
+    if (tr.ui.open[key]) li.appendChild(stepDetail(tr, s, t));
+    return li;
+  }
+
+  function returnItem(tr, r, t, showTick) {
+    var li = el("li", "ret " + (r.ok ? "ok" : "bad"));
+    var who = add(li, el("div", "who"));
+    add(who, el("span", "agent", r.a));
+    add(who, el("span", "role", roleOf(tr, r.a)));
+    add(who, el("span", "mark " + (r.ok ? "ok" : "bad"), tpl("replay.outcome." + (r.ok ? "success" : "failure"))));
+    if (showTick) add(who, el("span", "tickref", "t" + t));
+    add(li, el("div", "", tpl("replay.ret.line", { zone: r.z, risk: tpl("replay.risk." + r.r), probability: pct(r.pr) })));
+    var got = Object.keys(r.y || {}).some(function (k) { return r.y[k]; });
+    var gainKey = r.ok ? (got ? "replay.ret.success" : "replay.ret.success_empty") : (got ? "replay.ret.failure" : "replay.ret.failure_empty");
+    add(li, el("div", "gain", tpl(gainKey, { items: itemsText(r.y) })));
+    if (parseFloat(r.gd) > 0) add(li, el("div", "gain", tpl("replay.ret.gold", { gold: money(r.gd) })));
+    // Every return is followed by a rest of rest_ticks; a failure adds
+    // recovery_ticks_on_failure for the risk taken.
+    if (r.rec > t) add(li, el("div", "muted", tpl("replay.ret.recovering", { tick: r.rec })));
+    if ((r.br || []).length) add(li, el("div", "broken", tpl("replay.ret.broken", { items: r.br.map(goodL).join(", ") })));
+    return li;
+  }
+
+  function kvList(parent, obj, label) {
+    var keys = Object.keys(obj || {});
+    if (!keys.length) { add(parent, el("p", "muted", tpl("replay.d.none"))); return; }
+    var box = add(parent, el("div", "kv"));
+    keys.sort().forEach(function (k) { add(box, el("span", "", label(k) + ": " + obj[k])); });
+  }
+  function smallTable(parent, headers, rows, numeric) {
+    var t = add(parent, el("table"));
+    var hr = add(add(t, el("thead")), el("tr"));
+    headers.forEach(function (h, i) { add(hr, el("th", numeric[i] ? "n" : "", h)); });
+    var tb = add(t, el("tbody"));
+    rows.forEach(function (r) {
+      var row = add(tb, el("tr"));
+      r.forEach(function (v, i) { add(row, el("td", numeric[i] ? "n" : "", v)); });
+    });
+  }
+  function jsonish(items) {
+    return (items || []).map(function (it) {
+      if (typeof it !== "object" || it === null) return String(it);
+      return Object.keys(it).map(function (k) {
+        var v = it[k];
+        if (k === "good" || k === "resource" || k === "product") v = goodL(v);
+        return k + ": " + v;
+      }).join(", ");
+    });
+  }
+
+  function stepDetail(tr, s, t) {
+    var d = el("div", "detail");
+    var w = s.w || {}, o = s.o || {};
+
+    add(d, el("h4", "", tpl("replay.d.why")));
+    if (w.task) {
+      var tk = w.task;
+      add(d, el("p", "", tpl("replay.why.task") + ": " + (S.task[tk.ty] || tk.ty) + " · " +
+        tpl("replay.dec.priority", { priority: S.priority[tk.pr] || tk.pr }) + " · " + (tk.id || "")));
+      if (tk.p && Object.keys(tk.p).length) kvList(d, tk.p, function (k) { return k; });
+      if (tk.ctx && tk.ctx.length) add(d, el("p", "muted", tpl("replay.why.context", { results: tk.ctx.join(", ") })));
+      if (w.dc) {
+        var dp = add(d, el("p", "muted", tpl("replay.why.director_call", { n: w.dc.n, input: num(w.dc.it), output: num(w.dc.ot), remaining: w.dc.rem })));
+        promptButton(dp, tr, tpl("replay.prompt.title_director", { tick: t, n: w.dc.n }), [w.dc.ps, w.dc.pu, w.dc.pr], "pd:" + t + ":" + s.n);
+      }
+    } else if (w.tr) {
+      add(d, el("p", "", tpl("replay.why.triggers") + ": " + w.tr.map(function (n) { return S.trigger[n] || n; }).join("; ")));
+      if (w.wt) add(d, el("p", "muted", tpl(w.wt === 1 ? "replay.why.waited_one" : "replay.why.waited", { ticks: w.wt })));
+    } else {
+      add(d, el("p", "muted", tpl("replay.why.unknown")));
+    }
+
+    add(d, el("h4", "", tpl("replay.d.observed")));
+    add(d, el("p", "", tpl("replay.d.gold", { gold: money(o.g), available: money(o.av) })));
+    if (o.away) add(d, el("p", "muted", tpl("replay.d.away")));
+    if (tr.agentRoles[s.a] === "artisan") add(d, el("p", "muted", tpl("replay.d.capacity", { capacity: o.cap })));
+    add(d, el("p", "muted", tpl("replay.d.inventory")));
+    kvList(d, o.inv, goodL);
+    if (o.eq && Object.keys(o.eq).length) {
+      add(d, el("p", "muted", tpl("replay.d.equipment")));
+      kvList(d, o.eq, goodL);
+    }
+    if ((o.ord || []).length) {
+      add(d, el("p", "muted", tpl("replay.d.orders")));
+      smallTable(d, [tpl("replay.col.order"), tpl("replay.col.side"), tpl("replay.col.good"), tpl("replay.col.qty"), tpl("replay.col.price"), tpl("replay.col.expires")],
+        o.ord.map(function (r) { return [r[5] !== null && r[5] !== undefined ? "#" + r[5] : "—", tpl("replay.side." + r[0]), goodL(r[1]), r[2], money(r[3]), "t" + r[4]]; }),
+        [false, false, false, true, true, true]);
+    }
+    if ((o.mk || []).length) {
+      add(d, el("p", "muted", tpl("replay.d.market")));
+      smallTable(d, [tpl("replay.col.good"), tpl("replay.col.bid"), tpl("replay.col.ask"), tpl("replay.col.last")],
+        o.mk.map(function (r) { return [goodL(r[0]), money(r[1]), money(r[2]), money(r[3])]; }),
+        [false, true, true, true]);
+    }
+    if ((o.in || []).length) {
+      add(d, el("p", "muted", tpl("replay.d.inbox")));
+      var ul = add(d, el("ul"));
+      o.in.forEach(function (m) {
+        var what = [S.message[m[0]] || m[0], "← " + m[1]];
+        if (m[2]) what.push(S.message[m[2]] || goodL(m[2]));
+        if (m[3]) what.push("× " + m[3] + (m[4] ? " @ " + money(m[4]) : ""));
+        if (m[5] !== null && m[5] !== undefined) what.push("(t" + m[5] + ")");
+        add(ul, el("li", "", what.join(" ")));
+      });
+    }
+    if (o.bul) add(d, el("p", "", tpl("replay.d.bulletin")));
+
+    add(d, el("h4", "", tpl("replay.d.model")));
+    if (!(s.l || []).length) add(d, el("p", "muted", tpl("replay.llm.none")));
+    // Calls and invalid outputs in attempt order: attempt 1's failure before
+    // attempt 2's call.
+    var lines = (s.l || []).map(function (c) { return ["l", c[0], c]; })
+      .concat((s.x || []).map(function (x) { return ["x", x[0], x]; }))
+      .sort(function (a, b) { return a[1] - b[1] || (a[0] === "x" ? -1 : 1); });
+    lines.forEach(function (entry) { if (entry[0] === "l") callLine(entry[2]); else invalidLine(entry[2]); });
+    function callLine(c) {
+      var line = tpl("replay.llm.call", { attempt: c[0], input: num(c[1]), output: num(c[2]) });
+      var bk = Object.keys(c[4] || {}).map(function (k) { return (S.bucket[k] || k) + " " + num(c[4][k]); }).join(", ");
+      var p = add(d, el("p", "", line));
+      promptButton(p, tr, tpl("replay.prompt.title_agent", { agent: s.a, tick: t, attempt: c[0] }), c[5], "pc:" + t + ":" + s.n + ":" + c[0]);
+      // Cut off by the output cap: the model ran out of room.
+      if (c[3] === "length") add(d, el("p", "muted", tpl("replay.llm.truncated")));
+      if (bk) add(d, el("p", "muted", tpl("replay.llm.buckets", { buckets: bk })));
+    }
+    function invalidLine(x) {
+      var label = x[3] ? tpl("replay.invalid." + x[3]) : x[1];
+      var p = add(d, el("p", "", tpl("replay.llm.invalid", { attempt: x[0], reason: label })));
+      // The parser's own words, in English, for whoever wants the detail.
+      if (x[3] && x[1]) p.title = x[1];
+      // A call that failed outright: its prompt, and no reply.
+      if (x[2]) promptButton(p, tr, tpl("replay.prompt.title_agent", { agent: s.a, tick: t, attempt: x[0] }), [x[2][0], x[2][1], null], "px:" + t + ":" + s.n + ":" + x[0]);
+    }
+
+    add(d, el("h4", "", tpl("replay.d.decided")));
+    add(d, el("p", "", decisionText(s.d)));
+    if (s.d && s.d.pr) add(d, el("p", "muted", tpl("replay.dec.priority", { priority: S.priority[s.d.pr] || s.d.pr })));
+    if (s.d && s.d.why) add(d, el("p", "reason", "“" + s.d.why + "”"));
+
+    add(d, el("h4", "", tpl("replay.d.engine")));
+    if (!(s.e || []).length) add(d, el("p", "muted", tpl("replay.eng.nothing")));
+    else {
+      var eu = add(d, el("ul"));
+      s.e.forEach(function (e) {
+        add(eu, el("li", "", engineLine(e)));
+        if (e[0] === "expedition") add(eu, el("li", "muted", gearText(e[5], o.eq)));
+      });
+    }
+
+    if (s.r) {
+      add(d, el("h4", "", tpl("replay.d.result")));
+      add(d, el("p", "", s.r.id ? tpl("replay.result_status_id", { id: s.r.id, status: statusL(s.r.st) })
+        : tpl("replay.result_status", { status: statusL(s.r.st) })));
+      [["needs", "replay.result.needs"], ["offers", "replay.result.offers"], ["obs", "replay.result.observations"]].forEach(function (p) {
+        var items = jsonish(s.r[p[0]]);
+        add(d, el("p", "muted", tpl(p[1]) + ": " + (items.length ? items.join(" · ") : tpl("replay.d.none"))));
+      });
+    }
+    return d;
+  }
+
 })();
