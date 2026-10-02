@@ -732,4 +732,562 @@
     return d;
   }
 
+  function coordinationText(tr, f) {
+    var sc = f.sc || {};
+    var lines = [];
+    if (tr.condition === "A") {
+      var calls = (sc.calls || []), end = sc.end || {};
+      var cap = calls.length ? calls[0].cap : tr.directorCap;
+      var tasks = (f.st || []).length;
+      lines.push([tpl("replay.sched.a", {
+        used: calls.length, cap: cap, tasks: tasks, retries: end.director_retries || 0
+      }), ""]);
+      var closure = end.closed_by_decision ? tpl("replay.sched.closed_director")
+        : end.closed_by_cap ? tpl("replay.sched.closed_cap")
+        : end.closed_by_budget ? tpl("replay.sched.closed_budget")
+        : cap ? tpl("replay.sched.closed_k", { k: cap - 1 }) : "";
+      if (closure) lines.push([closure, ""]);
+      if ((sc.errors || []).length) lines.push([tpl("replay.sched.errors", { count: sc.errors.length }), "warn"]);
+    } else {
+      var end = sc.end || {};
+      lines.push([tpl("replay.sched.bc", {
+        requested: sc.requested || 0, served: (sc.served || []).length,
+        deferred: (sc.deferred || []).length, k: end.k
+      }), ""]);
+      if ((sc.deferred || []).length) {
+        lines.push([tpl("replay.sched.waiting", { agents: sc.deferred.map(function (x) { return x[0] + " (" + x[1].map(trigShort).join(", ") + ")"; }).join(", ") }), ""]);
+      }
+    }
+    if (f.x && !(f.st || []).length) lines.push([tpl("replay.sched.exhausted"), "warn"]);
+    return lines;
+  }
+
+  /* ---------- tabs ---------- */
+  function everOwed(tr) {
+    if (tr.everOwed === undefined) {
+      tr.everOwed = F.owed !== undefined && tr.frames.some(function (fr) {
+        return Object.keys(fr.a || {}).some(function (id) { return fr.a[id][F.owed] > 0; });
+      });
+    }
+    return tr.everOwed;
+  }
+  function renderTab(tr, box, f) {
+    box.textContent = "";
+    var tab = tr.ui.tab;
+    if (tab === "agents") {
+      add(box, el("p", "hint", tpl("replay.agents.hint")));
+      var acted = {};
+      (f.st || []).forEach(function (s) { acted[s.a] = true; });
+      var t = add(box, el("table", "agents"));
+      var hr = add(add(t, el("thead")), el("tr"));
+      // Wealth tax still owed: a column only in a run where somebody ever owed.
+      var owes = everOwed(tr);
+      var heads = [["replay.col.agent", ""], ["replay.col.gold", "n"], ["replay.col.items", "n"], ["replay.col.taxes", "n"]];
+      if (owes) heads.push(["replay.col.tax_owed", "n"]);
+      heads.concat([["replay.col.last_action", ""], ["replay.col.effective_wasted", "n"]])
+        .forEach(function (h) { add(hr, el("th", h[1], tpl(h[0]))); });
+      var tb = add(t, el("tbody"));
+      tr.agentIds.forEach(function (id, k) {
+        var a = f.a[id] || [0, 0, "", "", 0, 0, 0, 0, 0, 0];
+        var seen = a[F.observed];
+        // Reconstructed from the log for every tick; the observed gold is only
+        // what the agent was last shown, and goes stale between activations.
+        var gold = f.ag ? f.ag[k] : (seen ? a[F.gold] : null);
+        // Items likewise; without final holdings, the count the agent was last shown.
+        var items = f.ai ? f.ai[k] : (seen ? a[F.items] : null);
+        var known = f.ag && f.ai ? true : seen;
+        var row = add(tb, el("tr", (acted[id] ? "acted " : "") + (known ? "" : "unseen ") + (tr.ui.focus === id ? "focus" : "")));
+        var name = add(row, el("td", a[F.away] ? "away" : ""));
+        var pick = add(name, el("button", "agentbtn", id));
+        pick.type = "button";
+        pick.title = roleOf(tr, id);
+        pick.setAttribute("data-key", "agent:" + id);
+        pick.setAttribute("aria-pressed", tr.ui.focus === id ? "true" : "false");
+        pick.setAttribute("aria-label", tpl("replay.aria.follow_agent", { agent: id }));
+        add(row, el("td", "n", gold === null || gold === undefined ? "—" : num(gold)));
+        add(row, el("td", "n", items === null || items === undefined ? "—" : num(items)));
+        add(row, el("td", "n", a[F.taxes] ? money(a[F.taxes]) : "—"));
+        if (owes) add(row, el("td", "n", a[F.owed] ? money(a[F.owed]) : "—"));
+        var cell = add(row, el("td"));
+        add(cell, el("span", "pill", a[F.action] ? actL(a[F.action]) : "—"));
+        add(row, el("td", "n", a[F.effective] + " / " + a[F.activations]));
+        // The whole row answers a click; the button in its first cell gives
+        // keyboard access without breaking the table's semantics.
+        row.onclick = function () {
+          tr.ui.focus = tr.ui.focus === id ? null : id;
+          renderColumn(tr.col, tr);
+          writeHash(tr);
+        };
+      });
+    } else if (tab === "feed") {
+      var n = 0;
+      for (var t2 = tick; t2 >= 0 && n < 60; t2--) {
+        (frameAt(tr, t2).f || []).forEach(function (e) {
+          if (n >= 60) return;
+          n += 1;
+          var hi = e.e === "shock_applied" || e.e === "shock_reverted" || e.e === "budget_exhausted" || e.e === "director_error";
+          if (e.e === "more") {
+            var mrow = add(box, el("div", "feedrow"));
+            add(mrow, el("span", "t", "t" + t2));
+            add(mrow, el("span", "muted", tpl("replay.feed.more", { n: e.q })));
+            return;
+          }
+          if (e.e === "tax_paid") {
+            var trow = add(box, el("div", "feedrow tax"));
+            add(trow, el("span", "t", "t" + t2));
+            // A tick that settled only arrears had no collection, so it is not
+            // described as one; arrears are never counted as collected.
+            var arrearsTxt = tpl("replay.wealth.arrears", { amount: money(e.ar), payers: e.aq });
+            var collected = tpl("replay.feed.wealth_tax", { amount: money(e.v), agents: e.q });
+            if (e.c && !e.q) {
+              // A collection nobody paid is said so, not as "collected 0".
+              var owers = (frameAt(tr, t2).wt || []).filter(function (r) { return !r[3] && !(r[2] > 0); }).length;
+              collected = owers
+                ? tpl(owers === 1 ? "replay.wealth.nobody_unpaid_one" : "replay.wealth.nobody_unpaid", { unpaid: owers })
+                : tpl("replay.wealth.nobody" + (wealthRules ? "" : "_bare"), { exemption: exemptionText() });
+            }
+            add(trow, el("span", "", e.c
+              ? collected + (e.aq ? " · " + arrearsTxt : "")
+              : arrearsTxt));
+            return;
+          }
+          var exp = e.e === "expedition_resolved" ? (e.g === "success" ? " ok" : " bad") : "";
+          var row = add(box, el("div", "feedrow" + (hi ? " hi" : "") + exp));
+          add(row, el("span", "t", "t" + t2));
+          var txt = S.event[e.e] || e.e;
+          if (e.e === "expedition_resolved") txt += " · " + tpl("replay.outcome." + e.g) + (e.q ? " × " + e.q : "");
+          else {
+            if (e.g) txt += " · " + goodL(e.g);
+            if (e.s) txt += " · " + (S.scenario[e.s] || e.s);
+            if (e.v) txt += " @ " + money(e.v);
+            if (e.q) txt += " × " + e.q;
+            if (e.tx) txt += " · " + tpl("replay.feed.sales_tax", { amount: money(e.tx) });
+          }
+          if (e.a) txt += " (" + e.a + ")";
+          add(row, el("span", "", txt));
+        });
+      }
+      if (!n) add(box, el("p", "empty", tpl("replay.feed.empty")));
+    } else if (tab === "messages") {
+      var m = 0;
+      for (var t3 = tick; t3 >= 0 && m < 60; t3--) {
+        (frameAt(tr, t3).m || []).forEach(function (msg) {
+          if (m >= 60) return;
+          m += 1;
+          var row = add(box, el("div", "feedrow"));
+          add(row, el("span", "t", "t" + t3));
+          var txt = (S.message[msg.ty] || msg.ty) + " · " + msg.from + " → " + msg.to;
+          if (msg.g) txt += " · " + goodL(msg.g);
+          if (msg.q) txt += " · × " + msg.q + (msg.p ? " @ " + money(msg.p) : "");
+          add(row, el("span", "", txt));
+        });
+      }
+      if (!m) add(box, el("p", "empty", tpl(tr.condition === "A" ? "replay.messages.none_in_a" : "replay.messages.empty")));
+    } else if (tab === "tokens") {
+      var max = 1;
+      Object.keys(f.tok).forEach(function (k) { if (f.tok[k] > max) max = f.tok[k]; });
+      ["agent", "director", "p2p_content", "bulletin"].forEach(function (name) {
+        var v = f.tok[name] || 0;
+        var bar = add(box, el("div", "bar " + name));
+        var lbl = add(bar, el("div", "lbl"));
+        add(lbl, el("span", "", S.bucket[name]));
+        add(lbl, el("b", "", num(v)));
+        add(add(bar, el("div", "track")), el("div", "fill")).style.width = (v / max * 100).toFixed(1) + "%";
+      });
+      add(box, el("p", "", tpl("replay.tokens.total", { total: num(f.tokTotal) })));
+      if (tr.budgetTotal) {
+        var share = Math.min(100, f.tokTotal / tr.budgetTotal * 100);
+        var bb = add(box, el("div", "bar budget" + (f.x ? " exhausted" : "")));
+        var bl = add(bb, el("div", "lbl"));
+        add(bl, el("span", "", tpl("replay.budget")));
+        add(bl, el("b", "", num(f.tokTotal) + " / " + num(tr.budgetTotal)));
+        add(add(bb, el("div", "track")), el("div", "fill")).style.width = share.toFixed(1) + "%";
+        if (f.x) add(box, el("p", "exhaust", tpl("replay.exhausted_at", { tick: tr.exhaustionTick })));
+      }
+    } else if (tab === "stock") {
+      add(box, el("p", "hint", tpl("replay.stock.observer")));
+      var prevF = tick > 0 ? frameAt(tr, tick - 1) : null;
+      var goods = Object.keys(f.ws || {}).sort(function (x, y) { return goodL(x).localeCompare(goodL(y), S.locale); });
+      if (!goods.length) { add(box, el("p", "empty", tpl("replay.stock.none"))); return; }
+      smallTable(box, [tpl("replay.col.good"), tpl("replay.col.stock"), tpl("replay.col.on_sale"), tpl("replay.col.equipped"), tpl("replay.col.change")],
+        goods.map(function (gd) {
+          var now = f.ws[gd], before = prevF && prevF.ws ? (prevF.ws[gd] || 0) : now, d = now - before;
+          return [goodL(gd), num(now), num((f.os || {})[gd] || 0), (f.eqc || {})[gd] ? num(f.eqc[gd]) : "—", d ? (d > 0 ? "+" : "−") + Math.abs(d) : ""];
+        }), [false, true, true, true, true]);
+      if (f.zs) {
+        add(box, el("p", "muted", tpl("replay.stock.zones")));
+        var zones = Object.keys(f.zs), resources = {};
+        zones.forEach(function (z) { Object.keys(f.zs[z]).forEach(function (r) { resources[r] = true; }); });
+        var res = Object.keys(resources).sort();
+        smallTable(box, [tpl("replay.col.zone")].concat(res.map(goodL)),
+          zones.map(function (z) { return [z].concat(res.map(function (r) { return r in f.zs[z] ? num(f.zs[z][r]) : "—"; })); }),
+          [false].concat(res.map(function () { return true; })));
+      } else {
+        add(box, el("p", "muted", tpl("replay.stock.no_zones")));
+      }
+    } else if (tab === "bulletin") {
+      var bu = null, at = null;
+      for (var t4 = tick; t4 >= 0; t4--) { var fb = frameAt(tr, t4); if (fb.bu) { bu = fb.bu; at = t4; break; } }
+      if (!bu) { add(box, el("p", "empty", tpl("replay.bulletin.empty"))); return; }
+      add(box, el("p", "hint", "t" + at));
+      smallTable(box, [tpl("replay.col.good"), tpl("replay.col.mean_price"), tpl("replay.col.trades"), tpl("replay.col.supply"), tpl("replay.col.unmet")],
+        bu.map(function (r) { return [goodL(r[0]), money(r[1]), r[2], r[3], r[4]]; }), [false, true, true, true, true]);
+    }
+  }
+
+  /* ---------- one column ---------- */
+  function renderColumn(col, tr) {
+    // Rebuilding the lists would drop keyboard focus to the page; remember the
+    // focused control by its stable key and focus its replacement afterwards.
+    var active = document.activeElement;
+    var focusKey = active && col.el.contains(active) ? active.getAttribute("data-key") : null;
+    renderColumnBody(col, tr);
+    if (focusKey) {
+      var again = col.el.querySelector('[data-key="' + focusKey.replace(/["\\]/g, "\\$&") + '"]');
+      if (again && !again.closest("[hidden]")) again.focus();
+    }
+  }
+  function renderColumnBody(col, tr) {
+    var f = frameAt(tr, tick);
+    col.coord.textContent = "";
+    coordinationText(tr, f).forEach(function (l) { add(col.coord, el("div", l[1], l[0])); });
+    // Every Director call of the tick, including those that closed the cycle
+    // or failed: each one's prompt and reply.
+    var dcalls = ((f.sc || {}).calls || []).filter(function (c) { return c.pu !== null && c.pu !== undefined; });
+    if (dcalls.length) {
+      var row = add(col.coord, el("div", "pcalls"));
+      add(row, el("span", "", tpl("replay.prompt.director_calls")));
+      dcalls.forEach(function (c) {
+        // A call whose output the Director protocol rejected says so.
+        var kindKey = !c.err ? "replay.prompt.call_n"
+          : (c.pr === null || c.pr === undefined) ? "replay.prompt.call_n_noreply" : "replay.prompt.call_n_invalid";
+        var b = add(row, el("button", "pbtn" + (c.err ? " bad" : ""), tpl(kindKey, { n: c.n })));
+        b.type = "button";
+        if (c.err) b.title = String(c.err);
+        b.setAttribute("data-key", tr.condition + ":dc:" + tick + ":" + c.n);
+        b.onclick = function () { showPrompt(tr, tpl("replay.prompt.title_director", { tick: tick, n: c.n }), [c.ps, c.pu, c.pr]); };
+      });
+    }
+
+    var list = col.steps; list.textContent = "";
+    col.returns.textContent = "";
+    col.stepsBack.hidden = !tr.ui.focus;
+    if (!tr.ui.focus && tr.shock && (tick === tr.shockTick || tick === tr.reversionTick)) {
+      var starting = tick === tr.shockTick;
+      var card = add(col.returns, el("div", "shockcard " + (starting ? "on" : "off")));
+      add(card, el("strong", "", tpl(starting ? "replay.shock.starts" : "replay.shock.ends")));
+      if (starting) add(card, el("div", "", shockText(tr)));
+    }
+    if (!tr.ui.focus && ((f.wt || []).length || isTaxTick(tick))) {
+      var wt = f.wt || [];
+      var sum = function (rows) { return rows.reduce(function (s, r) { return s + r[2]; }, 0); };
+      // Paying: assessed at this collection and paid something now.
+      var current = wt.filter(function (r) { return !r[3] && r[2] > 0; });
+      var arrears = wt.filter(function (r) { return r[3]; });
+      // Assessed at this collection but paid nothing: the amount is now owed.
+      var unpaid = wt.filter(function (r) { return !r[3] && !(r[2] > 0); });
+      // Below the exempt amount: every agent with no row at this tick. An agent
+      // that only settled arrears, or that was assessed and could not pay, is
+      // not below it.
+      var listed = {};
+      // Assessed at this collection (paying or now owing); settling earlier
+      // arrears is not an assessment, so those agents count with the rest.
+      wt.forEach(function (r) { if (!r[3]) listed[r[0]] = true; });
+      var below = tr.agentIds.filter(function (a) { return !listed[a]; }).length;
+      var tc = add(col.returns, el("div", "taxcard"));
+      add(tc, el("strong", "", tpl(isTaxTick(tick) ? "replay.wealth.title" : "replay.wealth.arrears_title")));
+      if (isTaxTick(tick)) {
+        // Not paying is not the same as exempt: an agent whose gold sits frozen,
+        // or who cannot pay now, owes it as arrears. The minimum is shown only
+        // when it comes from a configuration proven to be the run's.
+        var bare = wealthRules ? "" : "_bare";
+        var key = current.length ? "replay.wealth.summary" + bare
+          : unpaid.length ? (unpaid.length === 1 ? "replay.wealth.nobody_unpaid_one" : "replay.wealth.nobody_unpaid")
+          : "replay.wealth.nobody" + bare;
+        var owingTxt = current.length && unpaid.length
+          ? " " + tpl("replay.wealth.summary_unpaid", { unpaid: unpaid.length })
+          : "";
+        add(tc, el("div", "", tpl(key, {
+          unpaid: unpaid.length,
+          amount: money(sum(current)), payers: current.length, others: below,
+          exemption: exemptionText()
+        }) + owingTxt));
+      }
+      if (arrears.length) {
+        add(tc, el("div", "", tpl("replay.wealth.arrears", { amount: money(sum(arrears)), payers: arrears.length })));
+      }
+      if (wt.length) {
+        // Only a collection that left somebody owing gets the column.
+        var owing = wt.some(function (r) { return r[4] > 0; });
+        var heads = [tpl("replay.col.agent"), tpl("replay.wealth.taxable"), tpl("replay.wealth.paid")];
+        if (owing) heads.push(tpl("replay.wealth.owed"));
+        smallTable(tc, heads, wt.map(function (r) {
+          var row = [r[0], r[1] === null || r[1] === undefined ? "—" : money(r[1]),
+            money(r[2]) + (r[3] ? " · " + tpl("replay.wealth.arrears_tag") : "")];
+          if (owing) row.push(r[4] === null || r[4] === undefined ? "—" : money(r[4]));
+          return row;
+        }), owing ? [false, true, true, true] : [false, true, true]);
+      }
+    }
+    if (!tr.ui.focus && (f.ex || []).length) {
+      add(col.returns, el("h3", "", tpl("replay.ret.title")));
+      var rl = add(col.returns, el("ul", "rets"));
+      f.ex.forEach(function (r) { rl.appendChild(returnItem(tr, r, tick, false)); });
+    }
+    if (tr.ui.focus) {
+      col.stepsTitle.textContent = tpl("replay.steps.history", { agent: tr.ui.focus, tick: tick });
+      var found = 0;
+      for (var t = Math.min(tick, tr.frames.length - 1); t >= 0 && found < 40; t--) {
+        (tr.frames[t].st || []).slice().reverse().forEach(function (s) {
+          if (s.a !== tr.ui.focus || found >= 40) return;
+          found += 1;
+          list.appendChild(stepItem(tr, s, t, true));
+        });
+        (tr.frames[t].ex || []).forEach(function (r) {
+          if (r.a !== tr.ui.focus || found >= 40) return;
+          found += 1;
+          list.appendChild(returnItem(tr, r, t, true));
+        });
+      }
+      if (!found) add(list, el("li", "empty", tpl("replay.steps.history_empty", { agent: tr.ui.focus })));
+    } else {
+      col.stepsTitle.textContent = tpl("replay.steps.title", { tick: tick });
+      (f.st || []).forEach(function (s) { list.appendChild(stepItem(tr, s, tick, false)); });
+      if (!(f.st || []).length) add(list, el("li", "empty", tpl("replay.steps.empty")));
+    }
+
+    col.tabButtons.forEach(function (b) {
+      var on = b.dataset.tab === tr.ui.tab;
+      b.classList.toggle("on", on);
+      b.setAttribute("aria-selected", on ? "true" : "false");
+      b.setAttribute("tabindex", on ? "0" : "-1");
+      if (on) col.tabBody.setAttribute("aria-labelledby", b.id);
+    });
+    renderTab(tr, col.tabBody, f);
+  }
+
+  /* ---------- build DOM ---------- */
+  /* Every tab a column can show; the bulletin only in Condition C. */
+  var TABS = [["agents", "replay.tab.agents"], ["stock", "replay.tab.stock"], ["feed", "replay.tab.feed"], ["messages", "replay.tab.messages"], ["tokens", "replay.tab.tokens"], ["bulletin", "replay.tab.bulletin"]];
+  var grid = $("#grid");
+  grid.style.setProperty("--cols", tracks.length);
+  tracks.forEach(function (tr, ti) {
+    var c = add(grid, el("article", "col " + tr.condition));
+    var h = add(c, el("header", "col-head"));
+    add(h, el("h2", "", D.labelByModel ? S.condition[tr.condition] + " · " + tr.model : S.condition[tr.condition]));
+    add(h, el("p", "", tpl("replay.desc." + tr.condition)));
+    if (tr.shock) add(c, el("p", "seen", tpl("replay.shock.seen." + tr.condition)));
+    var coord = add(c, el("div", "coord"));
+    var rets = add(c, el("div", "returns"));
+    var sh = add(c, el("div", "steps-head"));
+    var stitle = add(sh, el("h3"));
+    var back = add(sh, el("button", "", tpl("replay.steps.back")));
+    back.type = "button";
+    back.onclick = function () {
+      var was = tr.ui.focus;
+      tr.ui.focus = null; renderColumn(tr.col, tr); writeHash(tr);
+      // The button hides itself; hand focus to the agent that was followed.
+      var btn = was && c.querySelector('[data-key="agent:' + was + '"]');
+      if (btn) btn.focus();
+    };
+    var steps = add(c, el("ol", "steps"));
+    var tabs = add(c, el("div", "tabs"));
+    tabs.setAttribute("role", "tablist");
+    var defs = TABS.filter(function (d) { return d[0] !== "bulletin" || tr.condition === "C"; });
+    var panelId = "panel-" + ti;
+    var buttons = defs.map(function (d) {
+      var b = add(tabs, el("button", "", tpl(d[1])));
+      b.type = "button"; b.dataset.tab = d[0]; b.setAttribute("role", "tab");
+      b.id = "tab-" + ti + "-" + d[0];
+      b.setAttribute("aria-controls", panelId);
+      b.onclick = function () { tr.ui.tab = d[0]; renderColumn(tr.col, tr); writeHash(tr); };
+      return b;
+    });
+    /* Arrow keys move between tabs, Home and End to the first and last. */
+    tabs.addEventListener("keydown", function (e) {
+      var i = buttons.indexOf(e.target);
+      if (i < 0) return;
+      var j = e.key === "ArrowRight" ? (i + 1) % buttons.length
+        : e.key === "ArrowLeft" ? (i - 1 + buttons.length) % buttons.length
+        : e.key === "Home" ? 0 : e.key === "End" ? buttons.length - 1 : -1;
+      if (j < 0) return;
+      e.preventDefault(); e.stopPropagation();
+      tr.ui.tab = buttons[j].dataset.tab; renderColumn(tr.col, tr);
+      buttons[j].focus(); writeHash(tr);
+    });
+    var tabBody = add(c, el("div", "tabbody"));
+    tabBody.id = panelId; tabBody.setAttribute("role", "tabpanel");
+    tr.col = { el: c, coord: coord, returns: rets, steps: steps, stepsTitle: stitle, stepsBack: back, tabButtons: buttons, tabBody: tabBody };
+  });
+
+  /* goods selector */
+  var sel = $("#good"), allGoods = [];
+  tracks.forEach(function (tr) { tr.goods.forEach(function (g) { if (allGoods.indexOf(g) < 0) allGoods.push(g); }); });
+  allGoods.sort(function (x, y) { return goodL(x).localeCompare(goodL(y), S.locale); });
+  allGoods.forEach(function (g) { var o = add(sel, el("option", "", goodL(g))); o.value = g; });
+  // Open on the good the shock targets, the one the scenario is about.
+  var shockGood = head.shock ? (head.shock.target_resource || head.shock.target_product) : null;
+  good = allGoods.indexOf(D.focusGood) >= 0 ? D.focusGood
+    : allGoods.indexOf(shockGood) >= 0 ? shockGood : (allGoods[0] || null);
+  sel.value = good;
+  sel.onchange = function () { good = sel.value; render(); };
+
+  /* phase strip under the scrubber */
+  (function () {
+    var marks = $("#marks"), st = head.shockTick, rt = head.reversionTick;
+    function seg(a, b, cls) {
+      var s = add(marks, el("span", ""));
+      s.style.left = (a / horizon * 100) + "%"; s.style.width = ((b - a) / horizon * 100) + "%";
+      s.style.background = cls;
+    }
+    if (st !== null) seg(st, rt === null ? horizon : rt, "var(--shock)");
+    if (rt !== null) seg(rt, horizon, "var(--recovery)");
+    allTaxTicks.forEach(function (t) {
+      var m = add(marks, el("i", "tax-mark"));
+      m.style.left = (t / horizon * 100) + "%";
+      m.title = tpl("replay.wealth_tax_at", { tick: t });
+    });
+    tracks.forEach(function (tr) {
+      if (tr.exhaustionTick === null || tr.exhaustionTick === undefined) return;
+      var m = add(marks, el("i", "exhaust-mark sw-" + tr.condition));
+      m.style.left = (tr.exhaustionTick / horizon * 100) + "%";
+      m.title = tpl("replay.exhausted_at", { tick: tr.exhaustionTick });
+    });
+    marks.style.background = "var(--rule)";
+  })();
+
+  (function () {
+    var box = $("#shockbox"), text = shockText(head);
+    if (!text) return;
+    box.hidden = false;
+    add(box, el("strong", "", tpl("replay.shock.title", { scenario: S.scenario[head.shock.scenario] || head.shock.scenario })));
+    add(box, el("span", "", text));
+  })();
+
+  /* ---------- crafting guide (static reference, not tied to the tick) ---------- */
+  var SVGNS = "http://www.w3.org/2000/svg";
+  var RES_ORDER = ["iron", "wood", "leather", "herbs", "arcane_crystal"];
+  var PROD_ORDER = ["melee_weapon", "armor", "bow_gear", "staff_focus", "health_potion", "mana_potion"];
+  var RES_COLOUR = { iron: "#7d8a9a", wood: "#a8703f", leather: "#c68a52", herbs: "#4f9f45", arcane_crystal: "#8b6cf0" };
+
+  function svg(tag, attrs) {
+    var n = document.createElementNS(SVGNS, tag);
+    Object.keys(attrs || {}).forEach(function (k) { n.setAttribute(k, attrs[k]); });
+    return n;
+  }
+  function icon(goodId, cls) {
+    var s = svg("svg", { "class": "gi " + (cls || ""), "aria-hidden": "true" });
+    s.appendChild(svg("use", { href: "#g-" + goodId }));
+    return s;
+  }
+  function decimal(v, d) { return num(parseFloat(v), d); }
+  function specName(s) { return S.spec[s] || s; }
+  function ordered(list, order) {
+    return list.slice().sort(function (a, b) {
+      var ia = order.indexOf(a), ib = order.indexOf(b);
+      return (ia < 0 ? 99 : ia) - (ib < 0 ? 99 : ib);
+    });
+  }
+  function focusGood(g) {
+    if (allGoods.indexOf(g) < 0) return;
+    good = g; sel.value = g; render();
+    $(".overview").scrollIntoView({ behavior: "smooth", block: "start" });
+  }
+
+  function flowDiagram(R, resources, products) {
+    var rowR = 76, rowP = 62, top = 24;
+    var h = Math.max(resources.length * rowR, products.length * rowP) + top;
+    var W = 820, xr = 30, xp = W - 250;
+    var box = svg("svg", { viewBox: "0 0 " + W + " " + h, "class": "flow", role: "img" });
+    var yR = {}, yP = {};
+    resources.forEach(function (r, i) { yR[r] = top + i * rowR + (h - top - resources.length * rowR) / 2 + 20; });
+    products.forEach(function (p, j) { yP[p] = top + j * rowP + (h - top - products.length * rowP) / 2 + 20; });
+    var paths = [];
+    products.forEach(function (p) {
+      var inputs = ordered(Object.keys(R.recipes[p].in), RES_ORDER).filter(function (r) { return r in yR; });
+      inputs.forEach(function (r, k) {
+        /* Inputs of one product arrive side by side, so their labels never collide. */
+        var x1 = xr + 200, y1 = yR[r], x2 = xp - 12, y2 = yP[p] + (k - (inputs.length - 1) / 2) * 14;
+        var mx = (x1 + x2) / 2;
+        var path = svg("path", { d: "M" + x1 + " " + y1 + " C" + mx + " " + y1 + " " + mx + " " + y2 + " " + x2 + " " + y2,
+          stroke: RES_COLOUR[r] || "#888", "class": "edge", "data-r": r, "data-p": p });
+        box.appendChild(path);
+        /* The quantity sits on its own curve, three quarters of the way along. */
+        var s = 0.78, u = 1 - s;
+        var lx = u * u * u * x1 + 3 * u * u * s * mx + 3 * u * s * s * mx + s * s * s * x2;
+        var ly = u * u * u * y1 + 3 * u * u * s * y1 + 3 * u * s * s * y2 + s * s * s * y2;
+        var badge = svg("g", { "class": "qty", "data-r": r, "data-p": p });
+        badge.appendChild(svg("rect", { x: lx - 15, y: ly - 10, width: 30, height: 19, rx: 9.5, fill: RES_COLOUR[r] || "#888" }));
+        var label = svg("text", { x: lx, y: ly + 4.5, "text-anchor": "middle" });
+        label.textContent = "×" + R.recipes[p].in[r];
+        badge.appendChild(label);
+        box.appendChild(badge);
+        paths.push(path, badge);
+      });
+    });
+    function node(g, x, y, isRes) {
+      var grp = svg("g", { "class": "node", tabindex: "0" });
+      grp.appendChild(svg("use", { href: "#g-" + g, x: x, y: y - 20, width: 40, height: 40 }));
+      var txt = svg("text", { x: x + 48, y: y + 5, "class": "name" });
+      txt.textContent = goodL(g);
+      grp.appendChild(txt);
+      function on() {
+        box.classList.add("focus");
+        paths.forEach(function (e) { e.classList.toggle("on", e.getAttribute(isRes ? "data-r" : "data-p") === g); });
+      }
+      function off() { box.classList.remove("focus"); paths.forEach(function (e) { e.classList.remove("on"); }); }
+      grp.addEventListener("mouseenter", on); grp.addEventListener("focus", on);
+      grp.addEventListener("mouseleave", off); grp.addEventListener("blur", off);
+      grp.addEventListener("click", function () { focusGood(g); });
+      activatable(grp, goodL(g));
+      box.appendChild(grp);
+    }
+    resources.forEach(function (r) { node(r, xr, yR[r], true); });
+    products.forEach(function (p) { node(p, xp, yP[p], false); });
+    return box;
+  }
+
+  /* A card's text, apart from its name, in one element the card can point at. */
+  function cardBody(card, id) {
+    var body = add(card, el("div", "gbody"));
+    body.id = "gdesc-" + id;
+    return body;
+  }
+  function resourceCard(R, r, usedIn) {
+    var outer = el("article", "gcard");
+    var head = add(outer, el("header", ""));
+    head.appendChild(icon(r, "big"));
+    add(head, el("h4", "", goodL(r)));
+    var card = cardBody(outer, r);
+    add(card, el("h5", "", tpl("replay.guide.used_for")));
+    var uses = usedIn[r] || [];
+    if (!uses.length) add(card, el("p", "muted", tpl("replay.guide.unused")));
+    else {
+      var ul = add(card, el("ul", "uses"));
+      uses.forEach(function (u) {
+        var li = add(ul, el("li", ""));
+        li.appendChild(icon(u[0], "small"));
+        // Per recipe run: one run can make more than one unit.
+        add(li, el("span", "", u[2] > 1
+          ? tpl("replay.guide.per_batch", { qty: u[1], out: u[2], product: goodL(u[0]) })
+          : tpl("replay.guide.per_unit", { qty: u[1], product: goodL(u[0]) })));
+      });
+    }
+    add(card, el("h5", "", tpl("replay.guide.found_in")));
+    var zones = R.zones.filter(function (z) { return parseFloat(z.spawn[r] || 0) > 0; })
+      .sort(function (a, b) { return parseFloat(b.spawn[r]) - parseFloat(a.spawn[r]); });
+    var zl = add(card, el("ul", "plain"));
+    zones.forEach(function (z) {
+      add(zl, el("li", "", tpl("replay.guide.zone_rate", { zone: z.id, risk: tpl("replay.risk." + z.risk), rate: decimal(z.spawn[r], 1) })));
+    });
+    var best = Object.keys(R.affinity).filter(function (s) { return parseFloat(R.affinity[s][r] || 1) > 1; });
+    if (best.length) {
+      add(card, el("h5", "", tpl("replay.guide.best_gatherer")));
+      add(card, el("p", "", best.map(function (s) { return specName(s) + " ×" + decimal(R.affinity[s][r], 1); }).join(" · ")));
+    }
+    outer.addEventListener("click", function () { focusGood(r); });
+    activatable(outer, goodL(r), card.id);
+    return outer;
+  }
+
 })();
