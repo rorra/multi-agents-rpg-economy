@@ -13,11 +13,13 @@ and seeking never re-folds from the start.
 
 from __future__ import annotations
 
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from decimal import Decimal
+from pathlib import Path
 from typing import Any
 
-from rpg_economy.logging_ import EventType
+from rpg_economy.logging_ import Event, EventType
 
 #: Events shown in the activity feed, in the order a viewer cares about them.
 FEED_EVENTS = (
@@ -341,3 +343,306 @@ class PromptTexts:
         raw = json.dumps(self.texts, ensure_ascii=False, separators=(",", ":"))
         # mtime=0 keeps the page byte-reproducible.
         return base64.b64encode(gzip.compress(raw.encode("utf-8"), mtime=0)).decode("ascii")
+
+
+def _on_sale(book: dict[Any, tuple[str, str, float, int]]) -> dict[str, int]:
+    totals: Counter[str] = Counter()
+    for good, side, _, remaining in book.values():
+        if side == "sell":
+            totals[good] += remaining
+    return {good: units for good, units in sorted(totals.items()) if units}
+
+
+def _quotes(book: dict[Any, tuple[str, str, float, int]]) -> dict[str, list[float | None]]:
+    """Best bid and best ask per good resting on the book at the end of the tick."""
+    bids: dict[str, float] = {}
+    asks: dict[str, float] = {}
+    for good, side, limit, remaining in book.values():
+        if remaining <= 0:
+            continue
+        if side == "buy":
+            bids[good] = max(bids.get(good, limit), limit)
+        else:
+            asks[good] = min(asks.get(good, limit), limit)
+    return {good: [bids.get(good), asks.get(good)] for good in sorted(bids.keys() | asks.keys())}
+
+
+def _reconstruct_world_stock(
+    frames: list[TickFrame], deltas: list[Counter[str]], final: dict[str, Any]
+) -> None:
+    """End-of-tick stock per good, walked backwards from the final holdings.
+
+    Trades only move goods between agents, so the world total changes only
+    through expedition yields, production, consumption and equipping, all of
+    which are logged. A log without final holdings (a run cut short) has no
+    anchor, and the stock is left empty rather than guessed.
+    """
+    if not final:
+        return
+    running: Counter[str] = Counter()
+    for holding in final.values():
+        for good, units in (holding.get("inventory") or {}).items():
+            running[good] += int(units)
+    for frame, delta in zip(reversed(frames), reversed(deltas), strict=True):
+        frame.world_stock = dict(sorted(running.items()))
+        running.subtract(delta)
+
+
+def _reconstruct_role_gold(
+    frames: list[TickFrame],
+    deltas: list[dict[str, Decimal]],
+    final: dict[str, Any],
+    agent_ids: list[str],
+) -> None:
+    """End-of-tick gold per role and per agent, walked backwards from the final holdings.
+
+    The same for every condition and every tick, unlike the gold an observation
+    shows, which only covers agents activated so far and goes stale between
+    activations. Left empty without final holdings rather than guessed.
+    """
+    if not final:
+        return
+    gold = {agent: Decimal(str(h.get("gold", "0"))) for agent, h in final.items()}
+    role = {agent: str(h.get("role", "")) for agent, h in final.items()}
+    cent = Decimal("0.01")
+    for frame, delta in zip(reversed(frames), reversed(deltas), strict=True):
+        totals: dict[str, Decimal] = defaultdict(Decimal)
+        for agent, amount in gold.items():
+            totals[role[agent]] += amount
+        frame.role_gold = {r: float(v.quantize(cent)) for r, v in sorted(totals.items())}
+        frame.agent_gold = [
+            float(gold[agent].quantize(cent)) if agent in gold else None for agent in agent_ids
+        ]
+        for agent, change in delta.items():
+            if agent in gold:
+                gold[agent] -= change
+
+
+def _reconstruct_agent_items(
+    frames: list[TickFrame],
+    deltas: list[Counter[str]],
+    final: dict[str, Any],
+    agent_ids: list[str],
+) -> None:
+    """End-of-tick units held per agent, walked backwards from the final holdings.
+
+    Every change to an inventory is logged with its agent: trades, expedition
+    yields, production, consumption and equipping. Like the world stock, items
+    in use are not counted. Left empty without final holdings rather than guessed.
+    """
+    if not final:
+        return
+    running = {
+        agent: sum(int(u) for u in (h.get("inventory") or {}).values())
+        for agent, h in final.items()
+    }
+    for frame, delta in zip(reversed(frames), reversed(deltas), strict=True):
+        frame.agent_items = [running.get(agent) for agent in agent_ids]
+        for agent, change in delta.items():
+            if agent in running:
+                running[agent] -= change
+
+
+def _plain(payload: dict[str, Any]) -> dict[str, Any]:
+    """A payload with Decimal-like values as strings, safe to embed as JSON."""
+    return {k: (str(v) if isinstance(v, Decimal) else v) for k, v in payload.items()}
+
+
+def _compact_observation(observation: dict[str, Any]) -> dict[str, Any]:
+    """What the agent was shown, without the parts that never change.
+
+    The directory is static and the traits are fixed per agent, so both are
+    carried once per track instead of once per activation. The bulletin is
+    carried once per tick; here only its presence is recorded.
+    """
+    market = []
+    for row in observation.get("market") or []:
+        recent = row.get("recent_prices") or []
+        market.append(
+            [
+                row.get("good"),
+                row.get("best_bid"),
+                row.get("best_ask"),
+                recent[-1] if recent else None,
+                len(recent),
+            ]
+        )
+    orders = [
+        [
+            o.get("side"),
+            o.get("good"),
+            o.get("remaining"),
+            o.get("limit_price"),
+            o.get("expires_at_tick"),
+            o.get("order_id"),
+        ]
+        for o in observation.get("open_orders") or []
+    ]
+    inbox = []
+    for message in observation.get("messages") or []:
+        body = message.get("payload") or {}
+        inbox.append(
+            [
+                message.get("type"),
+                message.get("sender_id"),
+                body.get("good"),
+                body.get("quantity"),
+                body.get("price"),
+                message.get("sent_tick"),
+            ]
+        )
+    return {
+        "g": observation.get("gold"),
+        "av": observation.get("available_gold"),
+        "inv": observation.get("inventory") or {},
+        "eq": observation.get("equipment") or {},
+        "gear": observation.get("expedition_gear") or {},
+        "away": 1 if observation.get("is_away") else 0,
+        "cap": observation.get("production_capacity", 0),
+        "ord": orders,
+        "mk": market,
+        "in": inbox,
+        "bul": 1 if observation.get("bulletin") else 0,
+    }
+
+
+def _compact_bulletin(summary: dict[str, Any]) -> list[list[Any]]:
+    """The bulletin's per-good rows: good, mean price, trades, supply, unmet demand."""
+    return [
+        [
+            row.get("good"),
+            row.get("mean_price"),
+            row.get("trades"),
+            row.get("available_supply"),
+            row.get("unmet_demand"),
+        ]
+        for row in summary.get("goods") or []
+    ]
+
+
+def _waste_reason(engine: list[list[Any]], payload: dict[str, Any]) -> Any:
+    """Why an activation was wasted, as a code when the log allows one.
+
+    The event itself carries the engine's message or the agent's own reason;
+    the code comes from the rejection logged just before it, or from the WAIT
+    the activation ended in.
+    """
+    if payload.get("code"):
+        return payload["code"]
+    rejected = [entry[1] for entry in engine if entry[0] == "rejected" and entry[1]]
+    if rejected:
+        return rejected[-1]
+    if payload.get("action") == "wait":
+        # The fallback WAIT: invalid output after the one retry, or the budget
+        # running out mid-activation (its reason is the runner's fixed text).
+        reason = str(payload.get("reason") or "")
+        if reason == "budget exhausted":
+            return "budget_exhausted"
+        # Invalid output, whether or not the budget left room for the retry.
+        if reason.startswith("invalid output") or int(payload.get("invalid_outputs") or 0) >= 2:
+            return "invalid_output"
+        return "wait"
+    return payload.get("reason")
+
+
+def _attach_trade(step: dict[str, Any], payload: dict[str, Any]) -> None:
+    """A trade the acting agent was party to, filled during its activation."""
+    agent = step["a"]
+    if agent not in (payload.get("buyer_id"), payload.get("seller_id")):
+        return
+    buying = payload.get("buyer_id") == agent
+    step["e"].append(
+        [
+            "trade",
+            "buy" if buying else "sell",
+            payload.get("good"),
+            payload.get("quantity"),
+            payload.get("price"),
+            payload.get("seller_id") if buying else payload.get("buyer_id"),
+        ]
+    )
+
+
+def _reconcile(
+    final: TickFrame | None, ledger: dict[str, int], authoritative: int, path: Path
+) -> None:
+    """Refuse to build a replay whose bars would contradict the run's ledger.
+
+    A displayed total that disagrees with the log leaves a viewer no way to tell
+    which number is wrong, so the contradiction is made unrenderable.
+    """
+    if final is None or not ledger:
+        return  # a log without a tokens_consumed event has nothing to check against
+
+    displayed = {bucket: final.tokens.get(bucket, 0) for bucket in ledger}
+    mismatched = {b: (displayed[b], ledger[b]) for b in ledger if displayed[b] != ledger[b]}
+    if mismatched:
+        detail = ", ".join(
+            f"{b}: shows {d} but ledger says {a}" for b, (d, a) in mismatched.items()
+        )
+        raise ValueError(f"{path.name}: replay bucket totals disagree with the ledger -- {detail}")
+
+    if authoritative and final.tokens_total != authoritative:
+        raise ValueError(
+            f"{path.name}: replay total {final.tokens_total} disagrees with the "
+            f"ledger's authoritative total {authoritative}"
+        )
+
+
+def _feed_detail(event: Event) -> dict[str, Any]:
+    """The one or two fields that make a feed line worth reading."""
+    payload = event.payload
+    match event.type:
+        case EventType.TRADE_EXECUTED:
+            return {"g": payload["good"], "v": str(payload["price"]), "q": payload["quantity"]}
+        case EventType.EXPEDITION_RESOLVED:
+            return {"g": payload.get("outcome", ""), "q": payload.get("total_units", 0)}
+        case EventType.PRODUCTION_COMPLETED:
+            return {"g": payload.get("product", ""), "q": payload.get("quantity", 0)}
+        case EventType.ORDER_EXPIRED:
+            return {"g": payload.get("good", ""), "v": str(payload.get("limit_price", ""))}
+        case EventType.SHOCK_APPLIED | EventType.SHOCK_REVERTED:
+            # The good a shock targets when it has one; otherwise the scenario,
+            # which the page labels. A scenario id is not a good.
+            good = payload.get("target_resource") or payload.get("target_product")
+            return {"g": str(good)} if good else {"s": str(payload.get("scenario", ""))}
+        case _:
+            return {}
+
+
+@dataclass
+class ReplayBundle:
+    """One or more tracks replayed together, synchronized by tick."""
+
+    tracks: list[ReplayTrack]
+    title: str = ""
+    #: Shown as a banner. Used to mark instrument-validation runs so they are
+    #: never mistaken for experimental results: a replay of a pilot or mock run
+    #: looks exactly like a replay of a final one.
+    caveat: str = ""
+    #: The world's crafting and gathering rules, for the reference guide. Set
+    #: only from a configuration proven to be the one the runs used.
+    rules: dict[str, Any] | None = None
+
+    @property
+    def horizon(self) -> int:
+        return max((track.horizon for track in self.tracks), default=0)
+
+    @property
+    def mock(self) -> bool:
+        """Whether any track was answered by the offline mock rather than a model.
+
+        Such a replay shows the instrument working, not how a model behaves, and
+        the page says so whether or not a caveat was given.
+        """
+        return any(track.mock for track in self.tracks)
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            "title": self.title,
+            "caveat": self.caveat,
+            "mock": self.mock,
+            "horizon": self.horizon,
+            "tracks": [track.to_payload() for track in self.tracks],
+            "rules": self.rules,
+        }
