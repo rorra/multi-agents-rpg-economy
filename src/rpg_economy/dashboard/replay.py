@@ -1272,6 +1272,25 @@ class ReplayBundle:
         }
 
 
+def build_bundle(log_paths: list[Path | str], *, title: str = "", caveat: str = "") -> ReplayBundle:
+    """Build a synchronized bundle -- a trio, or any set of comparable runs."""
+    tracks = [build_track(path) for path in log_paths]
+    if not tracks:
+        raise ValueError("no run logs to replay")
+
+    seeds = {track.seed for track in tracks}
+    scenarios = {track.scenario for track in tracks}
+    if len(tracks) > 1 and (len(seeds) > 1 or len(scenarios) > 1):
+        # The trio view's whole claim is "same world, three orchestrations".
+        # Rendering mismatched runs side by side would illustrate the opposite
+        # while looking identical.
+        raise ValueError(
+            f"a synchronized replay needs one seed and one scenario; "
+            f"got seeds {sorted(seeds)} and scenarios {sorted(scenarios)}"
+        )
+    return ReplayBundle(tracks=tracks, title=title, caveat=caveat)
+
+
 def trio_logs(directory: Path | str) -> list[Path]:
     """The three condition logs of a trio directory, in A/B/C order."""
     root = Path(directory)
