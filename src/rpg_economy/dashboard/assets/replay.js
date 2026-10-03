@@ -1290,4 +1290,224 @@
     return outer;
   }
 
+  function productCard(R, p) {
+    var rec = R.recipes[p];
+    var outer = el("article", "gcard");
+    var head = add(outer, el("header", ""));
+    head.appendChild(icon(p, "big"));
+    add(head, el("h4", "", goodL(p)));
+    var card = cardBody(outer, p);
+    var line = add(card, el("div", "recipe"));
+    ordered(Object.keys(rec.in), RES_ORDER).forEach(function (r, i) {
+      if (i) add(line, el("span", "op", "+"));
+      var part = add(line, el("span", "part"));
+      add(part, el("b", "", String(rec.in[r])));
+      part.appendChild(icon(r, "small"));
+      part.title = goodL(r);
+    });
+    add(line, el("span", "op", "→"));
+    var out = add(line, el("span", "part"));
+    add(out, el("b", "", String(rec.out)));
+    out.appendChild(icon(p, "small"));
+    add(card, el("p", "muted", ordered(Object.keys(rec.in), RES_ORDER).map(function (r) { return rec.in[r] + " " + goodL(r); }).join(" + ")));
+    add(card, el("h5", "", tpl("replay.guide.made_by")));
+    add(card, el("p", "", specName(rec.by)));
+    add(card, el("h5", "", tpl("replay.guide.used_for")));
+    var users = Object.keys(R.gear).filter(function (s) { return R.gear[s][p] !== undefined; });
+    var who = users.map(function (s) { return specName(s) + " +" + pct(R.gear[s][p]); }).join(", ");
+    if (users.length && R.durability[p] !== undefined) {
+      add(card, el("p", "", tpl("replay.guide.gear", { who: who, trips: Math.round(R.durability[p] / Math.max(1, R.wear)) })));
+    } else if (users.length) {
+      add(card, el("p", "", tpl("replay.guide.potion", { who: who })));
+    } else {
+      add(card, el("p", "muted", tpl("replay.guide.trade_only")));
+    }
+    outer.addEventListener("click", function () { focusGood(p); });
+    activatable(outer, goodL(p), card.id);
+    return outer;
+  }
+
+  function renderGuide() {
+    var R = D.rules, box = $("#guide");
+    if (!R) return;
+    box.hidden = false;
+    var products = ordered(Object.keys(R.recipes), PROD_ORDER);
+    var usedIn = {};
+    products.forEach(function (p) {
+      ordered(Object.keys(R.recipes[p].in), RES_ORDER).forEach(function (r) {
+        (usedIn[r] = usedIn[r] || []).push([p, R.recipes[p].in[r], R.recipes[p].out || 1]);
+      });
+    });
+    var seen = {};
+    R.zones.forEach(function (z) { Object.keys(z.spawn).forEach(function (r) { seen[r] = true; }); });
+    Object.keys(usedIn).forEach(function (r) { seen[r] = true; });
+    var resources = ordered(Object.keys(seen), RES_ORDER);
+
+    add(box, el("h2", "", tpl("replay.guide.title")));
+    add(box, el("p", "lead", tpl("replay.guide.lead")));
+    var fig = add(box, el("figure", "flowbox"));
+    fig.appendChild(flowDiagram(R, resources, products));
+    add(fig, el("figcaption", "", tpl("replay.guide.flow_hint")));
+
+    add(box, el("h3", "", tpl("replay.guide.resources")));
+    var rg = add(box, el("div", "gcards"));
+    resources.forEach(function (r) { rg.appendChild(resourceCard(R, r, usedIn)); });
+    add(box, el("h3", "", tpl("replay.guide.products")));
+    var pg = add(box, el("div", "gcards"));
+    products.forEach(function (p) { pg.appendChild(productCard(R, p)); });
+  }
+  renderGuide();
+
+  /* ---------- global render ---------- */
+  function render() {
+    // Ticks are numbered from 0, so the last one is horizon and there are horizon + 1.
+    $("#tickbox").textContent = tpl("replay.tick", { tick: tick, horizon: horizon });
+    $("#cyclebox").textContent = tpl("replay.cycle", { cycle: frameAt(head, tick).c });
+    var ph = phaseOf(tick), tag = $("#phasetag");
+    $("#shockbox").classList.toggle("active", ph === "shock");
+    tag.textContent = S.phase[ph]; tag.className = "phase " + ph;
+    if (+$("#scrub").value !== tick) $("#scrub").value = tick;
+    $("#charttitle").textContent = tpl("replay.chart.title", { good: goodL(good) });
+    $("#stocktitle").textContent = tpl("replay.stock.title", { good: goodL(good) });
+    // Nothing to jump to after the last collection.
+    $("#taxjump").disabled = nextTaxTick() === null;
+    drawChart();
+    renderNow();
+    tracks.forEach(function (tr) { renderColumn(tr.col, tr); });
+    if (!playing) writeHash();
+  }
+
+  /* ---------- transport ---------- */
+  function setTick(t) { tick = Math.max(0, Math.min(horizon, t | 0)); render(); }
+  function play() {
+    if (tick >= horizon) tick = 0;
+    playing = true; lastFrame = performance.now(); acc = 0;
+    $("#play").textContent = tpl("replay.pause"); requestAnimationFrame(loop);
+  }
+  function pause() { if (!playing) return; playing = false; $("#play").textContent = tpl("replay.play"); writeHash(); }
+  function toggle() { playing ? pause() : play(); }
+  function loop(now) {
+    if (!playing) return;
+    var dt = Math.min(now - lastFrame, 250);
+    lastFrame = now;
+    acc += (dt / 1000) * speed;
+    if (acc >= 1) {
+      var steps = Math.floor(acc);
+      acc -= steps;
+      if (tick + steps >= horizon) { setTick(horizon); pause(); return; }
+      setTick(tick + steps);
+    }
+    requestAnimationFrame(loop);
+  }
+  $("#play").textContent = tpl("replay.play");
+  $("#play").onclick = toggle;
+  $("#back").onclick = function () { pause(); setTick(tick - 1); };
+  $("#fwd").onclick = function () { pause(); setTick(tick + 1); };
+  $("#restart").onclick = function () { pause(); setTick(0); };
+  $("#shock").onclick = function () { pause(); setTick(head.shockTick || 0); };
+  $("#recovery").onclick = function () { pause(); setTick(head.reversionTick || 0); };
+  $("#taxjump").onclick = function () { var n = nextTaxTick(); if (n !== null) { pause(); setTick(n); } };
+  $("#scrub").max = horizon;
+  $("#scrub").oninput = function () { pause(); setTick(+this.value); };
+  $("#speed").value = String(speed);
+  $("#speed").onchange = function () { speed = +this.value; };
+
+  document.addEventListener("keydown", function (e) {
+    // The open prompt dialog keeps its keys: scrolling, Esc, Tab.
+    if (promptDialog && promptDialog.open) return;
+    var tag = e.target.tagName;
+    if (tag === "SELECT" || tag === "INPUT" || tag === "TEXTAREA") return;
+    // Leave browser shortcuts alone (Ctrl+R must reload, not jump to recovery).
+    if (e.ctrlKey || e.metaKey || e.altKey) return;
+    // Space on a focused control (a button, a Run details summary, a link, a
+    // tab) activates that control, not play/pause too.
+    var control = e.target.closest ? e.target.closest("button,summary,a,[role=button],[role=tab]") : null;
+    if (e.code === "Space" && (control || e.target.getAttribute("tabindex") === "0")) return;
+    // Arrows, Home and End on a tab move between tabs, not along the timeline.
+    if (e.target.closest && e.target.closest("[role=tab]") && /^(Arrow|Home|End)/.test(e.key)) return;
+    if (e.code === "Space") { e.preventDefault(); toggle(); }
+    else if (e.key === "ArrowRight") { e.preventDefault(); pause(); setTick(tick + (e.shiftKey ? 10 : 1)); }
+    else if (e.key === "ArrowLeft") { e.preventDefault(); pause(); setTick(tick - (e.shiftKey ? 10 : 1)); }
+    else if (e.key === "Home") { e.preventDefault(); pause(); setTick(0); }
+    else if (e.key === "End") { e.preventDefault(); pause(); setTick(horizon); }
+    else if (e.key === "s" || e.key === "S") { pause(); setTick(head.shockTick || 0); }
+    else if (e.key === "r" || e.key === "R") { pause(); setTick(head.reversionTick || 0); }
+    else if (e.key === "t" || e.key === "T") { var n = nextTaxTick(); if (n !== null) { pause(); setTick(n); } }
+  });
+
+  /* ---------- theme ---------- */
+  function setTheme(name) {
+    document.documentElement.setAttribute("data-theme", name);
+    try { localStorage.setItem("replay-theme", name); } catch (err) { /* storage unavailable */ }
+    readColours(); drawChart();
+  }
+  $("#theme").onclick = function () {
+    setTheme(document.documentElement.getAttribute("data-theme") === "dark" ? "light" : "dark");
+  };
+  try {
+    var saved = localStorage.getItem("replay-theme");
+    if (saved === "dark" || saved === "light") document.documentElement.setAttribute("data-theme", saved);
+    else if (window.matchMedia) {
+      // No choice of its own: follow the system, including a change mid-demo.
+      var system = window.matchMedia("(prefers-color-scheme: dark)");
+      document.documentElement.setAttribute("data-theme", system.matches ? "dark" : "light");
+      system.addEventListener("change", function (e) {
+        var chosen = null;
+        try { chosen = localStorage.getItem("replay-theme"); } catch (err) { /* storage unavailable */ }
+        if (!chosen) {
+          document.documentElement.setAttribute("data-theme", e.matches ? "dark" : "light");
+          readColours(); drawChart();
+        }
+      });
+    }
+  } catch (err) { /* storage unavailable */ }
+
+  /* ---------- deep links: #t=150&good=iron&tab=feed&agent=smithing_1 ---------- */
+  var applying = false;
+  /* The column last changed by hand, whose tab and followed agent go in the link. */
+  var linked = head;
+  function writeHash(tr) {
+    if (tr) linked = tr;
+    if (applying || !window.history || !history.replaceState) return;
+    var parts = ["t=" + tick];
+    if (good) parts.push("good=" + encodeURIComponent(good));
+    if (linked && linked.ui.tab !== "agents") parts.push("tab=" + encodeURIComponent(linked.ui.tab));
+    var followed = null;
+    tracks.forEach(function (tr2) { if (tr2.ui.focus && !followed) followed = tr2.ui.focus; });
+    if (linked && linked.ui.focus) followed = linked.ui.focus;
+    if (followed) parts.push("agent=" + encodeURIComponent(followed));
+    try { history.replaceState(null, "", "#" + parts.join("&")); } catch (err) { /* file:// may refuse */ }
+  }
+  function applyHash() {
+    var h = (location.hash || "").replace(/^#/, "");
+    if (!h) return;
+    var q = {};
+    h.split("&").forEach(function (kv) {
+      var i = kv.indexOf("=");
+      if (i <= 0) return;
+      // A hand-edited or truncated link can hold a malformed escape; skip it.
+      try { q[kv.slice(0, i)] = decodeURIComponent(kv.slice(i + 1)); } catch (err) { /* bad pair */ }
+    });
+    applying = true;
+    if (q.good && allGoods.indexOf(q.good) >= 0) { good = q.good; sel.value = good; }
+    var known = TABS.some(function (d) { return d[0] === q.tab; });
+    var took = null;
+    tracks.forEach(function (tr) {
+      // Only a tab this column has; anything else leaves the column as it was.
+      if (known) tr.ui.tab = q.tab === "bulletin" && tr.condition !== "C" ? "agents" : q.tab;
+      if (known && tr.ui.tab === q.tab && !took) took = tr;
+      // A link without an agent follows nobody; an unknown agent also clears it.
+      tr.ui.focus = q.agent && tr.agentIds.indexOf(q.agent) >= 0 ? q.agent : null;
+    });
+    // The link is rewritten from the linked column, so it must be one that
+    // took the tab (a bulletin link lands only on C).
+    if (took) linked = took;
+    setTick(q.t !== undefined ? parseInt(q.t, 10) || 0 : tick);
+    applying = false;
+  }
+  window.addEventListener("hashchange", applyHash);
+  window.addEventListener("resize", function () { drawChart(); });
+
+  readColours();
+  if (location.hash) applyHash(); else render();
 })();
