@@ -604,3 +604,602 @@ def test_every_model_call_carries_its_prompt_and_reply(tmp_path: Path) -> None:
             assert texts[call["ps"]] == systems[payload["system_sha"]]
             assert texts[call["pu"]] == payload["user"]
             assert texts[call["pr"]] == payload["raw"]
+
+
+def test_each_system_prompt_is_logged_once_per_run(tmp_path: Path) -> None:
+    trio = _trio(tmp_path / "runs")
+    for result in trio.values():
+        shas = [
+            e["payload"]["sha"] for e in _events(result.log_path) if e["type"] == "prompt_system"
+        ]
+        assert shas and len(shas) == len(set(shas))
+
+
+def test_the_prompt_texts_are_packed_reproducibly() -> None:
+    from rpg_economy.dashboard.replay import PromptTexts
+
+    store = PromptTexts()
+    assert store.packed() is None
+    assert store.add(None) is None
+    first = store.add("áé prompt")
+    assert store.add("reply") == first + 1
+    assert store.add("áé prompt") == first, "a repeated text is stored once"
+    assert _unpack(store.packed()) == ["áé prompt", "reply"]
+    again = PromptTexts()
+    again.add("áé prompt")
+    again.add("reply")
+    assert again.packed() == store.packed()
+
+
+def test_a_failed_call_shows_its_prompt_and_no_reply(tmp_path: Path) -> None:
+    """An attempt that got no reply keeps its prompt; the page shows no reply for it."""
+    from rpg_economy.dashboard.replay import build_track
+
+    log = _trio(tmp_path / "runs")[Condition.B].log_path
+    lines = log.read_text().splitlines()
+    out, injected = [lines[0]], None
+    for line in lines[1:]:
+        event = json.loads(line)
+        if injected is None and event["type"] == "llm_call":
+            failed = {
+                **event,
+                "type": "agent_output_invalid",
+                "payload": {
+                    "activation": event["payload"].get("activation"),
+                    "attempt": 1,
+                    "reason": "llm error: no completion",
+                    "system_sha": event["payload"]["system_sha"],
+                    "user": "the attempted prompt",
+                },
+            }
+            out.append(json.dumps(failed))
+            injected = event
+        out.append(line)
+    assert injected is not None
+    edited = tmp_path / "failed.jsonl"
+    edited.write_text("\n".join(out) + "\n")
+    track = build_track(edited)
+    texts = _unpack(track.prompts.packed())
+    entries = [x for f in track.frames for s in f.steps for x in s["x"]]
+    (entry,) = [x for x in entries if x[2] is not None]
+    system, user = entry[2]
+    assert texts[user] == "the attempted prompt"
+    events = _events(log)
+    shas = {
+        e["payload"]["sha"]: e["payload"]["text"] for e in events if e["type"] == "prompt_system"
+    }
+    assert texts[system] == shas[injected["payload"]["system_sha"]]
+
+
+def test_a_log_without_prompt_text_still_replays(tmp_path: Path) -> None:
+    """Runs recorded before prompts were logged: no texts, no buttons."""
+    from rpg_economy.dashboard.replay import build_track
+
+    log = _trio(tmp_path / "runs")[Condition.B].log_path
+    lines = log.read_text().splitlines()
+    kept = [lines[0]]
+    for line in lines[1:]:
+        event = json.loads(line)
+        if event["type"] == "prompt_system":
+            continue
+        for key in ("system_sha", "user"):
+            event["payload"].pop(key, None)
+        kept.append(json.dumps(event))
+    old = tmp_path / "old.jsonl"
+    old.write_text("\n".join(kept) + "\n")
+    track = build_track(old)
+    assert all(
+        c[5][0] is None and c[5][1] is None for f in track.frames for s in f.steps for c in s["l"]
+    )
+
+
+def test_only_condition_c_steps_saw_the_bulletin(tmp_path: Path) -> None:
+    from rpg_economy.dashboard.replay import build_track
+
+    trio = _trio(tmp_path / "runs")
+    for condition, result in trio.items():
+        track = build_track(result.log_path)
+        flags = {s["o"]["bul"] for f in track.frames for s in f.steps}
+        published = [f for f in track.frames if f.bulletin is not None]
+        if condition is Condition.C:
+            assert flags == {1} and published
+        else:
+            assert flags == {0} and not published
+
+
+def test_messages_carry_their_sender_and_type(tmp_path: Path) -> None:
+    from rpg_economy.dashboard.replay import build_track
+
+    trio = _trio(tmp_path / "runs")
+    track = build_track(trio[Condition.B].log_path)
+    sent = [e for e in _events(trio[Condition.B].log_path) if e["type"] == "message_sent"]
+    shown = [m for f in track.frames for m in f.messages]
+    assert len(shown) == len(sent)
+    for message, event in zip(shown, sent, strict=True):
+        assert message["from"] == event["agent_id"]
+        assert message["to"] == event["payload"]["recipient_id"]
+        assert message["ty"] == event["payload"]["type"]
+
+
+def test_expedition_returns_carry_their_outcome_and_haul(tmp_path: Path) -> None:
+    """A return shows whether it succeeded, what it brought back and what broke."""
+    from rpg_economy.dashboard.replay import build_track
+
+    trio = _trio(tmp_path / "runs")
+    log = trio[Condition.B].log_path
+    resolved = [e for e in _events(log) if e["type"] == "expedition_resolved"]
+    track = build_track(log)
+    shown = [(f.tick, r) for f in track.frames for r in f.returns]
+
+    assert len(shown) == len(resolved)
+    for (tick, entry), event in zip(shown, resolved, strict=True):
+        assert tick == event["tick"]
+        assert entry["a"] == event["agent_id"]
+        assert entry["ok"] == (1 if event["payload"]["outcome"] == "success" else 0)
+        assert entry["y"] == event["payload"]["yielded"]
+        # The loot and the rest that follows every return, not only a failed one.
+        assert entry["gd"] == str(event["payload"].get("gold") or "0")
+        assert entry["rec"] == (event["payload"].get("recovering_until_tick") or 0)
+
+
+def test_a_departing_adventurer_shows_its_gear(tmp_path: Path) -> None:
+    """The replay shows what each carried item added, as the engine fixed it."""
+    from rpg_economy.dashboard.replay import build_track
+
+    trio = _trio(tmp_path / "runs")
+    log = trio[Condition.B].log_path
+    started = [e for e in _events(log) if e["type"] == "expedition_started"]
+    track = build_track(log)
+    departures = [e for f in track.frames for s in f.steps for e in s["e"] if e[0] == "expedition"]
+    assert departures
+    assert [d[5] for d in departures] == [e["payload"]["gear_bonus"] for e in started]
+    for frame in track.frames:
+        for step in frame.steps:
+            if any(e[0] == "expedition" for e in step["e"]):
+                assert step["o"]["gear"], f"{step['a']} left with no gear in its observation"
+
+
+def test_a_track_carries_what_its_shock_did(tmp_path: Path) -> None:
+    """The replay describes the shock from the log, not from the config."""
+    from rpg_economy.dashboard.replay import build_track
+
+    trio = _trio(tmp_path / "runs")
+    applied = next(e for e in _events(trio[Condition.B].log_path) if e["type"] == "shock_applied")
+    track = build_track(trio[Condition.B].log_path)
+
+    assert track.shock is not None
+    assert track.shock["scenario"] == applied["payload"]["scenario"]
+    assert track.shock["target_resource"] == applied["payload"]["target_resource"]
+    assert track.shock["spawn_multiplier"] == applied["payload"]["spawn_multiplier"]
+
+
+def test_world_stock_is_reconstructed_back_to_the_endowment(tmp_path: Path) -> None:
+    """Walking the log back from the final holdings lands on the starting stock."""
+    from collections import Counter
+
+    from rpg_economy.dashboard.replay import build_track
+    from rpg_economy.engine import build_world
+
+    config = short_config()
+    trio = _trio(tmp_path / "runs")
+    track = build_track(trio[Condition.B].log_path)
+
+    world = build_world(config)
+    endowment: Counter[str] = Counter()
+    for agent_id in world.agent_ids:
+        for good, units in world.account(agent_id).inventory.items():
+            endowment[good.value] += units
+
+    # Undo tick 0 as well: the reconstruction reports end-of-tick stock.
+    first = track.frames[0].world_stock
+    tick0 = Counter(first)
+    for event in _events(trio[Condition.B].log_path):
+        if event["tick"] != 0:
+            continue
+        payload = event["payload"]
+        if event["type"] == "production_completed":
+            for good, units in payload["consumed"].items():
+                tick0[good] += units
+            tick0[payload["product"]] -= payload["quantity"]
+        elif event["type"] == "consumption":
+            tick0[payload["product"]] += payload["quantity"]
+        elif event["type"] == "equipment_equipped":
+            tick0[payload["product"]] += 1
+        elif event["type"] == "expedition_resolved":
+            for good, units in payload["yielded"].items():
+                tick0[good] -= units
+    assert +tick0 == +endowment
+
+
+def test_zone_stock_reaches_the_replay(tmp_path: Path) -> None:
+    from rpg_economy.dashboard.replay import build_track
+
+    trio = _trio(tmp_path / "runs")
+    track = build_track(trio[Condition.A].log_path)
+    assert all(f.zone_stock for f in track.frames)
+    assert all(
+        units >= 0
+        for f in track.frames
+        for pool in f.zone_stock.values()
+        for units in pool.values()
+    )
+
+
+@pytest.mark.invariant
+def test_the_crafting_guide_comes_only_from_the_runs_own_config(tmp_path: Path) -> None:
+    """The logs hold the config only by hash, so the guide proves it has the right one."""
+    from rpg_economy.dashboard.replay import build_bundle, trio_logs, world_rules
+
+    _trio(tmp_path / "runs")
+    bundle = build_bundle(trio_logs(tmp_path / "runs"))
+
+    rules = world_rules(bundle, short_config())
+    assert rules is not None
+    assert rules["recipes"]["armor"]["in"] == {"iron": 2, "leather": 2}
+    assert set(rules["gear"]["warrior"]) == {"melee_weapon", "armor", "health_potion"}
+
+    # A different configuration (the full horizon) describes a different run.
+    assert world_rules(bundle, make_config()) is None
+
+
+def test_the_page_carries_the_guide_and_its_icons(tmp_path: Path) -> None:
+    from rpg_economy.dashboard.html import render_replay
+    from rpg_economy.dashboard.replay import build_bundle, trio_logs, world_rules
+
+    _trio(tmp_path / "runs")
+    bundle = build_bundle(trio_logs(tmp_path / "runs"))
+    bundle.rules = world_rules(bundle, short_config())
+    html = render_replay(bundle, locale="es")
+
+    assert 'id="guide"' in html
+    for good in ("iron", "wood", "leather", "herbs", "arcane_crystal", "melee_weapon", "armor"):
+        assert f'id="g-{good}"' in html
+    assert "Guía de crafting" in json.dumps(
+        json.loads(html.split("window.STR=")[1].split(";</script>")[0]), ensure_ascii=False
+    )
+
+
+def test_an_experiment_2_replay_shows_its_budget(tmp_path: Path) -> None:
+    """The budget bar reads the cap the log records, or it never appears."""
+    from rpg_economy.dashboard.replay import build_track
+
+    config = short_config(
+        run={"experiment": "experiment_2", "condition": "B"},
+        budget={"experiment_2_total_tokens": 40_000},
+    )
+    result = run_condition(config, tmp_path / "run.jsonl")
+    assert build_track(result.log_path).budget_total == 40_000
+
+
+def test_the_replay_has_no_frame_past_the_last_tick_that_ran(tmp_path: Path) -> None:
+    """run_end is stamped one past the last tick; it must not add an empty tick."""
+    from rpg_economy.dashboard.replay import build_track
+
+    config = short_config(run={"condition": "B"})
+    result = run_condition(config, tmp_path / "run.jsonl")
+    track = build_track(result.log_path)
+    assert track.horizon == config.time.horizon_ticks - 1
+    assert len(track.frames) == config.time.horizon_ticks
+    assert track.frames[-1].cycle == config.time.total_cycles - 1
+
+
+def test_role_gold_ends_at_the_logged_final_holdings(tmp_path: Path) -> None:
+    """Walked back from the run_end holdings, so the last frame must equal them."""
+    from collections import defaultdict
+    from decimal import Decimal
+
+    from rpg_economy.dashboard.replay import build_track
+
+    trio = _trio(tmp_path)
+    for condition, result in trio.items():
+        run_end = next(e for e in reversed(_events(result.log_path)) if e["type"] == "run_end")
+        expected: dict[str, Decimal] = defaultdict(Decimal)
+        for holding in run_end["payload"]["holdings"].values():
+            expected[holding["role"]] += Decimal(holding["gold"])
+
+        frames = build_track(result.log_path).frames
+        final = frames[-1]
+        assert final.role_gold == {
+            role: float(total.quantize(Decimal("0.01"))) for role, total in sorted(expected.items())
+        }, condition.value
+        assert final.to_payload()["rg"] == final.role_gold
+        assert all(set(frame.role_gold) == set(expected) for frame in frames)
+
+
+def test_role_gold_moves_only_with_loot_taxes_and_storage_in_total(tmp_path: Path) -> None:
+    """Trades move gold between roles; only loot, confiscation pay, taxes and storage change the total."""
+    import itertools
+
+    from rpg_economy.dashboard.replay import build_track
+
+    result = run_condition(short_config(run={"condition": "B"}), tmp_path / "B.jsonl")
+    events = _events(result.log_path)
+    frames = build_track(result.log_path).frames
+
+    for previous, frame in itertools.pairwise(frames):
+        flow = sum(
+            float(e["payload"].get("gold", 0))
+            for e in events
+            if e["type"] in ("expedition_resolved", "goods_confiscated")
+            and e["tick"] == frame.tick
+        ) - sum(
+            float(e["payload"]["amount"])
+            for e in events
+            if e["type"] in ("tax_paid", "storage_paid") and e["tick"] == frame.tick
+        )
+        change = sum(frame.role_gold.values()) - sum(previous.role_gold.values())
+        assert change == pytest.approx(flow, abs=0.03), frame.tick
+
+
+def test_a_step_lists_the_orders_of_a_place_orders(tmp_path: Path) -> None:
+    from rpg_economy.dashboard.replay import build_track
+
+    runs = _trio(tmp_path)
+    steps = [
+        s
+        for result in runs.values()
+        for f in build_track(result.log_path).frames
+        for s in f.steps
+        if s.get("d") and s["d"].get("ac") == "place_orders"
+    ]
+    assert steps, "the rule-based agents place several orders at once"
+    for step in steps:
+        orders = step["d"]["os"]
+        assert 2 <= len(orders) <= short_config().market.max_orders_per_activation
+        assert all(order[0] in ("buy", "sell", "cancel_order") for order in orders)
+
+
+def test_the_replay_shows_the_taxes(tmp_path: Path) -> None:
+    """Taxes collected per kind, per agent, on the feed and on the timeline."""
+    from rpg_economy.dashboard.replay import AGENT_FIELDS, build_track
+
+    config = short_config(
+        run={"condition": "B"},
+        economy={"taxes": {"wealth_every_ticks": 5, "wealth_exemption": 50}},
+    )
+    result = run_condition(config, tmp_path / "B.jsonl")
+    events = _events(result.log_path)
+    track = build_track(result.log_path)
+    paid = [e for e in events if e["type"] == "tax_paid"]
+    assert paid, "a run with taxes configured collected none"
+
+    last = track.frames[-1]
+    for kind in ("sales", "wealth"):
+        expected = sum(float(e["payload"]["amount"]) for e in paid if e["payload"]["tax"] == kind)
+        assert last.charges.get(kind, 0) == pytest.approx(expected, abs=0.02)
+
+    taxes = AGENT_FIELDS.index("taxes")
+    for agent_id in {e["agent_id"] for e in paid}:
+        expected = sum(float(e["payload"]["amount"]) for e in paid if e["agent_id"] == agent_id)
+        assert last.agents[agent_id][taxes] == pytest.approx(expected, abs=0.02)
+
+    wealth = [e for e in paid if e["payload"]["tax"] == "wealth"]
+    # Arrears settled between collections are payments, not collections.
+    collections = sorted({e["tick"] for e in wealth if not e["payload"].get("arrears")})
+    assert track.wealth_tax_ticks == collections
+    paying_ticks = sorted({e["tick"] for e in wealth})
+    for tick in paying_ticks:
+        (line,) = [f for f in track.frames[tick].feed if f["e"] == "tax_paid"]
+        payers = [e for e in wealth if e["tick"] == tick]
+        # The collection and the arrears settled at the same tick stay apart.
+        current = [e for e in payers if not e["payload"].get("arrears")]
+        owed = [e for e in payers if e["payload"].get("arrears")]
+        assert line["c"] == (1 if current else 0)
+        assert line["q"] == sum(1 for e in current if float(e["payload"]["amount"]) > 0)
+        assert line["aq"] == sum(1 for e in owed if float(e["payload"]["amount"]) > 0)
+        assert line["v"] == pytest.approx(
+            sum(float(e["payload"]["amount"]) for e in current), abs=0.02
+        )
+        assert line["ar"] == pytest.approx(
+            sum(float(e["payload"]["amount"]) for e in owed), abs=0.02
+        )
+        # The collection card: who paid, on what, how much, and whether it was arrears.
+        rows = list(track.frames[tick].wealth_tax)
+        assert sorted(row[0] for row in rows) == sorted(e["agent_id"] for e in payers)
+        for e in payers:
+            arrears = 1 if e["payload"].get("arrears") else 0
+            (row,) = [r for r in rows if r[0] == e["agent_id"] and r[3] == arrears]
+            if "taxable" in e["payload"]:
+                assert row[1] == pytest.approx(float(e["payload"]["taxable"]))
+            else:
+                assert row[1] is None
+            assert row[2] == pytest.approx(float(e["payload"]["amount"]))
+    assert not any(f.wealth_tax for f in track.frames if f.tick not in paying_ticks)
+
+    # A taxed trade carries its tax on the feed, unless the per-tick cap
+    # dropped its line (the tick then says "more").
+    for tick in {e["tick"] for e in paid if e["payload"]["tax"] == "sales"}:
+        feed = track.frames[tick].feed
+        assert any(f.get("tx") for f in feed) or any(f["e"] == "more" for f in feed)
+
+
+def test_the_replay_carries_the_best_bid_and_ask(tmp_path: Path) -> None:
+    """Quotes are rebuilt from the order events: the book at the end of each tick."""
+    from rpg_economy.dashboard.replay import build_track
+
+    result = run_condition(short_config(run={"condition": "B"}), tmp_path / "B.jsonl")
+    events = _events(result.log_path)
+    frames = build_track(result.log_path).frames
+
+    closing = {"order_filled", "order_expired", "order_cancelled"}
+    for frame in frames:
+        book: dict = {}
+        for e in events:
+            if e["tick"] > frame.tick:
+                break
+            p = e["payload"]
+            if e["type"] == "order_placed":
+                book[p["order_id"]] = [
+                    p["good"],
+                    p["side"],
+                    float(p["limit_price"]),
+                    p["remaining"],
+                ]
+            elif e["type"] == "order_partially_filled" and p["order_id"] in book:
+                book[p["order_id"]][3] = p["remaining"]
+            elif e["type"] in closing:
+                book.pop(p["order_id"], None)
+        for good, (bid, ask) in frame.quotes.items():
+            bids = [o[2] for o in book.values() if o[0] == good and o[1] == "buy" and o[3]]
+            asks = [o[2] for o in book.values() if o[0] == good and o[1] == "sell" and o[3]]
+            assert bid == (max(bids) if bids else None)
+            assert ask == (min(asks) if asks else None)
+            if bid is not None and ask is not None:
+                assert bid < ask, "a crossed book would have traded"
+    assert any(frame.quotes for frame in frames)
+
+
+# ---------------------------------------------------------------------------
+# Wealth-tax schedule, per-agent gold, the mock caveat, locale-aware numbers
+# ---------------------------------------------------------------------------
+def _taxed_trio(tmp_path: Path, **taxes):
+    config = short_config(economy={"taxes": {"wealth_every_ticks": 5, **taxes}})
+    run_trio(config, tmp_path, seed=7)
+    return config
+
+
+def test_the_wealth_tax_schedule_covers_every_collection_that_paid(tmp_path: Path) -> None:
+    """The schedule is the engine's rule; every tick at which somebody paid is on it."""
+    from rpg_economy.dashboard.replay import build_bundle, trio_logs, world_rules
+
+    config = _taxed_trio(tmp_path / "runs")
+    bundle = build_bundle(trio_logs(tmp_path / "runs"))
+    rules = world_rules(bundle, config)
+    assert rules is not None
+    wealth = rules["wealth"]
+    assert wealth["every"] == 5
+    assert wealth["exemption"] == str(config.economy.taxes.wealth_exemption)
+    assert wealth["ticks"] and all(0 <= t < config.time.horizon_ticks for t in wealth["ticks"])
+    for track in bundle.tracks:
+        assert set(track.wealth_tax_ticks) <= set(wealth["ticks"]), track.condition
+
+
+def test_a_collection_nobody_pays_is_still_scheduled(tmp_path: Path) -> None:
+    """With nobody above the minimum there are no payments, but still a schedule."""
+    from rpg_economy.dashboard.html import render_replay
+    from rpg_economy.dashboard.replay import build_bundle, trio_logs, world_rules
+
+    config = _taxed_trio(tmp_path / "runs", wealth_exemption=10_000_000)
+    bundle = build_bundle(trio_logs(tmp_path / "runs"))
+    assert all(not track.wealth_tax_ticks for track in bundle.tracks)
+    bundle.rules = world_rules(bundle, config)
+    assert bundle.rules is not None and bundle.rules["wealth"]["ticks"]
+
+    html = render_replay(bundle, locale="en")
+    data = json.loads(html.split("window.DATA=")[1].split(";window.STR=")[0])
+    assert data["rules"]["wealth"]["ticks"] == bundle.rules["wealth"]["ticks"]
+    # Nothing to jump to until the page has worked out the next collection.
+    assert '<button id="taxjump" type="button" disabled>' in html
+
+
+def test_no_schedule_without_a_wealth_tax(tmp_path: Path) -> None:
+    from rpg_economy.dashboard.replay import wealth_tax_schedule
+
+    assert wealth_tax_schedule(short_config(economy={"taxes": {"wealth_rate": 0}})) == []
+
+
+def test_token_buckets_render_in_a_fixed_order(tmp_path: Path) -> None:
+    """Agent, Director, P2P content, bulletin: never the alphabetical order of the keys."""
+    config = short_config(run={"condition": "C"})
+    result = run_condition(config, tmp_path / "run.jsonl", cycles=config.time.total_cycles)
+    data = build_dashboard(result.log_path)
+    data.tokens = {
+        "total": {"bulletin": 1, "p2p_content": 2, "director": 3, "agent": 4},
+        "authoritative_total": 10,
+    }
+
+    text = render_dashboard(data, locale="en")
+    section = text[text.index("Tokens by bucket") :]
+    labels = ("  Agents: 4", "  Director: 3", "  P2P content: 2", "  Bulletin: 1")
+    positions = [section.index(label) for label in labels]
+    assert positions == sorted(positions)
+
+
+def test_the_tax_card_counts_only_agents_below_the_exemption() -> None:
+    """Agents that could not pay or only settled arrears are not below the exempt amount."""
+    script = (DASHBOARD / "assets" / "replay.js").read_text(encoding="utf-8")
+    assert "tr.agentIds.length - current.length" not in script
+    assert "others: below" in script
+    # A collection nobody paid is worded as such in the feed, not "collected 0".
+    assert "if (e.c && !e.q)" in script
+    # The budget share does not shadow the pct() helper.
+    assert "var pct =" not in script and "var share =" in script
+
+
+def test_the_wealth_summary_takes_the_exemption_from_the_config() -> None:
+    """The exempt minimum is configuration, so the page never states it as a literal."""
+    from rpg_economy.i18n import Catalog
+
+    for locale in ("en", "es"):
+        catalog = Catalog.load(locale)
+        for key in ("replay.wealth.summary", "replay.wealth.nobody"):
+            assert "{exemption}" in catalog.raw(key)
+            assert "100" not in catalog.raw(key)
+
+
+def test_agent_gold_is_reconstructed_for_every_agent_and_tick(tmp_path: Path) -> None:
+    """Per-agent gold ends at the logged holdings and adds up to the role totals."""
+    from decimal import Decimal
+
+    from rpg_economy.dashboard.replay import build_track
+
+    trio = _trio(tmp_path)
+    for condition, result in trio.items():
+        run_end = next(e for e in reversed(_events(result.log_path)) if e["type"] == "run_end")
+        holdings = run_end["payload"]["holdings"]
+        track = build_track(result.log_path)
+        assert set(holdings) <= set(track.agent_ids), condition.value
+
+        final = track.frames[-1]
+        by_id = dict(zip(track.agent_ids, final.agent_gold, strict=True))
+        for agent, holding in holdings.items():
+            assert by_id[agent] == float(Decimal(holding["gold"])), (condition.value, agent)
+
+        for frame in track.frames:
+            assert len(frame.agent_gold) == len(track.agent_ids)
+            assert frame.to_payload()["ag"] == frame.agent_gold
+            totals: dict[str, float] = {}
+            for agent, gold in zip(track.agent_ids, frame.agent_gold, strict=True):
+                role = holdings[agent]["role"]
+                totals[role] = totals.get(role, 0.0) + gold
+            for role, total in totals.items():
+                assert total == pytest.approx(frame.role_gold[role], abs=0.01)
+
+
+def test_a_mock_answered_replay_says_so(tmp_path: Path) -> None:
+    """A replay of mock runs carries the caveat banner even when nobody gave one."""
+    from rpg_economy.dashboard.html import render_replay
+    from rpg_economy.dashboard.replay import build_bundle, trio_logs
+    from rpg_economy.i18n import t
+
+    _trio(tmp_path / "runs")
+    bundle = build_bundle(trio_logs(tmp_path / "runs"))
+    assert all(track.model_observed.startswith("mock:") for track in bundle.tracks)
+    assert bundle.mock
+
+    for locale in ("en", "es"):
+        html = render_replay(bundle, locale=locale)
+        assert 'class="banner"' in html
+        assert t("replay.banner.mock", locale=locale) in html
+
+    for track in bundle.tracks:
+        track.model_observed = "gpt-5-nano"
+    assert not bundle.mock
+    assert 'class="banner"' not in render_replay(bundle, locale="en")
+
+
+def test_the_text_view_formats_numbers_for_its_language(tmp_path: Path) -> None:
+    config = short_config(run={"condition": "B"})
+    result = run_condition(config, tmp_path / "run.jsonl", cycles=config.time.total_cycles)
+    data = build_dashboard(result.log_path)
+    total = data.tokens.get("authoritative_total", 0)
+    assert total >= 1000, "the fixture needs a total with a thousands separator"
+
+    english = render_dashboard(data, locale="en")
+    spanish = render_dashboard(data, locale="es")
+    assert f"{total:,}" in english
+    assert f"{total:,}".replace(",", ".") in spanish
+    gold = next(iter(data.holdings.values()))["gold"]
+    whole, _, cents = f"{float(gold):.2f}".partition(".")
+    assert f"{int(whole):,}.{cents}" in english
+    assert f"{int(whole):,}".replace(",", ".") + f",{cents}" in spanish
