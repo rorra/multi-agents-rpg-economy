@@ -238,6 +238,32 @@ def _held_gear(v: View) -> set[str]:
     return {o.item for o in v.gear_offers() if o.held} if not v.away else set()
 
 
+def _gear_to_buy(v: View) -> set[str]:
+    """Offered items that pay for themselves in every zone and that it can afford."""
+    return {
+        o.item
+        for o in v.gear_offers()
+        if not o.held
+        and o.ask is not None
+        and o.pays
+        and v.gold >= o.ask
+        and not v.has_open("buy", o.item, at_least=o.ask)
+    }
+
+
+def _gear_to_bid_for(v: View) -> set[str]:
+    """Items nobody offers that would pay at their last price, with no bid of its own."""
+    return {
+        o.item
+        for o in v.gear_offers()
+        if not o.held
+        and o.ask is None
+        and o.pays
+        and not v.has_open("buy", o.item)
+        and v.gold >= (o.cost_per_trip or Decimal(0))
+    }
+
+
 def _kept_gear(v: View) -> set[str]:
     """Gear and potions it holds unreserved: what its own trips use."""
     return {g for g in v.gear if v.held(g) > 0}
@@ -247,13 +273,36 @@ def _wanted_raw(v: View) -> set[str]:
     return {g for g in RAW if v.held(g) > 0 and v.bid(g) is not None}
 
 
+def _sells_wanted_raw_applies(v: View) -> bool:
+    return (
+        # Selling and buying go together in one place_orders; equipping does not.
+        v.is_adventurer and not v.can_set_out and bool(_wanted_raw(v)) and not _held_gear(v)
+    )
+
+
 def _sells_wanted_raw_met(v: View, a: dict[str, Any]) -> bool:
     return bool(sells(a, _wanted_raw(v)))
+
+
+def _ready_met(v: View, a: dict[str, Any]) -> bool:
+    return (
+        a.get("action") == "start_expedition"
+        or (a.get("action") == "equip" and a.get("target") in _held_gear(v))
+        or bool(sells(a, _wanted_raw(v)))
+        or bool(buys(a, v.gear))
+    )
 
 
 def _scarce_raw(v: View) -> set[str]:
     """Raw materials it holds that buyers bid for and nobody offers."""
     return {g for g in _wanted_raw(v) if v.ask(g) is None}
+
+
+def _asks_above_bid_met(v: View, a: dict[str, Any]) -> bool | None:
+    offers = sells(a, _scarce_raw(v))
+    if not offers:
+        return None
+    return any(v.bid(o["target"]) < price(o) <= v.bid(o["target"]) * NEAR_BID for o in offers)
 
 
 # -- artisan rules -----------------------------------------------------------------
@@ -282,6 +331,13 @@ def _missing_inputs(v: View) -> set[str]:
 
 def _sells_wanted_stock_applies(v: View) -> bool:
     return v.is_artisan and bool(_wanted_stock(v))
+
+
+def _sells_wanted_stock_met(v: View, a: dict[str, Any]) -> bool:
+    return any(
+        v.unit_cost(o["target"]) * COST_TOLERANCE <= price(o) <= v.bid(o["target"]) * NEAR_BID
+        for o in sells(a, _wanted_stock(v))
+    )
 
 
 def _crafts_wanted_applies(v: View) -> bool:
@@ -327,8 +383,17 @@ def _failed_bids(v: View) -> dict[str, Decimal]:
     return found
 
 
+def _raises_bid_met(v: View, a: dict[str, Any]) -> bool:
+    return any(price(o) > top for g, top in _failed_bids(v).items() for o in buys(a, {g}))
+
+
 def _unsold(v: View) -> set[str]:
     return {p for p in v.recipes() if v.owned(p) >= UNSOLD_FLAG and v.bid(p) is None}
+
+
+def _no_sale_below_cost_met(v: View, a: dict[str, Any]) -> bool:
+    own = set(v.recipes())
+    return all(price(o) >= v.unit_cost(o["target"]) * COST_TOLERANCE for o in sells(a, own))
 
 
 def _produces_possible_met(v: View, a: dict[str, Any]) -> bool:
@@ -341,7 +406,252 @@ def _produces_possible_met(v: View, a: dict[str, Any]) -> bool:
     return v.runs(product) >= quantity and v.capacity >= quantity
 
 
+# -- rules for everyone --------------------------------------------------------------
+def _sells_within_stock_met(v: View, a: dict[str, Any]) -> bool:
+    totals: dict[str, int] = {}
+    for o in sells(a):
+        totals[o.get("target")] = totals.get(o.get("target"), 0) + int(o.get("quantity") or 0)
+    # A cancel in the same answer frees what it held; which one is not logged.
+    limit = v.owned if cancels(a) else v.held
+    return all(q <= limit(g) for g, q in totals.items())
+
+
+def _buys_within_gold_met(v: View, a: dict[str, Any]) -> bool:
+    spend = sum((price(o) * int(o.get("quantity") or 0) for o in buys(a)), Decimal(0))
+    gold = (_dec(v.obs.get("gold")) or Decimal(0)) if cancels(a) else v.gold
+    return spend <= gold
+
+
+def _no_self_cross_met(v: View, a: dict[str, Any]) -> bool:
+    if cancels(a):
+        return True
+    for o in orders(a):
+        side, good = o.get("action"), o.get("target")
+        for mine in v.open_orders:
+            if mine["good"] != good:
+                continue
+            limit = Decimal(str(mine["limit_price"]))
+            if side == "buy" and mine["side"] == "sell" and price(o) >= limit:
+                return False
+            if side == "sell" and mine["side"] == "buy" and price(o) <= limit:
+                return False
+    return True
+
+
 def _equips_only_held_met(v: View, a: dict[str, Any]) -> bool:
     if a.get("action") != "equip":
         return True
     return not v.away and v.held(a.get("target")) > 0
+
+
+OBLIGATIONS: list[Obligation] = [
+    # adventurer
+    Obligation(
+        "adv_keeps_gear",
+        "adventurer",
+        0.85,
+        # Adventurers sold the potions their next trip would use,
+        # undercutting the alchemists; the market now refuses it, and an
+        # answer that tries it is a wasted activation.
+        lambda v: v.is_adventurer and bool(_kept_gear(v)),
+        lambda v, a: not sells(a, _kept_gear(v)),
+        "holds gear or potions its trips use: does not sell them",
+    ),
+    Obligation(
+        "adv_buys_paying_gear",
+        "adventurer",
+        0.75,
+        # Asked while resting or away: once it can set out, buying first and
+        # setting out compete for one action, and either is fair (adv_ready_acts).
+        lambda v: (
+            v.is_adventurer and not v.can_set_out and not _held_gear(v) and bool(_gear_to_buy(v))
+        ),
+        lambda v, a: any(price(o) >= v.ask(o["target"]) for o in buys(a, _gear_to_buy(v))),
+        "gear on offer would add more to every trip than it costs a trip, and it can pay: buys it",
+    ),
+    Obligation(
+        "adv_bids_for_paying_gear",
+        "adventurer",
+        0.4,
+        lambda v: (
+            v.is_adventurer
+            and not v.can_set_out
+            and not _held_gear(v)
+            and not _gear_to_buy(v)
+            and bool(_gear_to_bid_for(v))
+        ),
+        lambda v, a: bool(buys(a, _gear_to_bid_for(v))),
+        "gear nobody offers would pay for itself: bids for it",
+    ),
+    Obligation(
+        "adv_no_set_out_when_unable",
+        "adventurer",
+        0.85,
+        lambda v: v.is_adventurer and not v.away and v.resting,
+        lambda v, a: a.get("action") != "start_expedition",
+        "resting: does not set out",
+    ),
+    Obligation(
+        "adv_sells_wanted_raw",
+        "adventurer",
+        0.75,
+        _sells_wanted_raw_applies,
+        _sells_wanted_raw_met,
+        "resting or away, holds raw materials buyers bid for: offers them",
+    ),
+    Obligation(
+        "adv_asks_above_bid_when_scarce",
+        "adventurer",
+        0.25,
+        lambda v: v.is_adventurer and bool(_scarce_raw(v)),
+        _asks_above_bid_met,
+        "offering a raw material nobody else offers, sometimes asks above the bid",
+        aggregate=True,
+    ),
+    Obligation(
+        "adv_ready_acts",
+        "adventurer",
+        0.75,
+        lambda v: v.can_set_out,
+        _ready_met,
+        "can set out: sets out, equips or buys its gear, or sells wanted raw materials",
+    ),
+    Obligation(
+        "adv_no_raw_buy",
+        "adventurer",
+        0.85,
+        lambda v: v.is_adventurer,
+        lambda v, a: not buys(a, RAW),
+        "never bids for raw materials (adventurers only sell them)",
+    ),
+    Obligation(
+        "adv_buys_only_its_gear",
+        "adventurer",
+        0.85,
+        lambda v: v.is_adventurer,
+        lambda v, a: all(o.get("target") in v.gear for o in buys(a, PRODUCTS)),
+        "buys only products its subclass can carry",
+    ),
+    Obligation(
+        "adv_equips_only_held",
+        "adventurer",
+        0.85,
+        lambda v: v.is_adventurer,
+        _equips_only_held_met,
+        "equips only an item it holds, and not while away",
+    ),
+    # artisan
+    Obligation(
+        "art_sells_wanted_stock",
+        "artisan",
+        0.85,
+        _sells_wanted_stock_applies,
+        _sells_wanted_stock_met,
+        "holds a product buyers bid for above its cost: offers it near that bid",
+    ),
+    Obligation(
+        "art_crafts_wanted",
+        "artisan",
+        0.85,
+        _crafts_wanted_applies,
+        lambda v, a: a.get("action") == "produce" and a.get("target") in _wanted_craftable(v),
+        "can craft a product buyers wait for: crafts it",
+    ),
+    Obligation(
+        "art_buys_input_for_wanted",
+        "artisan",
+        0.75,
+        _buys_input_applies,
+        lambda v, a: bool(buys(a, _missing_inputs(v))),
+        "lacks the inputs for a product buyers wait for: bids for them",
+    ),
+    Obligation(
+        "art_raises_failed_bid",
+        "artisan",
+        0.75,
+        lambda v: (
+            v.is_artisan
+            and bool(_failed_bids(v))
+            and not _sells_wanted_stock_applies(v)
+            and not _crafts_wanted_applies(v)
+        ),
+        _raises_bid_met,
+        "its bids for an input expired unbought: bids higher",
+    ),
+    Obligation(
+        "art_stops_unsold",
+        "artisan",
+        0.85,
+        lambda v: v.is_artisan and bool(_unsold(v)),
+        lambda v, a: not (a.get("action") == "produce" and a.get("target") in _unsold(v)),
+        "holds unsold stock of a product with no bid: does not craft more of it",
+    ),
+    Obligation(
+        "art_no_sale_below_cost",
+        "artisan",
+        0.85,
+        lambda v: v.is_artisan and any(v.owned(p) for p in v.recipes()),
+        _no_sale_below_cost_met,
+        "does not offer its products below their input cost",
+    ),
+    Obligation(
+        "art_produces_only_possible",
+        "artisan",
+        0.85,
+        lambda v: v.is_artisan,
+        _produces_possible_met,
+        "crafts only what its inputs and capacity allow",
+    ),
+    # everyone
+    Obligation(
+        "sells_within_stock",
+        "any",
+        0.85,
+        lambda v: True,
+        _sells_within_stock_met,
+        "offers only what it holds and has not already offered",
+    ),
+    Obligation(
+        "buys_within_gold",
+        "any",
+        0.85,
+        lambda v: True,
+        _buys_within_gold_met,
+        "bids only what its free gold can pay",
+    ),
+    Obligation(
+        "no_self_cross",
+        "any",
+        0.85,
+        lambda v: True,
+        _no_self_cross_met,
+        "does not place an order that would trade with its own resting order",
+    ),
+    Obligation(
+        "task_answered_with_action",
+        "any",
+        0.75,
+        lambda v: v.task is not None,
+        lambda v, a: a.get("action") != "wait",
+        "given a TASK (A): acts on it rather than waiting",
+    ),
+]
+
+BY_NAME = {o.name: o for o in OBLIGATIONS}
+
+
+def applicable(view: View) -> list[Obligation]:
+    """The obligations that apply in this observation."""
+    return [o for o in OBLIGATIONS if o.for_role(view.role) and o.applies(view)]
+
+
+def judge(view: View, action: dict[str, Any] | None) -> dict[str, bool | None]:
+    """Each applicable obligation -> whether the answer met it.
+
+    An invalid answer (``action`` None) misses every rule, except those whose
+    answers are counted only when they do what the rule is about.
+    """
+    return {
+        o.name: o.met(view, action) if action is not None else (None if o.aggregate else False)
+        for o in applicable(view)
+    }
