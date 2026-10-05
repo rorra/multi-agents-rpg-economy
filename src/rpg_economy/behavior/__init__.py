@@ -10,3 +10,29 @@ Run before any costly batch, after any change to prompts, the world or the
 model; the results file is evidence of how the agents behave, read by nothing
 in the experiment itself.
 """
+
+from rpg_economy.behavior.audit import AuditReport, audit_log
+from rpg_economy.behavior.cases import SITUATIONS, Situation
+from rpg_economy.behavior.obligations import OBLIGATIONS, Obligation, View
+from rpg_economy.behavior.runner import (
+    BehaviorReport,
+    CaseResult,
+    build_jobs,
+    estimate_behavior_cost,
+    run_behavior_check,
+)
+
+__all__ = [
+    "OBLIGATIONS",
+    "SITUATIONS",
+    "AuditReport",
+    "BehaviorReport",
+    "CaseResult",
+    "Obligation",
+    "Situation",
+    "View",
+    "audit_log",
+    "build_jobs",
+    "estimate_behavior_cost",
+    "run_behavior_check",
+]
