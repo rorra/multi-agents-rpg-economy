@@ -1,0 +1,556 @@
+"""Figures for the paper, drawn from finished run logs and the report's results.
+
+The report (``analysis.report``) carries the pre-registered contrasts and their
+three figures. This module adds the descriptive pictures a write-up needs: how
+prices, volumes, flows and wealth moved through base, shock and recovery in
+each condition, what each condition spent in tokens and calls, how the agents
+acted, and the per-seed spread behind each paired contrast.
+
+Two inputs, both read only: the run logs (time series the results file does not
+keep) and ``results.json`` written by ``rpg-economy report`` (the per-run
+metrics and the Kaplan-Meier estimates, so nothing here recomputes a metric the
+report owns). Every label resolves through ``i18n.t``, and each figure is
+written once per supported language, as PNG and PDF.
+
+Across seeds a series is summarised by its median with the interquartile range
+as a band: ten seeds are too few for a mean to say more than the median, and
+the band shows the spread a single line would hide. A window with fewer than
+``MIN_SEEDS`` runs carrying a value is left empty rather than drawn from one or
+two thin markets.
+"""
+
+from __future__ import annotations
+
+import json
+import statistics
+from collections import Counter, defaultdict
+from concurrent.futures import ProcessPoolExecutor
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+from rpg_economy.analysis.figures import (
+    CONDITION_COLOURS,
+    CONDITION_LINESTYLES,
+    GRID,
+    INK,
+    INK_MUTED,
+    _figure,
+    _style,
+)
+from rpg_economy.config.models import SimulationConfig
+from rpg_economy.i18n import t
+
+CONDITIONS = ("A", "B", "C")
+RESOURCES = ("iron", "wood", "leather", "herbs", "arcane_crystal")
+PRODUCTS = ("melee_weapon", "armor", "bow_gear", "staff_focus", "health_potion", "mana_potion")
+GOODS = RESOURCES + PRODUCTS
+PHASES = ("base", "shock", "recovery")
+TRIGGERS = (
+    "T1_message_received",
+    "T2_order_event",
+    "T3_price_move",
+    "T4_own_state_threshold",
+    "T5_inactivity",
+)
+TASKS = (
+    "ANALYZE_MARKET",
+    "EVALUATE_EXPEDITION",
+    "EVALUATE_PRODUCTION",
+    "MANAGE_PROCUREMENT",
+    "MANAGE_INVENTORY",
+    "ADDRESS_IMBALANCE",
+)
+ACTIONS = (
+    "buy",
+    "sell",
+    "place_orders",
+    "cancel_order",
+    "produce",
+    "start_expedition",
+    "equip",
+    "send_message",
+    "wait",
+)
+#: Ticks per point of a time series.
+WINDOW = 10
+#: Fewest runs with a value for a window's median to be drawn.
+MIN_SEEDS = 3
+FORMATS = ("png", "pdf")
+
+
+# ---------------------------------------------------------------------------
+# Extraction: one pass over each log
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class RunSeries:
+    """What one run log contributes to the figures, language-neutral."""
+
+    condition: str
+    seed: int
+    windows: int
+    #: good -> per window mean trade price (None when nothing traded).
+    price: dict[str, list[float | None]] = field(default_factory=dict)
+    #: per window units traded, all goods.
+    units: list[int] = field(default_factory=list)
+    #: per window traded value, all goods.
+    value: list[float] = field(default_factory=list)
+    #: role -> per window mean gold of that role's agents (last observed).
+    gold: dict[str, list[float | None]] = field(default_factory=dict)
+    #: per window Gini of every agent's last observed gold.
+    gini: list[float | None] = field(default_factory=list)
+    #: phase -> flow -> good -> units.
+    flows: dict[str, dict[str, dict[str, int]]] = field(default_factory=dict)
+    #: phase -> started / succeeded expeditions.
+    expeditions: dict[str, dict[str, int]] = field(default_factory=dict)
+    actions: dict[str, int] = field(default_factory=dict)
+    triggers: dict[str, int] = field(default_factory=dict)
+    tasks: dict[str, int] = field(default_factory=dict)
+    activations: int = 0
+    wasted: int = 0
+    invalid: int = 0
+    #: kind ("input"/"output") -> bucket -> tokens.
+    tokens: dict[str, dict[str, int]] = field(default_factory=dict)
+    calls: dict[str, int] = field(default_factory=dict)
+    #: role -> final gold of each agent.
+    final_gold: dict[str, list[float]] = field(default_factory=dict)
+
+    def to_payload(self) -> dict[str, Any]:
+        return self.__dict__.copy()
+
+
+def gini(values: list[float]) -> float | None:
+    """Gini coefficient of non-negative holdings (0 equal, towards 1 concentrated)."""
+    xs = sorted(max(0.0, v) for v in values)
+    n, total = len(xs), sum(xs)
+    if n < 2 or total <= 0:
+        return None
+    weighted = sum((i + 1) * x for i, x in enumerate(xs))
+    return (2 * weighted) / (n * total) - (n + 1) / n
+
+
+def extract(path: Path, shock_tick: int, reversion_tick: int, horizon: int) -> RunSeries:
+    """Read one log once and keep only what the figures draw."""
+    windows = (horizon + WINDOW - 1) // WINDOW
+
+    def phase(tick: int) -> str:
+        if tick < shock_tick:
+            return "base"
+        return "shock" if tick < reversion_tick else "recovery"
+
+    prices: dict[str, list[list[float]]] = {g: [[] for _ in range(windows)] for g in GOODS}
+    units = [0] * windows
+    value = [0.0] * windows
+    flows = {p: defaultdict(Counter) for p in PHASES}
+    expeditions = {p: Counter() for p in PHASES}
+    actions: Counter = Counter()
+    triggers: Counter = Counter()
+    tasks: Counter = Counter()
+    roles: dict[str, str] = {}
+    last_gold: dict[str, float] = {}
+    gold_by_window: dict[str, list[float | None]] = {
+        "adventurer": [None] * windows,
+        "artisan": [None] * windows,
+    }
+    gini_by_window: list[float | None] = [None] * windows
+    activations = wasted = invalid = 0
+    condition, seed = "", 0
+    tokens: dict[str, dict[str, int]] = {}
+    calls: dict[str, int] = {}
+    final_gold: dict[str, list[float]] = {}
+    current_window = 0
+
+    def close_window(w: int) -> None:
+        for role in gold_by_window:
+            held = [g for a, g in last_gold.items() if roles.get(a) == role]
+            gold_by_window[role][w] = statistics.fmean(held) if held else None
+        gini_by_window[w] = gini(list(last_gold.values()))
+
+    with path.open(encoding="utf-8") as handle:
+        for line in handle:
+            event = json.loads(line)
+            kind = event["type"]
+            tick = event.get("tick") or 0
+            payload = event.get("payload") or {}
+            w = min(tick // WINDOW, windows - 1)
+            while current_window < w:
+                close_window(current_window)
+                current_window += 1
+            match kind:
+                case "run_metadata":
+                    condition, seed = payload["condition"], int(payload["seed"])
+                case "trade_executed":
+                    prices[payload["good"]][w].append(float(payload["price"]))
+                    units[w] += int(payload["quantity"])
+                    value[w] += float(payload["value"])
+                    if payload.get("buyer_role") == "adventurer" and payload["good"] in PRODUCTS:
+                        flows[phase(tick)]["bought"][payload["good"]] += int(payload["quantity"])
+                case "expedition_started":
+                    expeditions[phase(tick)]["started"] += 1
+                case "expedition_resolved":
+                    if payload.get("outcome") == "success":
+                        expeditions[phase(tick)]["succeeded"] += 1
+                    for good, qty in (payload.get("yielded") or {}).items():
+                        flows[phase(tick)]["gathered"][good] += int(qty)
+                case "production_completed":
+                    flows[phase(tick)]["made"][payload["product"]] += int(payload["quantity"])
+                    for good, qty in payload["consumed"].items():
+                        flows[phase(tick)]["used"][good] += int(qty)
+                case "consumption":
+                    flows[phase(tick)]["consumed"][payload["product"]] += int(payload["quantity"])
+                case "observation_delivered":
+                    obs = payload["observation"]
+                    roles[obs["agent_id"]] = obs["role"]
+                    last_gold[obs["agent_id"]] = float(obs["gold"])
+                case "agent_output":
+                    activations += 1
+                case "activation_wasted":
+                    wasted += 1
+                case "agent_output_invalid":
+                    invalid += 1
+                case "action_executed":
+                    actions[payload["action"]] += 1
+                case "trigger_fired":
+                    triggers[payload["trigger"]] += 1
+                case "director_task_assigned":
+                    tasks[payload["type"]] += 1
+                case "tokens_consumed":
+                    tokens = {"input": dict(payload["input"]), "output": dict(payload["output"])}
+                    calls = dict(payload["calls"])
+                case "run_end":
+                    for agent, held in payload["holdings"].items():
+                        final_gold.setdefault(held["role"], []).append(float(held["gold"]))
+                        roles[agent] = held["role"]
+                        last_gold[agent] = float(held["gold"])
+    while current_window < windows:
+        close_window(current_window)
+        current_window += 1
+
+    return RunSeries(
+        condition=condition,
+        seed=seed,
+        windows=windows,
+        price={g: [statistics.fmean(v) if v else None for v in prices[g]] for g in GOODS},
+        units=units,
+        value=value,
+        gold=gold_by_window,
+        gini=gini_by_window,
+        flows={p: {k: dict(v) for k, v in flows[p].items()} for p in PHASES},
+        expeditions={p: dict(expeditions[p]) for p in PHASES},
+        actions=dict(actions),
+        triggers=dict(triggers),
+        tasks=dict(tasks),
+        activations=activations,
+        wasted=wasted,
+        invalid=invalid,
+        tokens=tokens,
+        calls=calls,
+        final_gold=final_gold,
+    )
+
+
+def extract_all(logs: list[Path], config: SimulationConfig, *, workers: int = 8) -> list[RunSeries]:
+    """Extract every log, in parallel: each is an independent read."""
+    args = (config.phases.shock_tick, config.phases.reversion_tick, config.time.horizon_ticks)
+    with ProcessPoolExecutor(max_workers=max(1, workers)) as pool:
+        futures = [pool.submit(extract, path, *args) for path in logs]
+        return [f.result() for f in futures]
+
+
+# ---------------------------------------------------------------------------
+# Summaries across seeds
+# ---------------------------------------------------------------------------
+
+
+def _quantiles(values: list[float]) -> tuple[float, float, float] | None:
+    if len(values) < MIN_SEEDS:
+        return None
+    q1, median, q3 = statistics.quantiles(values, n=4, method="inclusive")
+    return q1, median, q3
+
+
+def band(
+    series: list[list[float | None]],
+) -> tuple[list[float | None], list[float | None], list[float | None]]:
+    """Per window median and interquartile range across runs."""
+    width = max((len(s) for s in series), default=0)
+    lo: list[float | None] = []
+    mid: list[float | None] = []
+    hi: list[float | None] = []
+    for w in range(width):
+        q = _quantiles([s[w] for s in series if w < len(s) and s[w] is not None])
+        lo.append(q[0] if q else None)
+        mid.append(q[1] if q else None)
+        hi.append(q[2] if q else None)
+    return lo, mid, hi
+
+
+def by_condition(runs: list[RunSeries]) -> dict[str, list[RunSeries]]:
+    grouped: dict[str, list[RunSeries]] = {c: [] for c in CONDITIONS}
+    for run in runs:
+        grouped.setdefault(run.condition, []).append(run)
+    for group in grouped.values():
+        group.sort(key=lambda r: r.seed)
+    return grouped
+
+
+def _median(values: list[float]) -> float:
+    return statistics.median(values) if values else 0.0
+
+
+# ---------------------------------------------------------------------------
+# Drawing helpers
+# ---------------------------------------------------------------------------
+
+
+def _save(fig, out: Path, name: str, *, layout: bool = True) -> list[Path]:
+    out.mkdir(parents=True, exist_ok=True)
+    if layout:  # figures that reserve room for a figure-level legend lay out themselves
+        fig.tight_layout()
+    paths = []
+    for fmt in FORMATS:
+        path = out / f"{name}.{fmt}"
+        fig.savefig(path, facecolor="white", dpi=200)
+        paths.append(path)
+    _figure().close(fig)
+    return paths
+
+
+def _shade(ax, config: SimulationConfig) -> None:
+    """The shock interval as a recessive band, in tick units."""
+    ax.axvspan(
+        config.phases.shock_tick, config.phases.reversion_tick, color=GRID, alpha=0.7, linewidth=0
+    )
+
+
+def _legend(ax, *, below: bool = True, ncols: int = 3) -> None:
+    if not ax.get_legend_handles_labels()[0]:
+        return
+    if below:
+        ax.legend(
+            frameon=False,
+            fontsize=8,
+            labelcolor=INK_MUTED,
+            ncols=ncols,
+            loc="upper center",
+            bbox_to_anchor=(0.5, -0.2),
+        )
+    else:
+        ax.legend(frameon=False, fontsize=8, labelcolor=INK_MUTED)
+
+
+def _title(ax, key: str, **kwargs: Any) -> None:
+    ax.set_title(t(key, **kwargs), fontsize=10.5, loc="left", color=INK)
+
+
+def _ticks(width: int) -> list[float]:
+    """Window index to the tick at its centre."""
+    return [w * WINDOW + WINDOW / 2 for w in range(width)]
+
+
+def _band_lines(ax, grouped: dict[str, list[list[float | None]]], *, label: bool = True) -> None:
+    for condition in CONDITIONS:
+        series = grouped.get(condition) or []
+        if not series:
+            continue
+        lo, mid, hi = band(series)
+        xs = _ticks(len(mid))
+        colour = CONDITION_COLOURS[condition]
+        pts = [(x, a, b, c) for x, a, b, c in zip(xs, lo, mid, hi, strict=True) if b is not None]
+        if not pts:
+            continue
+        ax.fill_between(
+            [p[0] for p in pts],
+            [p[1] for p in pts],
+            [p[3] for p in pts],
+            color=colour,
+            alpha=0.14,
+            linewidth=0,
+        )
+        ax.plot(
+            [p[0] for p in pts],
+            [p[2] for p in pts],
+            color=colour,
+            linestyle=CONDITION_LINESTYLES[condition],
+            linewidth=1.9,
+            label=t(f"condition.{condition}") if label else None,
+        )
+
+
+def good_label(good: str) -> str:
+    return t(f"resource.{good}") if good in RESOURCES else t(f"product.{good}")
+
+
+# ---------------------------------------------------------------------------
+# Figures
+# ---------------------------------------------------------------------------
+
+
+def fig_price(
+    runs: list[RunSeries], config: SimulationConfig, good: str, out: Path, name: str
+) -> list[Path]:
+    """One good's trade price over time: median and IQR across seeds, guide price dashed."""
+    plt = _figure()
+    fig, ax = plt.subplots(figsize=(8, 4.0))
+    _style(ax)
+    _shade(ax, config)
+    grouped = by_condition(runs)
+    _band_lines(ax, {c: [r.price[good] for r in rs] for c, rs in grouped.items()})
+    guide = config.economy.initial_reference_price.get(good)
+    if guide is not None:
+        ax.axhline(
+            float(guide),
+            color=INK_MUTED,
+            linewidth=1,
+            linestyle=(0, (4, 3)),
+            label=t("paper.label.guide_price"),
+        )
+    _title(ax, "paper.figure.price", good=good_label(good))
+    ax.set_xlabel(t("axis.tick"))
+    ax.set_ylabel(t("axis.price"))
+    _legend(ax, ncols=4)
+    return _save(fig, out, name)
+
+
+def fig_price_index(runs: list[RunSeries], config: SimulationConfig, out: Path) -> list[Path]:
+    """Every good's price relative to its guide price, averaged over the goods traded."""
+    plt = _figure()
+    fig, ax = plt.subplots(figsize=(8, 4.0))
+    _style(ax)
+    _shade(ax, config)
+    guide = {g: float(config.economy.initial_reference_price[g]) for g in GOODS}
+
+    def index(run: RunSeries) -> list[float | None]:
+        out_: list[float | None] = []
+        for w in range(run.windows):
+            ratios = [run.price[g][w] / guide[g] for g in GOODS if run.price[g][w] is not None]
+            out_.append(statistics.fmean(ratios) if ratios else None)
+        return out_
+
+    grouped = by_condition(runs)
+    _band_lines(ax, {c: [index(r) for r in rs] for c, rs in grouped.items()})
+    ax.axhline(1.0, color=INK_MUTED, linewidth=1, linestyle=(0, (4, 3)))
+    _title(ax, "paper.figure.price_index")
+    ax.set_xlabel(t("axis.tick"))
+    ax.set_ylabel(t("paper.axis.price_over_guide"))
+    _legend(ax)
+    return _save(fig, out, "03_price_index_all_goods")
+
+
+def fig_price_grid(runs: list[RunSeries], config: SimulationConfig, out: Path) -> list[Path]:
+    """Small multiples: every good's median price, one panel per good."""
+    plt = _figure()
+    fig, axes = plt.subplots(4, 3, figsize=(10, 10), sharex=True)
+    grouped = by_condition(runs)
+    for ax, good in zip(axes.flat, GOODS, strict=False):
+        _style(ax)
+        _shade(ax, config)
+        _band_lines(
+            ax,
+            {c: [r.price[good] for r in rs] for c, rs in grouped.items()},
+            label=good == GOODS[0],
+        )
+        ax.axhline(
+            float(config.economy.initial_reference_price[good]),
+            color=INK_MUTED,
+            linewidth=0.8,
+            linestyle=(0, (4, 3)),
+        )
+        ax.set_title(good_label(good), fontsize=9, loc="left", color=INK)
+    axes.flat[-1].axis("off")
+    handles, labels = axes.flat[0].get_legend_handles_labels()
+    axes.flat[-1].legend(
+        handles, labels, frameon=False, fontsize=9, labelcolor=INK_MUTED, loc="center"
+    )
+    fig.suptitle(t("paper.figure.price_grid"), x=0.02, ha="left", fontsize=11, color=INK)
+    for ax in axes[-1]:
+        ax.set_xlabel(t("axis.tick"))
+    return _save(fig, out, "04_price_every_good")
+
+
+def fig_seed_panels(
+    runs: list[RunSeries], config: SimulationConfig, good: str, out: Path, name: str
+) -> list[Path]:
+    """The shocked good's price in every seed, the three conditions overlaid."""
+    plt = _figure()
+    grouped = by_condition(runs)
+    seeds = sorted({r.seed for r in runs})
+    cols = 5
+    rows = (len(seeds) + cols - 1) // cols
+    fig, axes = plt.subplots(rows, cols, figsize=(12, 2.6 * rows), sharex=True, sharey=True)
+    flat = list(axes.flat) if hasattr(axes, "flat") else [axes]
+    for ax, seed in zip(flat, seeds, strict=False):
+        _style(ax)
+        _shade(ax, config)
+        for condition in CONDITIONS:
+            run = next((r for r in grouped.get(condition, []) if r.seed == seed), None)
+            if run is None:
+                continue
+            series = run.price[good]
+            pts = [
+                (x, v) for x, v in zip(_ticks(len(series)), series, strict=True) if v is not None
+            ]
+            ax.plot(
+                [p[0] for p in pts],
+                [p[1] for p in pts],
+                color=CONDITION_COLOURS[condition],
+                linestyle=CONDITION_LINESTYLES[condition],
+                linewidth=1.4,
+                label=t(f"condition.{condition}") if seed == seeds[0] else None,
+            )
+        ax.set_title(t("paper.label.seed", seed=seed), fontsize=9, loc="left", color=INK)
+    for ax in flat[len(seeds) :]:
+        ax.axis("off")
+    fig.suptitle(
+        t("paper.figure.seed_panels", good=good_label(good)),
+        x=0.02,
+        ha="left",
+        fontsize=11,
+        color=INK,
+    )
+    fig.legend(
+        *flat[0].get_legend_handles_labels(),
+        frameon=False,
+        fontsize=9,
+        labelcolor=INK_MUTED,
+        ncols=3,
+        loc="lower center",
+    )
+    fig.tight_layout(rect=(0, 0.06, 1, 0.96))
+    return _save(fig, out, name, layout=False)
+
+
+def fig_volume(runs: list[RunSeries], config: SimulationConfig, out: Path) -> list[Path]:
+    """Units traded per window, all goods."""
+    plt = _figure()
+    fig, ax = plt.subplots(figsize=(8, 4.0))
+    _style(ax)
+    _shade(ax, config)
+    grouped = by_condition(runs)
+    _band_lines(ax, {c: [[float(u) for u in r.units] for r in rs] for c, rs in grouped.items()})
+    _title(ax, "paper.figure.volume", window=WINDOW)
+    ax.set_xlabel(t("axis.tick"))
+    ax.set_ylabel(t("paper.axis.units"))
+    _legend(ax)
+    return _save(fig, out, "07_traded_units")
+
+
+def _grouped_bars(
+    ax, categories: list[str], values: dict[str, list[float]], labels: list[str]
+) -> None:
+    width = 0.8 / len(CONDITIONS)
+    for i, condition in enumerate(CONDITIONS):
+        xs = [k + (i - 1) * width for k in range(len(categories))]
+        ax.bar(
+            xs,
+            values[condition],
+            width=width * 0.95,
+            color=CONDITION_COLOURS[condition],
+            label=t(f"condition.{condition}"),
+            edgecolor="white",
+            linewidth=0.6,
+        )
+    ax.set_xticks(range(len(categories)))
+    ax.set_xticklabels(labels, fontsize=8.5)
