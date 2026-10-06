@@ -1,0 +1,6 @@
+# The final campaign at reduced scope: resource_scarcity under Experiment 1
+# only, on ten final seeds.
+campaign:
+  primary_only: true
+seeds:
+  final: [2001, 2002, 2003, 2004, 2005, 2006, 2007, 2008, 2009, 2010]
