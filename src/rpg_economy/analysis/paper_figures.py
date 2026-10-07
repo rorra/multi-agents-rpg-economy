@@ -39,7 +39,7 @@ from rpg_economy.analysis.figures import (
     _style,
 )
 from rpg_economy.config.models import SimulationConfig
-from rpg_economy.i18n import format_number, t
+from rpg_economy.i18n import SUPPORTED_LOCALES, format_number, get_catalog, set_locale, t
 
 CONDITIONS = ("A", "B", "C")
 RESOURCES = ("iron", "wood", "leather", "herbs", "arcane_crystal")
@@ -1091,3 +1091,195 @@ def _dig(run: dict[str, Any], path: tuple[str, ...]) -> float | None:
         return float(value) if value is not None else None
     except TypeError, ValueError:
         return None
+
+
+def fig_paired(results: dict[str, Any], out: Path) -> list[Path]:
+    """Each seed's value in A, B and C joined by a line: the pairing the tests use."""
+    plt = _figure()
+    runs = results.get("runs", [])
+    seeds = sorted({r["seed"] for r in runs})
+    cols = 3
+    rows = (len(PAIRED_METRICS) + cols - 1) // cols
+    fig, axes = plt.subplots(rows, cols, figsize=(12, 3.4 * rows))
+    for ax, (path, key) in zip(axes.flat, PAIRED_METRICS, strict=False):
+        _style(ax)
+        values = {c: [] for c in CONDITIONS}
+        for seed in seeds:
+            row = []
+            for condition in CONDITIONS:
+                run = next(
+                    (r for r in runs if r["seed"] == seed and r["condition"] == condition), None
+                )
+                value = _dig(run, path) if run else None
+                if value is not None and path[0] == "tokens":
+                    value /= 1e6
+                row.append(value)
+            xs = [i for i, v in enumerate(row) if v is not None]
+            ax.plot(xs, [row[i] for i in xs], color=GRID, linewidth=1.0, zorder=1)
+            for i, v in enumerate(row):
+                if v is not None:
+                    values[CONDITIONS[i]].append(v)
+        _strip(ax, values)
+        ax.set_title(t(key), fontsize=9, loc="left", color=INK, wrap=True)
+    for ax in list(axes.flat)[len(PAIRED_METRICS) :]:
+        ax.axis("off")
+    fig.suptitle(t("paper.figure.paired"), x=0.02, ha="left", fontsize=11, color=INK)
+    return _save(fig, out, "21_paired_metrics_per_seed")
+
+
+def fig_volatility_phases(results: dict[str, Any], out: Path, good: str) -> list[Path]:
+    """The target good's volatility in each phase (phase level), every run a point."""
+    plt = _figure()
+    runs = results.get("runs", [])
+    fig, axes = plt.subplots(1, 3, figsize=(12, 3.6), sharey=True)
+    for ax, p in zip(axes, PHASES, strict=True):
+        _style(ax)
+        _strip(
+            ax,
+            {
+                c: [
+                    v
+                    for r in runs
+                    if r["condition"] == c
+                    if (v := _dig(r, ("volatility_phase", p))) is not None
+                ]
+                for c in CONDITIONS
+            },
+        )
+        ax.set_title(t(f"phase.{p}"), fontsize=10, loc="left", color=INK)
+    axes[0].set_ylabel(t("paper.axis.volatility"))
+    fig.suptitle(
+        t("paper.figure.volatility_phases", good=good_label(good)),
+        x=0.02,
+        ha="left",
+        fontsize=11,
+        color=INK,
+    )
+    return _save(fig, out, "22_volatility_by_phase")
+
+
+def fig_peak(
+    runs: list[RunSeries], config: SimulationConfig, out: Path, good: str, product: str
+) -> list[Path]:
+    """Peak price after the shock relative to the run's own base mean."""
+    plt = _figure()
+    fig, axes = plt.subplots(1, 2, figsize=(10, 3.8))
+    grouped = by_condition(runs)
+    base_lo = config.phases.shock_tick // 2 // WINDOW
+    base_hi = config.phases.shock_tick // WINDOW
+    shock_lo = config.phases.shock_tick // WINDOW
+    for ax, item in zip(axes, (good, product), strict=True):
+        _style(ax)
+        values: dict[str, list[float]] = {}
+        for c in CONDITIONS:
+            out_ = []
+            for r in grouped[c]:
+                base = [v for v in r.price[item][base_lo:base_hi] if v is not None]
+                after = [v for v in r.price[item][shock_lo:] if v is not None]
+                if base and after:
+                    out_.append(max(after) / statistics.fmean(base))
+            values[c] = out_
+        _strip(ax, values)
+        ax.axhline(1.0, color=INK_MUTED, linewidth=1, linestyle=(0, (4, 3)))
+        ax.set_title(good_label(item), fontsize=10, loc="left", color=INK)
+    axes[0].set_ylabel(t("paper.axis.peak_over_base"))
+    fig.suptitle(t("paper.figure.peak"), x=0.02, ha="left", fontsize=11, color=INK)
+    return _save(fig, out, "05_peak_price_over_base")
+
+
+def fig_cost_vs_outcome(results: dict[str, Any], out: Path) -> list[Path]:
+    """Tokens spent against the shock-phase volatility of the target, one point per run."""
+    plt = _figure()
+    fig, ax = plt.subplots(figsize=(7, 4.0))
+    _style(ax)
+    for condition in CONDITIONS:
+        pts = [
+            (x / 1e6, y)
+            for r in results.get("runs", [])
+            if r["condition"] == condition
+            if (x := _dig(r, ("tokens", "authoritative_total"))) is not None
+            if (y := _dig(r, ("volatility_phase", "shock"))) is not None
+        ]
+        ax.scatter(
+            [p[0] for p in pts],
+            [p[1] for p in pts],
+            s=34,
+            color=CONDITION_COLOURS[condition],
+            edgecolor="white",
+            linewidth=0.8,
+            label=t(f"condition.{condition}"),
+        )
+    _title(ax, "paper.figure.cost_vs_outcome")
+    ax.set_xlabel(t("paper.axis.million_tokens"))
+    ax.set_ylabel(t("paper.metric.volatility_shock"))
+    _legend(ax, below=False)
+    return _save(fig, out, "23_tokens_vs_volatility")
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+
+def render_locale(
+    runs: list[RunSeries],
+    results: dict[str, Any],
+    config: SimulationConfig,
+    out: Path,
+) -> list[Path]:
+    """Every figure in the active language."""
+    first = (results.get("runs") or [{}])[0]
+    good = first.get("target_good") or "herbs"
+    product = (first.get("propagation") or {}).get("good") or "health_potion"
+    paths: list[Path] = []
+    paths += fig_price(runs, config, good, out, "01_price_target")
+    paths += fig_price(runs, config, product, out, "02_price_product")
+    paths += fig_price_index(runs, config, out)
+    paths += fig_price_grid(runs, config, out)
+    paths += fig_peak(runs, config, out, good, product)
+    paths += fig_seed_panels(runs, config, good, out, "06_price_target_per_seed")
+    paths += fig_seed_panels(runs, config, product, out, "06b_price_product_per_seed")
+    paths += fig_volume(runs, config, out)
+    paths += fig_flows(runs, out, good, product)
+    paths += fig_production(runs, out)
+    paths += fig_expeditions(runs, out)
+    paths += fig_gold(runs, config, out)
+    paths += fig_gini(runs, config, out)
+    paths += fig_final_gold(runs, out)
+    paths += fig_tokens(runs, out)
+    paths += fig_calls(runs, out)
+    paths += fig_activations(runs, out)
+    paths += fig_actions(runs, out)
+    paths += fig_orchestration(runs, out)
+    paths += fig_survival(results, out, good, product)
+    paths += fig_recovery_grid(results, out, good, product)
+    paths += fig_paired(results, out)
+    paths += fig_volatility_phases(results, out, good)
+    paths += fig_cost_vs_outcome(results, out)
+    return paths
+
+
+def generate(
+    logs: list[Path],
+    results_path: Path,
+    config: SimulationConfig,
+    out: Path,
+    *,
+    workers: int = 8,
+) -> dict[str, list[Path]]:
+    """Extract the logs once, then draw every figure in every supported language."""
+    results = json.loads(results_path.read_text(encoding="utf-8"))
+    runs = [r for r in extract_all(logs, config, workers=workers) if r.condition in CONDITIONS]
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "series.json").write_text(
+        json.dumps([r.to_payload() for r in runs], separators=(",", ":")), encoding="utf-8"
+    )
+    active = get_catalog().locale
+    try:
+        written = {}
+        for locale in SUPPORTED_LOCALES:
+            set_locale(locale)
+            written[locale] = render_locale(runs, results, config, out / locale)
+        return written
+    finally:
+        set_locale(active)
