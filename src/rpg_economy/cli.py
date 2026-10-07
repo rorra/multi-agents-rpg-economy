@@ -16,9 +16,10 @@ from decimal import Decimal
 from pathlib import Path
 
 from rpg_economy.campaign.interrupt import Interrupt
+from rpg_economy.config import config_hash, load_config
 from rpg_economy.config.models import SimulationConfig
 from rpg_economy.domain import Condition, ExperimentRegime
-from rpg_economy.i18n import SUPPORTED_LOCALES, format_number, t
+from rpg_economy.i18n import SUPPORTED_LOCALES, format_number, set_locale, t
 
 DEFAULT_CONFIG = Path("configs/base.yaml")
 
@@ -1169,3 +1170,326 @@ def _smoke_worst_case(config: SimulationConfig) -> Decimal:
         Decimal(worst_input) / 1_000_000 * pricing.input_per_1m_tokens
         + Decimal(worst_output) / 1_000_000 * pricing.output_per_1m_tokens
     ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+
+def _derisk_run(
+    config: SimulationConfig,
+    models: tuple[str, ...],
+    root: Path,
+    *,
+    horizon: int,
+    seed: int,
+    interrupt: Interrupt | None = None,
+) -> int:
+    """Run each de-risk arm in ``models``; 0 when every one finished and passed the gate.
+
+    After a first Ctrl-C (``interrupt``) no further arm starts; the running
+    one finishes and is kept.
+    """
+    # Condition-level parallelism (IMPLEMENTATION.md section 5): the trio's
+    # critical path is otherwise A + B + C in series, and A alone is the
+    # longest run.
+    from rpg_economy.campaign.derisk import derisk_config
+    from rpg_economy.campaign.parallel import run_trio_parallel
+    from rpg_economy.campaign.runner import set_aside_previous
+    from rpg_economy.integrity import TrioIntegrityError
+    from rpg_economy.llm import ProviderError
+    from rpg_economy.logging_ import LogError
+    from rpg_economy.runner import RunInterrupted
+
+    interrupt = interrupt if interrupt is not None else Interrupt()
+    for model in models:
+        if interrupt.should_stop():
+            return _stopped(root)
+        arm = _derisk_arm(derisk_config(config, model=model, horizon=horizon), seed)
+        destination = root / model
+        print(t("cli.derisk.running", model=model))
+        try:
+            # Anything left from an unfinished attempt is set aside, never
+            # appended to: run logs are write-once.
+            set_aside_previous(destination)
+            run_trio_parallel(arm, destination, seed=seed, interrupt=interrupt)
+        except RunInterrupted:
+            return _stopped(root)
+        except ProviderError as exc:
+            print(t("error.provider.failed", detail=str(exc)), file=sys.stderr)
+            return 8
+        except (LogError, OSError, TrioIntegrityError) as exc:
+            return _unusable_run(exc, destination)
+    return 0
+
+
+def _derisk_arm(arm: SimulationConfig, seed: int) -> SimulationConfig:
+    """One model's arm as the cell it runs: its own scenario and experiment, at ``seed``."""
+    return arm.for_cell(scenario=arm.run.scenario, experiment=arm.run.experiment, seed=seed)
+
+
+def _parse_model_pricing(spec: str | None) -> dict[str, tuple[Decimal, Decimal]]:
+    """Parse `model=in/out,model=in/out` into per-model $/1M prices.
+
+    The comparison model is deliberately absent from the configuration -- only
+    the configured model's price belongs there -- so its rate is supplied here.
+    Without this, pricing a gpt-5-mini arm at the configured model's rate would
+    understate it fivefold.
+    """
+    table: dict[str, tuple[Decimal, Decimal]] = {}
+    for part in (spec or "").split(","):
+        if not part.strip():
+            continue
+        name, _, rates = part.partition("=")
+        inp, _, out = rates.partition("/")
+        # Decimal raises InvalidOperation on a malformed rate; the caller reports it.
+        table[name.strip()] = (Decimal(inp.strip()), Decimal(out.strip()))
+    return table
+
+
+def _summed_estimates(estimates: list, *, model: str):
+    """Several estimates in one currency as one: every amount and count added."""
+    from rpg_economy.campaign.cost import CostEstimate
+
+    first = estimates[0]
+    worst = [e.worst_case for e in estimates]
+    return CostEstimate(
+        currency=first.currency,
+        quoted_on=first.quoted_on,
+        model=model,
+        total_runs=sum(e.total_runs for e in estimates),
+        input_tokens=sum(e.input_tokens for e in estimates),
+        output_tokens=sum(e.output_tokens for e in estimates),
+        input_cost=sum((e.input_cost for e in estimates), Decimal(0)),
+        output_cost=sum((e.output_cost for e in estimates), Decimal(0)),
+        upper_bound=sum((e.upper_bound for e in estimates), Decimal(0)),
+        worst_case=None if None in worst else sum(worst, Decimal(0)),
+        retry_attempts=max(e.retry_attempts for e in estimates),
+        extrapolated_cells=list(dict.fromkeys(c for e in estimates for c in e.extrapolated_cells)),
+        warnings=list(dict.fromkeys(w for e in estimates for w in e.warnings)),
+    )
+
+
+def _replay(
+    source: Path,
+    out: Path | None,
+    *,
+    locale: str,
+    good: str | None,
+    all_locales: bool,
+    config: object | None = None,
+) -> int:
+    """Render a replay page from a trio directory or a single run log.
+
+    ``config`` feeds the crafting guide at the bottom of the page, and only if
+    it is proven to be the configuration the runs used.
+    """
+    from rpg_economy.dashboard.html import write_replay
+    from rpg_economy.dashboard.replay import build_bundle, trio_logs, world_rules
+
+    try:
+        paths = trio_logs(source) if source.is_dir() else [source]
+        bundle = build_bundle(paths)
+    except (OSError, ValueError) as exc:
+        print(t("error.dashboard.unreadable", detail=str(exc)), file=sys.stderr)
+        return 6
+
+    if config is not None:
+        bundle.rules = world_rules(bundle, config)
+    if bundle.rules is None:
+        print(t("cli.replay.no_rules"), file=sys.stderr)
+
+    from rpg_economy.i18n import SUPPORTED_LOCALES
+
+    locales = SUPPORTED_LOCALES if all_locales else (locale,)
+    destination = out or Path("reports")
+
+    for name in locales:
+        # One page per language, from one bundle: the timeline is
+        # language-neutral and only the labels differ.
+        path = (
+            destination / name / "replay.html"
+            if all_locales or destination.suffix != ".html"
+            else destination
+        )
+        written = write_replay(bundle, path, locale=name, focus_good=good)
+        print(t("cli.replay.written", locale=locale, path=str(written), lang=name))
+
+    # Rendering switches the active locale per page; restore the caller's.
+    set_locale(locale)
+    return 0
+
+
+#: Past configurations, kept so that older run logs can still be rebuilt.
+HISTORY_DIR = Path("configs/history")
+
+
+def _behavior_check(
+    config: SimulationConfig,
+    *,
+    reps: int,
+    only: str | None,
+    workers: int,
+    out: Path | None,
+    confirm_cost: str | None,
+    spend_limit_set: bool,
+    logs: list[Path] | None = None,
+    moments: int = 3,
+    base: SimulationConfig | None = None,
+) -> int:
+    """Ask the real model in every behaviour situation, and judge each answer.
+
+    The built situations, plus with --from-log the moments of a real run where
+    an obligation was missed (up to --moments per obligation), rebuilt with
+    today's prompts. Without --real this prices the check and lists it. A real
+    check passes the same gate as any real spend: priced first, the total
+    confirmed by value, and a provider-side spend limit acknowledged. Exits 0
+    when every obligation meets its threshold in every situation and invalid
+    answers stay under the limit, 7 otherwise.
+    """
+    import json
+    from datetime import UTC, datetime
+
+    from rpg_economy.agents.prompts import PROMPT_VERSION
+    from rpg_economy.behavior import (
+        SITUATIONS,
+        audit_log,
+        build_jobs,
+        estimate_behavior_cost,
+        run_behavior_check,
+    )
+    from rpg_economy.behavior.obligations import BY_NAME as OBLIGATIONS_BY_NAME
+    from rpg_economy.behavior.replay import ReplayError, pick_moments, replay_jobs
+    from rpg_economy.llm.client import build_client
+
+    situations = SITUATIONS
+    if only:
+        names = [name.strip() for name in only.split(",") if name.strip()]
+        known = {s.name for s in SITUATIONS}
+        unknown = [n for n in names if not any(k == n or k.startswith(n + ":") for k in known)]
+        if unknown:
+            print(t("error.behavior.unknown_case", names=", ".join(unknown)), file=sys.stderr)
+            return 2
+        situations = [
+            s for s in SITUATIONS if any(s.name == n or s.name.startswith(n + ":") for n in names)
+        ]
+    if reps < 1:
+        print(t("error.behavior.reps"), file=sys.stderr)
+        return 2
+    if config.llm.pricing is None:
+        print(t("error.campaign.invalid", detail=t("error.cost.no_pricing")), file=sys.stderr)
+        return 4
+
+    jobs = build_jobs(config, situations)
+    # Past configurations a log may have been made under (configs/history).
+    earlier = tuple(
+        load_config(DEFAULT_CONFIG, layers=[layer])
+        for layer in sorted(HISTORY_DIR.glob("*.yaml"))
+        if logs
+    )
+    for log in logs or []:
+        label = f"{log.parts[-6]}-{log.stem}" if len(log.parts) > 5 else log.stem
+        try:
+            audit = audit_log(log, base or config)
+            jobs += replay_jobs(
+                log,
+                base or config,
+                pick_moments(audit, moments),
+                label=label,
+                earlier=earlier,
+            )
+        except (OSError, ReplayError) as exc:
+            print(t("error.behavior.replay", log=str(log), detail=str(exc)), file=sys.stderr)
+            return 2
+    estimate = estimate_behavior_cost(jobs, reps, config.llm.pricing)
+    print(t("cli.behavior.header", cases=len(situations), jobs=len(jobs), reps=reps))
+    print(
+        t(
+            "cli.behavior.cost",
+            total=estimate["total_cost"],
+            currency=estimate["currency"],
+            calls=estimate["calls"],
+            input=format_number(estimate["input_tokens"]),
+            output=format_number(estimate["output_tokens"]),
+        )
+    )
+    if config.llm.mock:
+        for job in jobs:
+            print(
+                t(
+                    "cli.behavior.listed",
+                    case=job.name,
+                    condition=job.condition.value,
+                    obligations=", ".join(job.obligations()),
+                )
+            )
+        print(t("cli.behavior.dry_run"))
+        return 0
+    if not spend_limit_set:
+        print(t("error.derisk.no_spend_limit"), file=sys.stderr)
+        return 5
+    if confirm_cost != str(estimate["total_cost"]):
+        print(
+            t(
+                "error.behavior.unconfirmed",
+                total=str(estimate["total_cost"]),
+                currency=estimate["currency"],
+            ),
+            file=sys.stderr,
+        )
+        return 5
+
+    report = run_behavior_check(jobs, build_client(config.llm), reps, workers=workers)
+    for result in report.results:
+        failing = ", ".join(
+            f"{name} {result.met(name)}/{len(result.answers)}" for name in result.failing
+        )
+        print(
+            t(
+                "cli.behavior.case",
+                case=result.case,
+                condition=result.condition,
+                status=t("cli.behavior.pass" if result.passed else "cli.behavior.fail"),
+                failing=failing or "-",
+            )
+        )
+    print(t("cli.behavior.by_obligation"))
+    for name, entry in report.by_obligation().items():
+        print(
+            t(
+                "cli.behavior.obligation_total"
+                if name in OBLIGATIONS_BY_NAME and OBLIGATIONS_BY_NAME[name].aggregate
+                else "cli.behavior.obligation",
+                status=t(
+                    "cli.behavior.fail"
+                    if name in report.failing_aggregates
+                    else "cli.behavior.pass"
+                ),
+                name=name,
+                met=entry["met"],
+                answers=entry["answers"],
+                share=f"{entry['met'] / entry['answers']:.0%}" if entry["answers"] else "-",
+                failed=entry["failed"],
+                jobs=entry["jobs"],
+            )
+        )
+    print(
+        t(
+            "cli.behavior.summary",
+            invalid=f"{report.invalid_share:.1%}",
+            status=t("cli.behavior.pass" if report.passed else "cli.behavior.fail"),
+            input=format_number(report.input_tokens),
+            output=format_number(report.output_tokens),
+        )
+    )
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    path = out or Path("runs") / "behavior" / f"behavior-{stamp}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "created_at": stamp,
+        "prompt_version": PROMPT_VERSION,
+        "config_hash": config_hash(config),
+        "model_snapshot": config.llm.model_snapshot,
+        "reasoning_effort": config.llm.reasoning_effort,
+        "logs": [str(log) for log in logs or []],
+        **report.to_payload(),
+    }
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    print(t("cli.behavior.written", path=str(path)))
+    return 0 if report.passed else 7
