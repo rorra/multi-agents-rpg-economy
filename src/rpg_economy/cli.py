@@ -9,13 +9,15 @@ before the parser exists.
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from collections.abc import Callable, Sequence
+from decimal import Decimal
 from pathlib import Path
 
 from rpg_economy.campaign.interrupt import Interrupt
 from rpg_economy.config.models import SimulationConfig
-from rpg_economy.domain import ExperimentRegime
+from rpg_economy.domain import Condition, ExperimentRegime
 from rpg_economy.i18n import SUPPORTED_LOCALES, format_number, t
 
 DEFAULT_CONFIG = Path("configs/base.yaml")
@@ -874,3 +876,296 @@ def _print_billing(report: dict) -> None:
         print(
             t("cli.pilot.billing_total", total=format_number(report.get("billed_total_all", total)))
         )
+
+
+def _write_billing(directory: Path, *, expected_runs: int) -> dict:
+    """Verify a batch's billing, print it, and write it to ``billing.json``."""
+    from rpg_economy.campaign.pilot import verify_stage_billing
+
+    report = verify_stage_billing(directory, expected_runs=expected_runs)
+    _print_billing(report)
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "billing.json").write_text(
+        json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    return report
+
+
+def _pending_changed(directory: Path, confirmed: object, current: object) -> bool:
+    """Whether what is pending now, under the lock, left the confirmed set; prints why.
+
+    The batch was priced and confirmed on ``confirmed`` before the lock was
+    taken. Trios that finished meanwhile only shrink it; anything pending now
+    that was not confirmed would be spent without having been shown.
+    """
+    allowed = set(confirmed.trios)
+    unconfirmed = [trio for trio in current.trios if trio not in allowed]
+    if not unconfirmed:
+        return False
+    print(
+        t(
+            "error.campaign.pending_changed",
+            path=str(directory),
+            confirmed=len(confirmed.trios),
+            pending=len(current.trios),
+            unconfirmed=len(unconfirmed),
+        ),
+        file=sys.stderr,
+    )
+    return True
+
+
+def _stage_profile(profile_logs: Path):
+    from rpg_economy.campaign import measure_profile
+    from rpg_economy.campaign.cost import CostError
+
+    profile = measure_profile(profile_logs)
+    if profile.runs_measured == 0:
+        raise CostError(
+            f"no measured runs under {profile_logs}",
+            key="error.cost.no_runs_under",
+            path=str(profile_logs),
+        )
+    return profile
+
+
+def _smoke(
+    config: object,
+    out: Path,
+    *,
+    seed: int,
+    budget_fraction: float,
+    confirm_cost: str | None,
+    spend_limit_set: bool,
+    report_only: bool,
+    allow_final_seed: bool = False,
+    break_lock: bool = False,
+) -> int:
+    """The two real-provider smoke runs.
+
+    SMOKE-1 is an unconstrained trio: it establishes that the provider's usage
+    fields reach the ledger and that bucket attribution reconciles with them on
+    every call. SMOKE-2 replays condition A against a budget set from SMOKE-1's
+    measured spend, so exhaustion is provoked by real consumption rather than a
+    guess -- the point is that the budget binds on the provider's total, and a
+    hand-picked number could bind on ours by accident.
+    """
+    from decimal import ROUND_HALF_UP, Decimal
+
+    from rpg_economy.campaign.runner import set_aside_previous
+    from rpg_economy.campaign.smoke import smoke_config, verify_smoke
+    from rpg_economy.integrity import TrioIntegrityError
+    from rpg_economy.llm import ProviderError
+    from rpg_economy.logging_ import LogError
+    from rpg_economy.runner import RunInterrupted, run_condition, run_trio
+
+    root = Path(out)
+    one, two = root / "smoke1", root / "smoke2"
+    planned = smoke_config(config, experiment="experiment_1").time.horizon_ticks
+
+    if not report_only:
+        if _refuse_final_seed(config, seed, allowed=allow_final_seed):
+            return 5
+        if config.llm.pricing is None:
+            print(t("error.campaign.invalid", detail=t("error.cost.no_pricing")), file=sys.stderr)
+            return 4
+        estimate = _smoke_estimate(config)
+        print(t("cli.smoke.cost", total=estimate, currency=config.llm.pricing.currency))
+        print(
+            t(
+                "cli.smoke.cost_worst",
+                worst=_smoke_worst_case(config),
+                currency=config.llm.pricing.currency,
+            )
+        )
+        print(t("cli.smoke.cost_note"))
+        if not spend_limit_set:
+            print(t("error.derisk.no_spend_limit"), file=sys.stderr)
+            return 5
+        if confirm_cost != str(estimate):
+            print(
+                t(
+                    "error.campaign.unconfirmed",
+                    total=str(estimate),
+                    currency=config.llm.pricing.currency,
+                    runs=4,
+                ),
+                file=sys.stderr,
+            )
+            return 5
+
+        # Where the step being run writes, for the message if its log fails.
+        current = one
+        interrupt = Interrupt()
+
+        def execute() -> int:
+            nonlocal current
+            try:
+                print(t("cli.smoke.running", label="SMOKE-1"))
+                # A rerun keeps the earlier runs, set aside: they were billed,
+                # and run logs are write-once.
+                set_aside_previous(one)
+                run_trio(
+                    smoke_config(config, experiment="experiment_1"),
+                    one,
+                    seed=seed,
+                    should_stop=interrupt.should_stop,
+                    should_abort=interrupt.should_abort,
+                )
+
+                measured = verify_smoke(
+                    one / "A.jsonl",
+                    label="SMOKE-1",
+                    planned_horizon=planned,
+                    expect_exhaustion=False,
+                )
+                budget = max(1, int(measured.provider_total * budget_fraction))
+                print(
+                    t(
+                        "cli.smoke.budget",
+                        budget=format_number(budget),
+                        measured=format_number(measured.provider_total),
+                        fraction=f"{budget_fraction:.0%}",
+                    )
+                )
+
+                # SMOKE-1 is kept, and verified again by a rerun.
+                if interrupt.should_stop():
+                    return _stopped(root)
+                print(t("cli.smoke.running", label="SMOKE-2"))
+                current = two
+                two.mkdir(parents=True, exist_ok=True)
+                set_aside_previous(two, (Condition.A,))
+                run_condition(
+                    smoke_config(config, experiment="experiment_2", budget=budget).for_condition(
+                        Condition.A, seed=seed
+                    ),
+                    two / "A.jsonl",
+                    should_abort=interrupt.should_abort,
+                )
+            except RunInterrupted:
+                return _stopped(root)
+            except ProviderError as exc:
+                print(t("error.provider.failed", detail=str(exc)), file=sys.stderr)
+                return 8
+            except (LogError, OSError, TrioIntegrityError) as exc:
+                return _unusable_run(exc, current)
+            return 0
+
+        # Held for both runs: a second smoke on the same directory would set
+        # this one's logs aside mid-run and pay for its own.
+        code = _locked(root, execute, break_lock=break_lock, interrupt=interrupt)
+        if code:
+            return code
+
+    reports = []
+    for path, label, exhaustion in (
+        (one / "A.jsonl", "SMOKE-1", False),
+        (two / "A.jsonl", "SMOKE-2", True),
+    ):
+        if not path.exists():
+            print(t("error.smoke.no_run", label=label, path=str(path)), file=sys.stderr)
+            return 6
+        try:
+            reports.append(
+                verify_smoke(
+                    path, label=label, planned_horizon=planned, expect_exhaustion=exhaustion
+                )
+            )
+        except LogError, OSError:
+            print(t("error.run.log_unusable", path=str(path)), file=sys.stderr)
+            return 6
+
+    ok = True
+    for report in reports:
+        print()
+        print(t("cli.smoke.header", label=report.label, model=report.model))
+        print(
+            t(
+                "cli.smoke.usage",
+                calls=format_number(report.llm_calls),
+                input=format_number(report.provider_input),
+                output=format_number(report.provider_output),
+                ledger=format_number(report.ledger_total),
+            )
+        )
+        if config.llm.pricing is not None:
+            actual = (
+                Decimal(report.provider_input) / 1_000_000 * config.llm.pricing.input_per_1m_tokens
+                + Decimal(report.provider_output)
+                / 1_000_000
+                * config.llm.pricing.output_per_1m_tokens
+            ).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
+            print(t("cli.smoke.actual_cost", total=actual, currency=config.llm.pricing.currency))
+        for check in report.checks:
+            print(
+                t(
+                    "cli.smoke.check",
+                    mark=t("cli.smoke.pass" if check.passed else "cli.smoke.fail"),
+                    name=check.name,
+                    detail=check.detail,
+                )
+            )
+        ok = ok and report.passed
+
+    import json
+
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "smoke.json").write_text(
+        json.dumps([r.to_payload() for r in reports], indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    print()
+    print(t("cli.smoke.written", path=str(root / "smoke.json")))
+    if not ok:
+        print(t("error.smoke.failed"), file=sys.stderr)
+        return 7
+    return 0
+
+
+def _smoke_estimate(config: object):
+    """Typical price of the two smoke runs, the figure confirmed with --confirm-cost.
+
+    Output at the completion length measured on the real provider, not at the
+    output cap; ``_smoke_worst_case`` is the cap.
+    """
+    from decimal import ROUND_HALF_UP, Decimal
+
+    from rpg_economy.campaign.cost import MEASURED_OUTPUT_PER_CALL
+    from rpg_economy.campaign.smoke import SMOKE_CALLS, SMOKE_INPUT_TOKENS
+
+    pricing = config.llm.pricing
+    # One measured constant, not two literals drifting apart.
+    output = SMOKE_CALLS * MEASURED_OUTPUT_PER_CALL
+    return (
+        Decimal(SMOKE_INPUT_TOKENS) / 1_000_000 * pricing.input_per_1m_tokens
+        + Decimal(output) / 1_000_000 * pricing.output_per_1m_tokens
+    ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+
+def _smoke_worst_case(config: SimulationConfig) -> Decimal:
+    """Price of the two smoke runs at every cap: what a spend limit must cover.
+
+    Each run as ``_worst_case_run`` prices a campaign run: every activation the
+    K cap allows, each agent call retried once, every Director call the K + 1
+    cap allows, and every reply at ``max_output_tokens``. SMOKE-1 is a trio;
+    SMOKE-2 is condition A again, bounded here by A without a budget, since its
+    budget is only known once SMOKE-1 has run.
+    """
+    from decimal import ROUND_HALF_UP
+
+    from rpg_economy.campaign.cost import _worst_case_run
+    from rpg_economy.campaign.smoke import SMOKE_CALLS, SMOKE_INPUT_TOKENS, smoke_config
+
+    pricing = config.llm.pricing
+    sized = smoke_config(config, experiment="experiment_1")
+    input_per_call = SMOKE_INPUT_TOKENS / SMOKE_CALLS
+    worst_input = worst_output = 0
+    for condition in (Condition.A, Condition.B, Condition.C, Condition.A):
+        run_input, run_output = _worst_case_run(sized, condition, input_per_call, None)
+        worst_input += run_input
+        worst_output += run_output
+    return (
+        Decimal(worst_input) / 1_000_000 * pricing.input_per_1m_tokens
+        + Decimal(worst_output) / 1_000_000 * pricing.output_per_1m_tokens
+    ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
