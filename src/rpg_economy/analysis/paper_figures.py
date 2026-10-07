@@ -39,7 +39,7 @@ from rpg_economy.analysis.figures import (
     _style,
 )
 from rpg_economy.config.models import SimulationConfig
-from rpg_economy.i18n import t
+from rpg_economy.i18n import format_number, t
 
 CONDITIONS = ("A", "B", "C")
 RESOURCES = ("iron", "wood", "leather", "herbs", "arcane_crystal")
@@ -554,3 +554,540 @@ def _grouped_bars(
         )
     ax.set_xticks(range(len(categories)))
     ax.set_xticklabels(labels, fontsize=8.5)
+
+
+def fig_flows(runs: list[RunSeries], out: Path, good: str, product: str) -> list[Path]:
+    """Herbs gathered and used, and potions made and bought, per phase (median per run)."""
+    plt = _figure()
+    fig, grid = plt.subplots(2, 2, figsize=(10, 7))
+    axes = list(grid.flat)
+    grouped = by_condition(runs)
+    panels = (
+        (good, "gathered", "paper.flow.gathered"),
+        (good, "used", "paper.flow.used"),
+        (product, "made", "paper.flow.made"),
+        (product, "bought", "paper.flow.bought"),
+    )
+    labels = [t(f"phase.{p}") for p in PHASES]
+    for ax, (item, kind, key) in zip(axes, panels, strict=True):
+        _style(ax)
+        values = {
+            c: [
+                _median([r.flows[p].get(kind, {}).get(item, 0) for r in grouped[c]]) for p in PHASES
+            ]
+            for c in CONDITIONS
+        }
+        _grouped_bars(ax, list(PHASES), values, labels)
+        ax.set_title(
+            t("paper.label.flow_panel", item=good_label(item), flow=t(key)),
+            fontsize=9.5,
+            loc="left",
+            color=INK,
+        )
+    for ax in (axes[0], axes[2]):
+        ax.set_ylabel(t("paper.axis.units_per_run"))
+    fig.suptitle(t("paper.figure.flows"), x=0.02, ha="left", fontsize=11, color=INK)
+    fig.legend(
+        *axes[0].get_legend_handles_labels(),
+        frameon=False,
+        fontsize=9,
+        labelcolor=INK_MUTED,
+        ncols=3,
+        loc="lower center",
+    )
+    fig.tight_layout(rect=(0, 0.04, 1, 0.97))
+    return _save(fig, out, "08_flows_by_phase", layout=False)
+
+
+def fig_production(runs: list[RunSeries], out: Path) -> list[Path]:
+    """Every product made per phase, median per run, one panel per product."""
+    plt = _figure()
+    fig, grid = plt.subplots(2, 3, figsize=(12, 6.6))
+    grouped = by_condition(runs)
+    labels = [t(f"phase.{p}") for p in PHASES]
+    axes = list(grid.flat)
+    for ax, good in zip(axes, PRODUCTS, strict=True):
+        _style(ax)
+        values = {
+            c: [
+                _median([r.flows[p].get("made", {}).get(good, 0) for r in grouped[c]])
+                for p in PHASES
+            ]
+            for c in CONDITIONS
+        }
+        _grouped_bars(ax, list(PHASES), values, labels)
+        ax.set_title(good_label(good), fontsize=9.5, loc="left", color=INK)
+    for ax in (axes[0], axes[3]):
+        ax.set_ylabel(t("paper.axis.units_per_run"))
+    fig.suptitle(t("paper.figure.production"), x=0.02, ha="left", fontsize=11, color=INK)
+    fig.legend(
+        *axes[0].get_legend_handles_labels(),
+        frameon=False,
+        fontsize=9,
+        labelcolor=INK_MUTED,
+        ncols=3,
+        loc="lower center",
+    )
+    fig.tight_layout(rect=(0, 0.05, 1, 0.97))
+    return _save(fig, out, "09_production_by_phase", layout=False)
+
+
+def fig_expeditions(runs: list[RunSeries], out: Path) -> list[Path]:
+    """Expeditions started and their success rate per phase."""
+    plt = _figure()
+    fig, axes = plt.subplots(1, 2, figsize=(10, 3.6))
+    grouped = by_condition(runs)
+    labels = [t(f"phase.{p}") for p in PHASES]
+    started = {
+        c: [_median([r.expeditions[p].get("started", 0) for r in grouped[c]]) for p in PHASES]
+        for c in CONDITIONS
+    }
+    rate = {
+        c: [
+            _median(
+                [
+                    r.expeditions[p].get("succeeded", 0) / r.expeditions[p]["started"]
+                    for r in grouped[c]
+                    if r.expeditions[p].get("started")
+                ]
+            )
+            for p in PHASES
+        ]
+        for c in CONDITIONS
+    }
+    for ax, values, key, ylabel in (
+        (axes[0], started, "paper.figure.expeditions_started", "paper.axis.per_run"),
+        (axes[1], rate, "paper.figure.expedition_success", "paper.axis.share"),
+    ):
+        _style(ax)
+        _grouped_bars(ax, list(PHASES), values, labels)
+        _title(ax, key)
+        ax.set_ylabel(t(ylabel))
+    _legend(axes[0])
+    return _save(fig, out, "10_expeditions")
+
+
+def fig_gold(runs: list[RunSeries], config: SimulationConfig, out: Path) -> list[Path]:
+    """Mean gold of adventurers and of artisans over time."""
+    plt = _figure()
+    fig, axes = plt.subplots(1, 2, figsize=(11, 3.8), sharey=True)
+    grouped = by_condition(runs)
+    for ax, role in zip(axes, ("adventurer", "artisan"), strict=True):
+        _style(ax)
+        _shade(ax, config)
+        _band_lines(ax, {c: [r.gold[role] for r in rs] for c, rs in grouped.items()})
+        ax.set_title(t(f"role.{role}"), fontsize=10, loc="left", color=INK)
+        ax.set_xlabel(t("axis.tick"))
+    axes[0].set_ylabel(t("paper.axis.mean_gold"))
+    fig.suptitle(t("paper.figure.gold"), x=0.02, ha="left", fontsize=11, color=INK)
+    _legend(axes[0])
+    return _save(fig, out, "11_gold_by_role")
+
+
+def fig_gini(runs: list[RunSeries], config: SimulationConfig, out: Path) -> list[Path]:
+    plt = _figure()
+    fig, ax = plt.subplots(figsize=(8, 3.8))
+    _style(ax)
+    _shade(ax, config)
+    grouped = by_condition(runs)
+    _band_lines(ax, {c: [r.gini for r in rs] for c, rs in grouped.items()})
+    _title(ax, "paper.figure.gini")
+    ax.set_xlabel(t("axis.tick"))
+    ax.set_ylabel(t("paper.axis.gini"))
+    _legend(ax)
+    return _save(fig, out, "12_gini_over_time")
+
+
+def _strip(
+    ax, values: dict[str, list[float]], *, seeds: dict[str, list[int]] | None = None
+) -> None:
+    """Every run as a point per condition, its median as a bar: ten points hide nothing."""
+    for i, condition in enumerate(CONDITIONS):
+        ys = values.get(condition) or []
+        if not ys:
+            continue
+        n = len(ys)
+        xs = [i + (k - (n - 1) / 2) * (0.36 / max(1, n - 1)) for k in range(n)]
+        ax.scatter(
+            xs,
+            ys,
+            s=26,
+            color=CONDITION_COLOURS[condition],
+            edgecolor="white",
+            linewidth=0.8,
+            zorder=3,
+        )
+        median = statistics.median(ys)
+        ax.hlines(median, i - 0.28, i + 0.28, color=INK, linewidth=1.6, zorder=4)
+    ax.set_xticks(range(len(CONDITIONS)))
+    ax.set_xticklabels([t(f"paper.short.{c}") for c in CONDITIONS], fontsize=8)
+
+
+def fig_final_gold(runs: list[RunSeries], out: Path) -> list[Path]:
+    """The poorest artisan and the poorest adventurer at the end of every run."""
+    plt = _figure()
+    fig, axes = plt.subplots(1, 2, figsize=(10, 3.8), sharey=True)
+    grouped = by_condition(runs)
+    for ax, role in zip(axes, ("artisan", "adventurer"), strict=True):
+        _style(ax)
+        _strip(
+            ax, {c: [min(r.final_gold.get(role, [0.0])) for r in grouped[c]] for c in CONDITIONS}
+        )
+        ax.axhline(0, color=INK_MUTED, linewidth=1)
+        ax.set_title(
+            t("paper.figure.poorest", role=t(f"role.{role}")), fontsize=10, loc="left", color=INK
+        )
+    axes[0].set_ylabel(t("paper.axis.final_gold"))
+    return _save(fig, out, "13_poorest_agent_final_gold")
+
+
+def fig_tokens(runs: list[RunSeries], out: Path) -> list[Path]:
+    """Tokens per run by bucket, input and output stacked (median per run)."""
+    plt = _figure()
+    fig, ax = plt.subplots(figsize=(8, 4.0))
+    _style(ax)
+    grouped = by_condition(runs)
+    segments = (
+        ("agent", "input", "#2a78d6", 1.0),
+        ("agent", "output", "#2a78d6", 0.55),
+        ("director", "input", "#7a4fb5", 1.0),
+        ("director", "output", "#7a4fb5", 0.55),
+        ("bulletin", "input", "#1baf7a", 1.0),
+        ("p2p_content", "input", "#eb6834", 1.0),
+    )
+    bottoms = [0.0] * len(CONDITIONS)
+    for bucket, kind, colour, alpha in segments:
+        heights = [
+            _median([r.tokens.get(kind, {}).get(bucket, 0) / 1e6 for r in grouped[c]])
+            for c in CONDITIONS
+        ]
+        if not any(heights):
+            continue
+        ax.bar(
+            range(len(CONDITIONS)),
+            heights,
+            bottom=bottoms,
+            color=colour,
+            alpha=alpha,
+            width=0.6,
+            edgecolor="white",
+            linewidth=0.6,
+            label=t(
+                "paper.label.bucket_kind",
+                bucket=t(f"bucket.{bucket}"),
+                kind=t(f"paper.kind.{kind}"),
+            ),
+        )
+        bottoms = [b + h for b, h in zip(bottoms, heights, strict=True)]
+    for i, total in enumerate(bottoms):
+        ax.text(
+            i,
+            total,
+            t("paper.label.million", value=format_number(total, 1)),
+            ha="center",
+            va="bottom",
+            fontsize=8.5,
+            color=INK_MUTED,
+        )
+    ax.set_ylim(0, max(bottoms) * 1.12)
+    ax.set_xticks(range(len(CONDITIONS)))
+    ax.set_xticklabels([t(f"condition.{c}") for c in CONDITIONS], fontsize=8.5)
+    _title(ax, "paper.figure.tokens")
+    ax.set_ylabel(t("paper.axis.million_tokens"))
+    _legend(ax, below=False)
+    return _save(fig, out, "14_tokens_by_bucket")
+
+
+def fig_calls(runs: list[RunSeries], out: Path) -> list[Path]:
+    """LLM calls per run, agents and Director."""
+    plt = _figure()
+    fig, ax = plt.subplots(figsize=(7, 3.8))
+    _style(ax)
+    grouped = by_condition(runs)
+    bottoms = [0.0] * len(CONDITIONS)
+    for bucket, colour in (("agent", "#2a78d6"), ("director", "#7a4fb5")):
+        heights = [_median([r.calls.get(bucket, 0) for r in grouped[c]]) for c in CONDITIONS]
+        ax.bar(
+            range(len(CONDITIONS)),
+            heights,
+            bottom=bottoms,
+            color=colour,
+            width=0.6,
+            edgecolor="white",
+            linewidth=0.6,
+            label=t(f"bucket.{bucket}"),
+        )
+        bottoms = [b + h for b, h in zip(bottoms, heights, strict=True)]
+    for i, total in enumerate(bottoms):
+        ax.text(
+            i, total, format_number(total), ha="center", va="bottom", fontsize=8.5, color=INK_MUTED
+        )
+    ax.set_ylim(0, max(bottoms) * 1.12)
+    ax.set_xticks(range(len(CONDITIONS)))
+    ax.set_xticklabels([t(f"condition.{c}") for c in CONDITIONS], fontsize=8.5)
+    _title(ax, "paper.figure.calls")
+    ax.set_ylabel(t("paper.axis.calls_per_run"))
+    _legend(ax, below=False)
+    return _save(fig, out, "15_llm_calls")
+
+
+def fig_activations(runs: list[RunSeries], out: Path) -> list[Path]:
+    """Activations per run: effective, wasted, plus invalid outputs."""
+    plt = _figure()
+    fig, ax = plt.subplots(figsize=(7, 3.8))
+    _style(ax)
+    grouped = by_condition(runs)
+    effective = [_median([r.activations - r.wasted for r in grouped[c]]) for c in CONDITIONS]
+    wasted = [_median([r.wasted for r in grouped[c]]) for c in CONDITIONS]
+    invalid = [_median([r.invalid for r in grouped[c]]) for c in CONDITIONS]
+    xs = range(len(CONDITIONS))
+    ax.bar(xs, effective, width=0.6, color="#2a78d6", label=t("paper.label.effective"))
+    ax.bar(xs, wasted, bottom=effective, width=0.6, color="#c9c7c1", label=t("paper.label.wasted"))
+    ax.scatter(xs, invalid, marker="D", s=30, color=INK, zorder=3, label=t("paper.label.invalid"))
+    ax.set_xticks(list(xs))
+    ax.set_xticklabels([t(f"condition.{c}") for c in CONDITIONS], fontsize=8.5)
+    _title(ax, "paper.figure.activations")
+    ax.set_ylabel(t("paper.axis.per_run"))
+    _legend(ax, below=False)
+    return _save(fig, out, "16_activations")
+
+
+def fig_actions(runs: list[RunSeries], out: Path) -> list[Path]:
+    """Share of each executed action type, per condition (pooled over runs)."""
+    plt = _figure()
+    fig, ax = plt.subplots(figsize=(9, 3.4))
+    _style(ax)
+    grouped = by_condition(runs)
+    palette = (
+        "#2a78d6",
+        "#eb6834",
+        "#1baf7a",
+        "#7a4fb5",
+        "#d4a020",
+        "#c2416b",
+        "#4aa3c9",
+        "#8a8a3c",
+        "#c9c7c1",
+    )
+    present = [a for a in ACTIONS if any(r.actions.get(a) for r in runs)]
+    for i, condition in enumerate(CONDITIONS):
+        counts = Counter()
+        for r in grouped[condition]:
+            counts.update(r.actions)
+        total = sum(counts[a] for a in present) or 1
+        left = 0.0
+        for k, action in enumerate(present):
+            share = counts[action] / total
+            ax.barh(
+                i,
+                share,
+                left=left,
+                color=palette[k % len(palette)],
+                edgecolor="white",
+                linewidth=0.6,
+                label=t(f"action.{action}") if i == 0 else None,
+            )
+            if share >= 0.06:
+                ax.text(
+                    left + share / 2,
+                    i,
+                    t("paper.label.percent", value=format_number(share * 100)),
+                    ha="center",
+                    va="center",
+                    fontsize=7.5,
+                    color="white",
+                )
+            left += share
+    ax.set_yticks(range(len(CONDITIONS)))
+    ax.set_yticklabels([t(f"condition.{c}") for c in CONDITIONS], fontsize=8.5)
+    ax.invert_yaxis()
+    ax.set_xlim(0, 1)
+    _title(ax, "paper.figure.actions")
+    ax.set_xlabel(t("paper.axis.share"))
+    _legend(ax, ncols=5)
+    return _save(fig, out, "17_action_mix")
+
+
+def fig_orchestration(runs: list[RunSeries], out: Path) -> list[Path]:
+    """What drives activation: the Director's TASK types in A, the triggers in B and C."""
+    plt = _figure()
+    fig, axes = plt.subplots(1, 2, figsize=(12.5, 3.8))
+    grouped = by_condition(runs)
+    ax = axes[0]
+    _style(ax)
+    tasks = [_median([r.tasks.get(k, 0) for r in grouped["A"]]) for k in TASKS]
+    ax.barh(range(len(TASKS)), tasks, color=CONDITION_COLOURS["A"], height=0.6)
+    ax.set_yticks(range(len(TASKS)))
+    ax.set_yticklabels([t(f"task.{k}") for k in TASKS], fontsize=8)
+    ax.invert_yaxis()
+    _title(ax, "paper.figure.tasks")
+    ax.set_xlabel(t("paper.axis.per_run"))
+    ax = axes[1]
+    _style(ax)
+    height = 0.38
+    for j, condition in enumerate(("B", "C")):
+        values = [_median([r.triggers.get(k, 0) for r in grouped[condition]]) for k in TRIGGERS]
+        ax.barh(
+            [i + (j - 0.5) * height for i in range(len(TRIGGERS))],
+            values,
+            height=height * 0.95,
+            color=CONDITION_COLOURS[condition],
+            label=t(f"condition.{condition}"),
+        )
+    ax.set_yticks(range(len(TRIGGERS)))
+    ax.set_yticklabels([t(f"trigger.{k}") for k in TRIGGERS], fontsize=8)
+    ax.invert_yaxis()
+    _title(ax, "paper.figure.triggers")
+    ax.set_xlabel(t("paper.axis.per_run"))
+    _legend(ax, below=False)
+    return _save(fig, out, "18_tasks_and_triggers")
+
+
+def _km(ax, curves: dict[str, Any]) -> None:
+    for condition in CONDITIONS:
+        curve = curves.get(condition)
+        if not curve or not curve.get("times"):
+            continue
+        ax.step(
+            [0, *curve["times"]],
+            [1.0, *curve["survival"]],
+            where="post",
+            linewidth=2.0,
+            color=CONDITION_COLOURS[condition],
+            linestyle=CONDITION_LINESTYLES[condition],
+            label=t(
+                "paper.label.km",
+                condition=t(f"condition.{condition}"),
+                events=curve["events"],
+                n=curve["n"],
+            ),
+        )
+    ax.set_ylim(-0.02, 1.05)
+    ax.set_xlabel(t("report.axis.recovery_ticks"))
+    ax.set_ylabel(t("report.axis.survival"))
+
+
+def fig_survival(results: dict[str, Any], out: Path, good: str, product: str) -> list[Path]:
+    """Kaplan-Meier: share of runs not yet recovered, the target and its product."""
+    plt = _figure()
+    fig, axes = plt.subplots(1, 2, figsize=(11, 3.8), sharey=True)
+    for ax, key, item in (
+        (axes[0], "survival", good),
+        (axes[1], "survival_propagation", product),
+    ):
+        _style(ax)
+        _km(ax, (results.get(key) or {}).get("kaplan_meier", {}))
+        ax.set_title(good_label(item), fontsize=10, loc="left", color=INK)
+        _legend(ax, below=False)
+    fig.suptitle(t("paper.figure.survival"), x=0.02, ha="left", fontsize=11, color=INK)
+    return _save(fig, out, "19_recovery_kaplan_meier")
+
+
+def fig_recovery_grid(results: dict[str, Any], out: Path, good: str, product: str) -> list[Path]:
+    """Every run's recovery: the time when it recovered, a hatch when censored."""
+    plt = _figure()
+    runs = results.get("runs", [])
+    seeds = sorted({r["seed"] for r in runs})
+    fig, axes = plt.subplots(1, 2, figsize=(11, 3.4))
+    from matplotlib.colors import LinearSegmentedColormap
+
+    cmap = LinearSegmentedColormap.from_list("rec", ["#1baf7a", "#f2e6b3", "#eb6834"])
+    horizon = max(((r.get("recovery") or {}).get("value") or 0 for r in runs), default=150) or 150
+    for ax, key, item in ((axes[0], "recovery", good), (axes[1], "propagation_recovery", product)):
+        ax.set_xlim(-0.5, max(1, len(seeds)) - 0.5)
+        ax.set_ylim(-0.5, len(CONDITIONS) - 0.5)
+        for i, condition in enumerate(CONDITIONS):
+            for j, seed in enumerate(seeds):
+                run = next(
+                    (r for r in runs if r["seed"] == seed and r["condition"] == condition), None
+                )
+                rec = (run or {}).get(key) or {}
+                value = rec.get("value")
+                if value is None:
+                    ax.add_patch(_rect(j, i, "#ffffff", hatch="///"))
+                    ax.text(
+                        j,
+                        i,
+                        t("report.value.missing"),
+                        ha="center",
+                        va="center",
+                        fontsize=7,
+                        color=INK_MUTED,
+                    )
+                elif rec.get("censored"):
+                    ax.add_patch(_rect(j, i, "#e6e5e1", hatch="xx"))
+                    ax.text(
+                        j,
+                        i,
+                        t("paper.label.censored_at", value=format_number(value)),
+                        ha="center",
+                        va="center",
+                        fontsize=7,
+                        color=INK,
+                    )
+                else:
+                    ax.add_patch(_rect(j, i, cmap(min(1.0, value / horizon))))
+                    ax.text(
+                        j,
+                        i,
+                        format_number(value),
+                        ha="center",
+                        va="center",
+                        fontsize=7.5,
+                        color=INK,
+                    )
+        ax.set_xticks(range(len(seeds)))
+        ax.set_xticklabels([str(s) for s in seeds], rotation=45, ha="right", fontsize=7.5)
+        ax.set_yticks(range(len(CONDITIONS)))
+        ax.set_yticklabels([t(f"condition.{c}") for c in CONDITIONS], fontsize=8)
+        ax.invert_yaxis()
+        for side in ax.spines.values():
+            side.set_visible(False)
+        ax.tick_params(length=0, colors=INK_MUTED)
+        ax.set_title(good_label(item), fontsize=10, loc="left", color=INK)
+    fig.suptitle(t("paper.figure.recovery_grid"), x=0.02, ha="left", fontsize=11, color=INK)
+    fig.text(0.02, 0.01, t("paper.note.recovery_grid"), fontsize=7.5, color=INK_MUTED)
+    fig.tight_layout(rect=(0, 0.05, 1, 0.95))
+    return _save(fig, out, "20_recovery_per_seed", layout=False)
+
+
+def _rect(x: float, y: float, colour: Any, *, hatch: str | None = None):
+    from matplotlib.patches import Rectangle
+
+    return Rectangle(
+        (x - 0.46, y - 0.42),
+        0.92,
+        0.84,
+        facecolor=colour,
+        edgecolor="#c9c7c1",
+        linewidth=0.6,
+        hatch=hatch,
+    )
+
+
+#: Per-run metrics from results.json drawn as paired per-seed plots: key path,
+#: label key, and whether the value is a phase dict to read at "shock".
+PAIRED_METRICS = (
+    (("volatility_phase", "shock"), "paper.metric.volatility_shock"),
+    (("useful_production", "useful_fraction"), "paper.metric.useful_production"),
+    (("coordination", "coordination_efficiency"), "paper.metric.coordination_efficiency"),
+    (("gini",), "paper.metric.gini"),
+    (("tokens", "authoritative_total"), "paper.metric.tokens_millions"),
+    (("volume_value", "shock"), "paper.metric.traded_value_shock"),
+    (("propagation", "mean_price", "shock"), "paper.metric.propagation_price"),
+    (("stockouts", "by_phase", "shock"), "paper.metric.stockout_ticks"),
+)
+
+
+def _dig(run: dict[str, Any], path: tuple[str, ...]) -> float | None:
+    value: Any = run
+    for key in path:
+        if not isinstance(value, dict):
+            return None
+        value = value.get(key)
+    if isinstance(value, dict):  # a phase-keyed value collapsed to its total
+        value = value.get("value")
+    try:
+        return float(value) if value is not None else None
+    except TypeError, ValueError:
+        return None
