@@ -498,3 +498,94 @@ overwrite a file without `--force`, and its `--out` JSON records
 Exit code 7 means a run, stage or verification did not complete cleanly: an
 integrity failure, a failed trio or a failed billing check.
 
+### 4.13 Out of scope
+Anything in design §14 (regulators, credit, multiple currencies, free chat,
+combat, maps...) is not built.
+
+## 5. Phases
+
+0. Scaffold: config, logging, i18n, CI.
+1. Deterministic engine with rule-based agents.
+2. Activation machinery: triggers, scheduler, K.
+3. LLM layer: client, mock, parsing, token accounting, prompts.
+4. Conditions A and C, and the paired trio runner.
+5. Budgets and Experiment 2.
+6. Metrics, statistics and bilingual reports.
+7. Pilot tooling and a read-only dashboard built from logs.
+
+Campaigns run in parallel across runs (threads; each run stays serial and
+fully isolated), and a test checks that serial and parallel execution produce
+byte-identical logs. Only transient provider errors (rate limits, timeouts,
+5xx) are retried, with capped jittered backoff; a 400 fails immediately.
+A finished trio is never rerun, and a truncated log does not count as
+finished.
+
+CLI notes:
+
+- `campaign-run` requires `--phase pilot|final`; there is no default seed set.
+- `pilot --stage calibration|budget-derivation` runs the two pilot stages. The
+  calibration stage runs `campaign.pilot_calibration_horizon` ticks with the
+  phases scaled in proportion, and the efficacy check scales its 10-tick
+  stockout threshold the same way; budget derivation runs the full horizon.
+- `trio --real`, `smoke` and `derisk` refuse a seed from the final set unless
+  `--allow-final-seed` is given.
+- `smoke` and `derisk` always call the real provider, behind the same cost
+  gates as a real batch (a priced estimate, `--confirm-cost` and
+  `--spend-limit-set`), whatever `llm.mock` says; `--report-only` re-reports
+  a finished run without spending anything.
+- `report` accepts `--layer`, like the other commands: pass the same layers the
+  runs used, so the analysis reads them under the same configuration.
+
+## 6. Testing
+
+Minimum coverage: determinism (same seed, same log), K and K + 1 caps, token
+buckets adding up, each trigger, scheduler neutrality, schema round-trips and
+retry fallbacks, shared randomness across a trio, metric censoring, and no
+hardcoded user-facing strings.
+
+The real model's behaviour is checked apart from the test suite, which never
+reaches the network (package `behavior`). `obligations` states, once, the rules
+each role must follow, as checks over an observation and an answer: when a
+rule applies, from what the agent sees, and whether an answer meets it. Where
+two rules would ask for different actions in one activation, the earlier takes
+precedence and the later does not apply. The rules are used twice:
+
+- `rpg-economy behavior-audit LOG...` judges every activation of a real run
+  (the logged observation against the action finally given) and reports, per
+  rule, how often it applied and was met, with the missed moments. Logs only.
+- `rpg-economy behavior-check` asks the model. `cases` builds a situation per
+  rule in the engine, each in variants (clean; noisy, with the traffic of a real
+  run; poor, without the gold to buy). With
+  `--from-log`, `replay` adds the moments where a real run missed a rule: the
+  run is executed again offline, each call answered with the logged answer in
+  order, so the deterministic engine reaches the same states, and the prompt
+  today's code builds there is kept; a log made under another configuration,
+  or a replay that drifts, is refused. Every answer is judged by every rule
+  that applies; a situation passes when each reaches its threshold (0.85 or
+  0.75, of 8 answers by default), and the check passes when every situation
+  does and invalid answers stay under 5%. It is priced and confirmed like any
+  real spend, writes the answers and scores to `runs/behavior/`, and exits 7
+  on a failure.
+
+Run the check after any change to prompts, the world or the model, before a
+real batch, and audit every real run. Offline tests cover the rules, the
+situations, the scoring, the audit and the replay.
+
+## 7. Conventions
+
+- Small commits per phase, conventional commit messages.
+- Values the design leaves open go to config, marked `# calibrated`.
+- Design ambiguities are resolved in the design document, not decided in code.
+- Everything runs offline with the mock client.
+- No real-LLM batch runs without printing a cost estimate first. Estimates
+  take input tokens and call counts from the profiled runs. Output tokens come
+  from the measured real rate when those runs are mock (a mock doesn't reason,
+  so its output understates cost), and from the runs themselves when they are
+  real.
+
+Reduced final campaign: `campaign.primary_only` runs only resource_scarcity
+under Experiment 1, on any number of final seeds; the design's seed floors and
+the secondary scenarios become a "reduced campaign" warning, and no Experiment 2
+budget is needed. `configs/scenarios/final-reduced.yaml` sets it with ten final
+seeds (2001 to 2010); adding seeds there and running the same `campaign-run`
+resumes, skipping the trios already run.
