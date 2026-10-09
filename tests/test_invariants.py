@@ -262,3 +262,187 @@ def test_the_delivered_observation_is_logged_in_full_not_hashed(tmp_path: Path) 
     assert seen_bulletin[Condition.C]
     assert not seen_bulletin[Condition.B]
     assert not seen_bulletin[Condition.A]
+
+
+@pytest.mark.invariant
+def test_run_metadata_records_every_inference_parameter() -> None:
+    """Design v1.0 s15: a run records the inference parameters that produced it.
+
+    ``reasoning_effort`` decides whether the model answers at all -- at the
+    provider default gpt-5-nano spends its whole completion budget reasoning and
+    returns empty content (design s13). A log without it cannot explain its own
+    run.
+    """
+    from rpg_economy.cli_support import build_metadata
+    from tests.conftest import make_config
+
+    params = build_metadata(make_config()).llm_params
+    for key in ("temperature", "reasoning_effort", "max_output_tokens", "seed", "model_snapshot"):
+        assert key in params, f"run metadata omits inference parameter {key!r}"
+
+
+@pytest.mark.invariant
+def test_the_runner_delegates_the_mock_decision_to_build_client(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A run must be what its metadata says it is.
+
+    ``run_condition`` must honour ``config.llm.mock`` through ``build_client``.
+    Otherwise a ``mock: False`` configuration could run offline while its
+    metadata records ``llm_mock: False``: a run that looks real and is not
+    (design s12).
+
+    Asserted through a spy rather than by running, because the real path would
+    otherwise reach the network from the test suite.
+    """
+    import rpg_economy.runner as runner_module
+    from rpg_economy.llm.client import MockLLMClient
+    from rpg_economy.runner import run_condition
+    from tests.conftest import make_config
+
+    seen: list[bool] = []
+    real_build = runner_module.build_client
+
+    def spy(llm_config, responder=None):
+        seen.append(llm_config.mock)
+        # Always hand back a mock so the test never reaches a provider.
+        return MockLLMClient(responder, model=f"mock:{llm_config.model}")
+
+    monkeypatch.setattr(runner_module, "build_client", spy)
+    run_condition(
+        make_config(run={"condition": "A"}, llm={"mock": False}),
+        tmp_path / "run.jsonl",
+        cycles=1,
+    )
+
+    assert seen, "run_condition never consulted build_client"
+    assert all(flag is False for flag in seen), (
+        "run_condition passed a mock=True config to build_client for a mock=False run"
+    )
+    assert real_build is not spy
+
+
+# ---------------------------------------------------------------------------
+# The suite-wide guard against real provider calls (tests/conftest.py)
+# ---------------------------------------------------------------------------
+def test_no_test_can_construct_the_real_provider_client() -> None:
+    """Guards the guard: ``.env`` is loaded inside the client, so the key cannot be relied on."""
+    from rpg_economy.llm.client import OpenAIClient, build_client
+    from tests.conftest import RealProviderCall, make_config
+
+    config = make_config(llm={"mock": False}).llm
+    with pytest.raises(RealProviderCall):
+        OpenAIClient(config)
+    with pytest.raises(RealProviderCall):
+        build_client(config)
+
+
+def test_the_provider_sdk_is_blocked_too() -> None:
+    """A client built some other way still cannot be constructed or send."""
+    openai = pytest.importorskip("openai")
+    from openai import _base_client
+
+    from tests.conftest import RealProviderCall
+
+    with pytest.raises(RealProviderCall):
+        openai.OpenAI(api_key="not-a-key")
+    with pytest.raises(RealProviderCall):
+        _base_client.SyncAPIClient.request(object(), None, None)
+
+
+def test_credentials_are_never_loaded_in_tests() -> None:
+    dotenv = pytest.importorskip("dotenv")
+    assert dotenv.load_dotenv() is False
+
+
+@pytest.mark.provider_client
+def test_the_marker_admits_the_client_around_a_fake_sdk(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Marked, OpenAIClient can be constructed -- but only around a fake SDK."""
+    from types import SimpleNamespace
+
+    openai = pytest.importorskip("openai")
+    from rpg_economy.llm.client import OpenAIClient
+    from tests.conftest import RealProviderCall, make_config
+
+    config = make_config(llm={"mock": False}).llm
+    with pytest.raises(RealProviderCall):
+        OpenAIClient(config)  # the real SDK is still blocked
+
+    fake = SimpleNamespace(chat=SimpleNamespace(completions=None))
+    monkeypatch.setattr(openai, "OpenAI", lambda **options: fake)
+    assert OpenAIClient(config)._client is fake
+
+
+def test_the_marker_does_not_outlive_its_test() -> None:
+    """Runs after the marked test above: the client is blocked again."""
+    from rpg_economy.llm.client import OpenAIClient
+    from tests.conftest import RealProviderCall, make_config
+
+    with pytest.raises(RealProviderCall):
+        OpenAIClient(make_config(llm={"mock": False}).llm)
+
+
+@pytest.fixture(scope="module")
+def _client_built_in_a_module_fixture() -> BaseException | None:
+    """What constructing the real client in a module-scoped fixture does."""
+    from rpg_economy.llm.client import OpenAIClient
+    from tests.conftest import make_config
+
+    try:
+        OpenAIClient(make_config(llm={"mock": False}).llm)
+    except Exception as exc:  # the test inspects it
+        return exc
+    return None
+
+
+def test_the_guard_covers_module_scoped_fixtures(
+    _client_built_in_a_module_fixture: BaseException | None,
+) -> None:
+    from tests.conftest import RealProviderCall
+
+    assert isinstance(_client_built_in_a_module_fixture, RealProviderCall)
+
+
+# ---------------------------------------------------------------------------
+# The config hash: what a run is, not how it is analysed
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    "field, value",
+    [
+        ("recovery_band_pct_x", "0.33"),
+        ("recovery_hold_ticks_m", 7),
+        ("useful_production_ticks_t", 9),
+        ("unanswered_request_ticks_d", 11),
+    ],
+)
+def test_analysis_only_metric_parameters_stay_out_of_the_hash(field: str, value: object) -> None:
+    """Re-tuning them re-analyses finished runs; it must never re-run them."""
+    from rpg_economy.config import config_hash, setup_hash
+    from tests.conftest import make_config
+
+    base = make_config()
+    retuned = make_config(metrics={field: value})
+    assert getattr(retuned.metrics, field) != getattr(base.metrics, field)
+    assert config_hash(retuned) == config_hash(base)
+    assert setup_hash(retuned) == setup_hash(base)
+
+
+def test_the_volatility_window_stays_in_the_hash() -> None:
+    """The global view reads W while the run executes, so it is part of what a run is."""
+    from rpg_economy.config import config_hash, setup_hash
+    from rpg_economy.config.loader import ANALYSIS_ONLY_METRIC_FIELDS
+    from tests.conftest import make_config
+
+    base = make_config()
+    assert "volatility_window_w" not in ANALYSIS_ONLY_METRIC_FIELDS
+    wider = make_config(metrics={"volatility_window_w": base.metrics.volatility_window_w + 1})
+    assert config_hash(wider) != config_hash(base)
+    assert setup_hash(wider) != setup_hash(base)
+
+
+def test_the_analysis_only_metric_fields_exist() -> None:
+    """A renamed field would silently fall back into the hash."""
+    from rpg_economy.config.loader import ANALYSIS_ONLY_METRIC_FIELDS
+    from rpg_economy.config.models import MetricsConfig
+
+    assert set(ANALYSIS_ONLY_METRIC_FIELDS) <= set(MetricsConfig.model_fields)
