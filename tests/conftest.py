@@ -12,7 +12,13 @@ from rpg_economy.config import config_hash, load_config
 from rpg_economy.config.models import SimulationConfig
 from rpg_economy.domain import Role
 from rpg_economy.engine import AgentAccount, Engine, Market, WorldState, build_world
-from rpg_economy.logging_ import Environment, EventLogWriter, EventType, RunMetadata, read_events
+from rpg_economy.logging_ import (
+    Environment,
+    EventLogWriter,
+    EventType,
+    RunMetadata,
+    read_events,
+)
 
 #: The repository root, so no test depends on the directory pytest runs from.
 ROOT = Path(__file__).resolve().parents[1]
@@ -43,8 +49,61 @@ _provider_guard = pytest.MonkeyPatch()
 _real_client_init: object = None
 
 
+def pytest_configure(config: pytest.Config) -> None:
+    """No code under test can reach the provider, whatever the environment holds.
+
+    Installed once for the whole session, before collection, so module- and
+    session-scoped fixtures and import-time code are covered too, not only the
+    body of each test. ``OpenAIClient.__init__`` loads credentials from ``.env``
+    itself, so an unset ``OPENAI_API_KEY`` protects nothing. Blocked here:
+    constructing the client; reading ``.env``; constructing the SDK's clients;
+    and the SDK's request path, so even a client built some other way cannot
+    send. A test marked ``provider_client`` gets ``OpenAIClient.__init__`` back
+    (``_provider_client_marker``) -- it has to install a fake ``openai.OpenAI``
+    to get past the block below. Tests that assemble a client around a fake
+    transport without ``__init__`` need no marker.
+    """
+    global _real_client_init
+    import rpg_economy.llm.client as client_module
+
+    _real_client_init = client_module.OpenAIClient.__init__
+    _provider_guard.setattr(client_module.OpenAIClient, "__init__", _refuse_provider)
+
+    try:
+        import dotenv
+    except ImportError:  # pragma: no cover -- offline installs
+        pass
+    else:
+        _provider_guard.setattr(dotenv, "load_dotenv", lambda *args, **kwargs: False)
+
+    try:
+        import openai
+        from openai import _base_client
+    except ImportError:  # pragma: no cover -- offline installs
+        return
+    for name in ("OpenAI", "AsyncOpenAI", "AzureOpenAI", "AsyncAzureOpenAI"):
+        if hasattr(openai, name):
+            _provider_guard.setattr(openai, name, _refuse_provider)
+    for name in ("SyncAPIClient", "AsyncAPIClient"):
+        base = getattr(_base_client, name, None)
+        if base is not None and hasattr(base, "request"):
+            _provider_guard.setattr(base, "request", _refuse_provider)
+
+
 def pytest_unconfigure(config: pytest.Config) -> None:
     _provider_guard.undo()
+
+
+@pytest.fixture(autouse=True)
+def _provider_client_marker(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ``provider_client`` test may construct ``OpenAIClient``; only that test."""
+    if request.node.get_closest_marker(PROVIDER_CLIENT_MARKER) is None:
+        return
+    import rpg_economy.llm.client as client_module
+
+    monkeypatch.setattr(client_module.OpenAIClient, "__init__", _real_client_init)
 
 
 @pytest.fixture(autouse=True)
@@ -61,6 +120,14 @@ def _default_locale(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     clear_cache()
     yield
     clear_cache()
+
+
+@pytest.fixture(autouse=True)
+def _absolute_default_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The CLI's default --config is relative to where it runs; the tests are not."""
+    import rpg_economy.cli
+
+    monkeypatch.setattr(rpg_economy.cli, "DEFAULT_CONFIG", BASE_CONFIG)
 
 
 def make_config(**overrides: object) -> SimulationConfig:
