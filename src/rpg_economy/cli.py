@@ -15,12 +15,20 @@ from collections.abc import Callable, Sequence
 from decimal import Decimal
 from pathlib import Path
 
-from rpg_economy.campaign import estimate_cost
+from rpg_economy.campaign import build_plan, estimate_cost, measure_profile, scenario_tier
+from rpg_economy.campaign.cost import CostError
 from rpg_economy.campaign.interrupt import Interrupt
-from rpg_economy.config import config_hash, load_config
+from rpg_economy.campaign.plan import PlanError
+from rpg_economy.config import ConfigError, config_hash, load_config
 from rpg_economy.config.models import SimulationConfig
 from rpg_economy.domain import Condition, ExperimentRegime
-from rpg_economy.i18n import SUPPORTED_LOCALES, format_number, set_locale, t
+from rpg_economy.i18n import (
+    SUPPORTED_LOCALES,
+    UnsupportedLocaleError,
+    format_number,
+    set_locale,
+    t,
+)
 
 DEFAULT_CONFIG = Path("configs/base.yaml")
 
@@ -297,6 +305,217 @@ def build_parser() -> argparse.ArgumentParser:
     replay.add_argument("--layer", type=Path, action="append", default=[], help=t("cli.help.layer"))
 
     return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    tokens = list(sys.argv[1:] if argv is None else argv)
+    try:
+        # --locale, else SIM_LOCALE, else English: the one resolved value every
+        # renderer below receives.
+        locale = set_locale(peek_locale(tokens))
+    except UnsupportedLocaleError as exc:
+        # Already worded in the catalog in use (the default one, here).
+        print(str(exc), file=sys.stderr)
+        return 2
+
+    args = build_parser().parse_args(tokens)
+
+    if args.command == "balance":
+        from rpg_economy.analysis.balance import balance_from_log, render_balance
+
+        for log in args.logs:
+            print(render_balance(balance_from_log(log)))
+            print()
+        return 0
+
+    # Handled before any configuration is loaded: the dashboard reads a log and
+    # nothing else, so requiring a config would tie an observation tool to the
+    # setup of the run it observes (IMPLEMENTATION.md phase 7).
+    # Like the dashboard, a replay reads recorded logs. The configuration is
+    # optional and only feeds the crafting guide, after its hash is checked
+    # against the logs; a missing or invalid one just omits the guide.
+    if args.command == "replay":
+        try:
+            replay_config = load_config(args.config, layers=list(args.layer))
+        except ConfigError, OSError:
+            replay_config = None
+        return _replay(
+            args.source,
+            args.out,
+            locale=locale,
+            good=args.good,
+            all_locales=args.all_locales,
+            config=replay_config,
+        )
+
+    if args.command == "dashboard":
+        return _dashboard(args.log, locale=locale)
+
+    if args.command == "check":
+        from rpg_economy.dashboard.check import check_directory, render_checks
+
+        checks = check_directory(args.logs)
+        if not checks:
+            print(t("error.report.no_logs", path=str(args.logs)), file=sys.stderr)
+            return 2
+        print(render_checks(checks, t))
+        return 0
+
+    overrides: dict[str, object] = {}
+    run_overrides = {
+        key: value
+        for key, value in (
+            ("seed", getattr(args, "seed", None)),
+            ("scenario", getattr(args, "scenario", None)),
+        )
+        if value is not None
+    }
+    if run_overrides:
+        overrides["run"] = run_overrides
+
+    try:
+        config = load_config(args.config, layers=list(args.layer), overrides=overrides)
+    except ConfigError as exc:
+        print(t("error.config.invalid", detail=str(exc)), file=sys.stderr)
+        return 2
+
+    if getattr(args, "real", False):
+        config = with_real_provider(config)
+
+    if args.command == "config-show":
+        print(t("cli.config.loaded", path=str(args.config), hash=config_hash(config)))
+        return 0
+
+    if args.command == "economy-check":
+        if args.shock_efficacy:
+            return _shock_efficacy(
+                config,
+                args.pilot_logs,
+                scenario_given=args.scenario is not None,
+                allow_mock=args.allow_mock,
+            )
+        return _economy_check(config, args.log)
+
+    if args.command == "trio":
+        return _trio(
+            config,
+            args.out,
+            experiment=args.experiment,
+            profile_logs=args.profile_logs,
+            confirm_cost=args.confirm_cost,
+            spend_limit_set=args.spend_limit_set,
+            allow_final_seed=args.allow_final_seed,
+            replay=not args.no_replay,
+            good=args.good,
+            locale=locale,
+            break_lock=args.break_lock,
+        )
+
+    if args.command == "behavior-check":
+        return _behavior_check(
+            config,
+            reps=args.reps,
+            only=args.only,
+            workers=args.workers,
+            out=args.out,
+            confirm_cost=args.confirm_cost,
+            spend_limit_set=args.spend_limit_set,
+            logs=list(args.from_log),
+            moments=args.moments,
+            base=load_config(args.config, layers=list(args.layer)),
+        )
+
+    if args.command == "behavior-audit":
+        return _behavior_audit(config, list(args.logs), args.out)
+
+    if args.command == "report":
+        return _report(
+            config,
+            args.logs,
+            args.out,
+            include_pilot=args.include_pilot,
+            allow_mock=args.allow_mock,
+        )
+
+    if args.command == "paper-figures":
+        return _paper_figures(config, args.logs, args.results, args.out, workers=args.workers)
+
+    if args.command == "derive-budget":
+        return _derive_budget(
+            config,
+            args.pilot_logs,
+            args.out,
+            layer_out=args.layer_out,
+            allow_mock=args.allow_mock,
+            force=args.force,
+        )
+
+    if args.command == "pilot":
+        return _pilot(
+            config,
+            args.stage,
+            args.out,
+            profile_logs=args.profile_logs,
+            workers=args.workers,
+            confirm_cost=args.confirm_cost,
+            spend_limit_set=args.spend_limit_set,
+            resume=not args.no_resume,
+            verify_only=args.verify_only,
+            break_lock=args.break_lock,
+            only_seed=args.seed,
+            only_scenario=args.scenario,
+            only_condition=args.condition,
+        )
+
+    if args.command == "smoke":
+        return _smoke(
+            config,
+            args.out,
+            seed=args.seed,
+            budget_fraction=args.budget_fraction,
+            confirm_cost=args.confirm_cost,
+            spend_limit_set=args.spend_limit_set,
+            report_only=args.report_only,
+            allow_final_seed=args.allow_final_seed,
+            break_lock=args.break_lock,
+        )
+
+    if args.command == "derisk":
+        return _derisk(
+            config,
+            args.out,
+            seed=args.seed,
+            horizon=args.horizon,
+            # De-duplicated in order: a model listed twice is one arm, run and
+            # priced once.
+            models=tuple(dict.fromkeys(m.strip() for m in args.models.split(",") if m.strip())),
+            profile_logs=args.profile_logs,
+            model_pricing=args.model_pricing,
+            confirm_cost=args.confirm_cost,
+            spend_limit_set=args.spend_limit_set,
+            report_only=args.report_only,
+            allow_final_seed=args.allow_final_seed,
+            break_lock=args.break_lock,
+        )
+
+    if args.command == "campaign-plan":
+        return _campaign_plan(config, args.phase, args.profile_logs, args.out)
+
+    if args.command == "campaign-run":
+        return _campaign_run(
+            config,
+            args.phase,
+            args.out,
+            profile_logs=args.profile_logs,
+            confirm_cost=args.confirm_cost,
+            resume=not args.no_resume,
+            workers=args.workers,
+            spend_limit_set=args.spend_limit_set,
+            break_lock=args.break_lock,
+            only_condition=args.condition,
+        )
+
+    return 1
 
 
 def with_real_provider(config: SimulationConfig) -> SimulationConfig:
@@ -2217,6 +2436,61 @@ def _dashboard(log_path: Path, *, locale: str) -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------
+# Campaign planning and execution (IMPLEMENTATION.md phase 7)
+# ---------------------------------------------------------------------------
+def _render_plan(plan: object, estimate: object | None) -> None:
+    """Print a plan, and its price when one could be computed."""
+    print(t("cli.campaign.plan_header", phase=plan.phase.value))
+    for scenario, trios in plan.by_scenario().items():
+        experiments = sorted({trio.experiment.value for trio in trios})
+        print(
+            t(
+                "cli.campaign.plan_row",
+                scenario=t(f"scenario.{scenario.value}"),
+                tier=t(f"campaign.tier.{scenario_tier(scenario).value}"),
+                trios=len(trios),
+                runs=sum(trio.runs for trio in trios),
+                experiments=", ".join(t(f"experiment.{e}") for e in experiments),
+            )
+        )
+    print(t("cli.campaign.plan_total", trios=len(plan.trios), runs=plan.total_runs))
+
+    for warning in plan.warnings:
+        print(t("cli.campaign.warning", detail=_localized(warning)), file=sys.stderr)
+
+    if estimate is None:
+        return
+
+    print()
+    print(
+        t(
+            "cli.campaign.cost_header",
+            model=estimate.model,
+            currency=estimate.currency,
+            quoted_on=estimate.quoted_on,
+        )
+    )
+    print(
+        t(
+            "cli.campaign.cost_tokens",
+            input=format_number(estimate.input_tokens),
+            output=format_number(estimate.output_tokens),
+            total=format_number(estimate.total_tokens),
+        )
+    )
+    print(
+        t(
+            "cli.campaign.cost_total",
+            total=estimate.total_cost,
+            currency=estimate.currency,
+            upper=estimate.upper_bound,
+        )
+    )
+    print(t("cli.campaign.cost_caveat_real" if estimate.real else "cli.campaign.cost_caveat"))
+    _print_bounds(estimate)
+
+
 def _print_bounds(estimate: object, *, plan_shown: bool = True) -> None:
     """The upper bound and worst case, and what the spend limit must cover."""
     if estimate.worst_case is not None:
@@ -2234,3 +2508,194 @@ def _print_bounds(estimate: object, *, plan_shown: bool = True) -> None:
     shown = estimate.plan_warnings if plan_shown else []
     for warning in [w for w in estimate.warnings if w not in shown]:
         print(t("cli.campaign.warning", detail=_localized(warning)), file=sys.stderr)
+
+
+def _build_plan_and_estimate(
+    config: object, phase: str, profile_logs: Path | None, *, priced: object | None = None
+) -> tuple[object, object | None]:
+    """Build the plan, and price ``priced`` (default: the whole plan) if a profile is given.
+
+    ``priced`` is a callable from the plan to the part of it to price, so a
+    resumed campaign can be priced on the trios it still has to run.
+    """
+    plan = build_plan(config, phase=phase)
+    if profile_logs is None:
+        return plan, None
+    if config.llm.pricing is None:
+        raise CostError(
+            "llm.pricing is not configured; a campaign cannot be priced without it",
+            key="error.cost.no_pricing",
+        )
+    profile = measure_profile(profile_logs)
+    estimate = estimate_cost(
+        priced(plan) if priced is not None else plan,
+        profile,
+        config.llm.pricing,
+        model=config.llm.model,
+        horizon=config.time.horizon_ticks,
+        config=config,
+    )
+    return plan, estimate
+
+
+def _campaign_plan(config: object, phase: str, profile_logs: Path | None, out: Path | None) -> int:
+    """Show what a campaign would run, and what it would cost."""
+    try:
+        plan, estimate = _build_plan_and_estimate(config, phase, profile_logs)
+    except (PlanError, CostError) as exc:
+        print(t("error.campaign.invalid", detail=_localized(exc)), file=sys.stderr)
+        return 4
+
+    _render_plan(plan, estimate)
+
+    if out is not None:
+        import json
+
+        payload = {"plan": plan.to_payload()}
+        if estimate is not None:
+            payload["estimate"] = estimate.to_payload()
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        print(t("cli.campaign.plan_written", path=str(out)))
+    return 0
+
+
+def _campaign_run(
+    config: object,
+    phase: str,
+    out: Path,
+    *,
+    profile_logs: Path | None,
+    confirm_cost: str | None,
+    resume: bool,
+    workers: int = 8,
+    spend_limit_set: bool = False,
+    break_lock: bool = False,
+    only_condition: str | None = None,
+) -> int:
+    """Execute a campaign, refusing an unpriced real-provider batch.
+
+    ``only_condition`` runs just that condition of each trio, priced alone; a
+    trio is verified once all three conditions have run.
+
+    The mock path runs freely: it costs nothing and is the default. The real path
+    must be priced first and the price confirmed by value, so that
+    confirmation cannot be carried over from a smaller plan -- the number typed
+    has to match the number printed.
+    """
+    from rpg_economy.campaign.runner import pending_trios
+
+    def remaining(full: object) -> object:
+        if only_condition is not None:
+            from dataclasses import replace
+
+            from rpg_economy.domain import Condition
+
+            full = replace(
+                full, trios=[replace(trio, only=Condition(only_condition)) for trio in full.trios]
+            )
+        return pending_trios(config, full, out, resume=resume)
+
+    try:
+        plan, estimate = _build_plan_and_estimate(config, phase, profile_logs, priced=remaining)
+        pending = remaining(plan)
+    except (PlanError, CostError) as exc:
+        print(t("error.campaign.invalid", detail=_localized(exc)), file=sys.stderr)
+        return 4
+
+    _render_plan(plan, estimate)
+    if len(pending.trios) != len(plan.trios):
+        # The estimate above prices only these: a resumed campaign never pays
+        # twice for a trio that finished and passed the gate.
+        print(
+            t(
+                "cli.campaign.resume_pending",
+                complete=len(plan.trios) - len(pending.trios),
+                total=len(plan.trios),
+                pending=len(pending.trios),
+            )
+        )
+
+    # A real rerun with nothing pending spends nothing, so it is neither
+    # priced nor confirmed; it still verifies and writes the billing report.
+    if not config.llm.mock and pending.trios:
+        code = _confirm_real_batch(
+            config,
+            estimate,
+            confirm_cost=confirm_cost,
+            spend_limit_set=spend_limit_set,
+            runs=pending.total_runs,
+        )
+        if code:
+            return code
+
+    from rpg_economy.campaign.parallel import run_campaign_parallel
+    from rpg_economy.campaign.pilot import billing_passed
+
+    def progress(outcome: object, done: int, total: int) -> None:
+        print(
+            t(
+                "cli.campaign.progress",
+                index=done,
+                total=total,
+                scenario=t(f"scenario.{outcome.trio.scenario.value}"),
+                experiment=t(f"experiment.{outcome.trio.experiment.value}"),
+                seed=outcome.trio.seed,
+            )
+        )
+
+    interrupt = Interrupt()
+
+    def execute() -> int:
+        # Checked again under the lock: only what was priced and confirmed runs.
+        if _pending_changed(Path(out), pending, remaining(plan)):
+            return 5
+        billed = True
+        try:
+            result = run_campaign_parallel(
+                config,
+                pending,
+                out,
+                workers=workers,
+                resume=resume,
+                progress=progress,
+                interrupt=interrupt,
+            )
+            print(
+                t(
+                    "cli.campaign.done",
+                    completed=len(result.by_status("completed")),
+                    skipped=len(result.by_status("skipped")),
+                    path=str(out),
+                )
+            )
+            _print_failed_trios(result)
+        finally:
+            if not config.llm.mock:
+                # A real campaign is only evidence if every run was real and
+                # fully billed (IMPLEMENTATION.md section 4.7). Written whatever
+                # happened to the batch -- failed trios, a Ctrl-C and an
+                # exception included -- since the spend it records happened
+                # either way.
+                billed = billing_passed(
+                    _write_billing(
+                        Path(out),
+                        expected_runs=None if only_condition is not None else plan.total_runs,
+                    )
+                )
+
+        if interrupt.should_stop():
+            return _stopped(Path(out))
+        if not billed:
+            print(t("error.pilot.failed"), file=sys.stderr)
+        if result.failed or not billed:
+            return 7
+        return 0
+
+    # Held from the first trio to the billing verification: a second process
+    # on the same directory would find the same trios pending and pay for them too.
+    return _locked(Path(out), execute, break_lock=break_lock, interrupt=interrupt)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
