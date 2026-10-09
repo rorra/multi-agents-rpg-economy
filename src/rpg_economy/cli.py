@@ -15,6 +15,7 @@ from collections.abc import Callable, Sequence
 from decimal import Decimal
 from pathlib import Path
 
+from rpg_economy.campaign import estimate_cost
 from rpg_economy.campaign.interrupt import Interrupt
 from rpg_economy.config import config_hash, load_config
 from rpg_economy.config.models import SimulationConfig
@@ -793,6 +794,255 @@ def _render_efficacy(efficacy: object) -> bool:
     return effective
 
 
+def _pilot(
+    config: object,
+    stage_name: str,
+    out: Path,
+    *,
+    profile_logs: Path | None,
+    workers: int,
+    confirm_cost: str | None,
+    spend_limit_set: bool,
+    resume: bool,
+    verify_only: bool,
+    break_lock: bool = False,
+    only_seed: int | None = None,
+    only_scenario: str | None = None,
+    only_condition: str | None = None,
+) -> int:
+    """Run one pilot stage, or price and describe it without running anything.
+
+    ``only_condition`` runs just that condition of each selected trio, priced
+    alone; the trio is verified once all three conditions have run.
+
+    ``only_seed`` and ``only_scenario`` narrow the stage to part of its trios,
+    run in the stage's own folder with the stage's own configuration, so a
+    first check counts toward the stage: running the whole stage afterwards
+    on the same folder skips what already finished.
+
+    Without --confirm-cost this is a dry run: it prints the matrix and the
+    price and exits. Execution needs the same three gates a campaign does, plus
+    the billing verification (IMPLEMENTATION.md section 4.7) once the stage
+    completes.
+    """
+    import json
+
+    from rpg_economy.campaign.cost import CostError, estimate_cost
+    from rpg_economy.campaign.parallel import run_campaign_parallel
+    from rpg_economy.campaign.pilot import (
+        STAGES,
+        billing_passed,
+        stage_config,
+        stage_plan,
+        verify_stage_billing,
+    )
+    from rpg_economy.campaign.plan import PlanError
+    from rpg_economy.campaign.runner import pending_trios
+
+    stage = STAGES[stage_name]
+    # Each stage in its own directory: the two stages run the same seeds at
+    # different horizons, and sharing one would mix them.
+    root = Path(out) / stage.name
+
+    try:
+        derived = stage_config(config, stage)
+        plan = stage_plan(config, stage)
+    except (PlanError, ValueError) as exc:
+        print(t("error.campaign.invalid", detail=_localized(exc)), file=sys.stderr)
+        return 4
+    if only_seed is not None or only_scenario is not None:
+        plan.trios = [
+            trio
+            for trio in plan.trios
+            if (only_seed is None or trio.seed == only_seed)
+            and (only_scenario is None or trio.scenario.value == only_scenario)
+        ]
+        if not plan.trios:
+            print(
+                t(
+                    "error.pilot.no_matching_trio",
+                    seed=only_seed if only_seed is not None else "-",
+                    scenario=only_scenario or "-",
+                ),
+                file=sys.stderr,
+            )
+            return 4
+    if only_condition is not None:
+        from dataclasses import replace
+
+        from rpg_economy.domain import Condition
+
+        plan.trios = [replace(trio, only=Condition(only_condition)) for trio in plan.trios]
+
+    print(
+        t(
+            "cli.pilot.header",
+            stage=stage.name,
+            purpose=t(stage.purpose_key),
+            trios=len(plan.trios),
+            runs=plan.total_runs,
+        )
+    )
+    print(
+        t(
+            "cli.pilot.shape",
+            horizon=derived.time.horizon_ticks,
+            base=derived.phases.base_ticks,
+            shock=derived.phases.shock_ticks,
+            recovery=derived.phases.recovery_ticks,
+            k=derived.time.k_activations,
+            full=config.time.horizon_ticks,
+        )
+    )
+    for scenario, trios in plan.by_scenario().items():
+        print(
+            t(
+                "cli.pilot.scenario",
+                scenario=t(f"scenario.{scenario.value}"),
+                trios=len(trios),
+                runs=sum(x.runs for x in trios),
+            )
+        )
+    for warning in plan.warnings:
+        print(t("cli.campaign.warning", detail=_localized(warning)), file=sys.stderr)
+
+    if verify_only:
+        # The stage is whole only if every planned run finished.
+        report = verify_stage_billing(root, expected_runs=plan.total_runs)
+        print(json.dumps(report, indent=2, sort_keys=True))
+        if not billing_passed(report):
+            print(t("error.pilot.failed"), file=sys.stderr)
+            return 7
+        return 0
+
+    # Priced and confirmed on what still has to run: a resumed stage never
+    # pays twice for trios that already finished and passed the gate.
+    pending = pending_trios(derived, plan, root, resume=resume)
+    if len(pending.trios) != len(plan.trios):
+        print(
+            t(
+                "cli.campaign.resume_pending",
+                complete=len(plan.trios) - len(pending.trios),
+                total=len(plan.trios),
+                pending=len(pending.trios),
+            )
+        )
+
+    # Nothing left to run, so nothing to price or confirm: a real rerun of a
+    # finished stage goes straight to its billing verification (as derisk
+    # keeps finished arms without a gate).
+    nothing_pending = not pending.trios and not config.llm.mock
+
+    estimate = None
+    if profile_logs is not None and not nothing_pending:
+        if config.llm.pricing is None:
+            print(t("error.campaign.invalid", detail=t("error.cost.no_pricing")), file=sys.stderr)
+            return 4
+        try:
+            profile = _stage_profile(profile_logs)
+            # Priced at the stage's own horizon: the calibration stage is shorter
+            # than the configured one, and the profile may be shorter than either.
+            estimate = estimate_cost(
+                pending,
+                profile,
+                config.llm.pricing,
+                model=config.llm.model,
+                horizon=derived.time.horizon_ticks,
+                config=derived,
+            )
+        except CostError as exc:
+            print(t("error.campaign.invalid", detail=_localized(exc)), file=sys.stderr)
+            return 4
+        print(
+            t(
+                "cli.pilot.cost",
+                total=estimate.total_cost,
+                currency=estimate.currency,
+                input=format_number(estimate.input_tokens),
+                output=format_number(estimate.output_tokens),
+            )
+        )
+        _print_bounds(estimate)
+
+    if not nothing_pending:
+        if confirm_cost is None:
+            print(t("cli.pilot.dry_run"))
+            return 0
+        # The pilot exists to measure the real model; a mock pilot would only
+        # fail its billing verification after running every trio.
+        if config.llm.mock:
+            print(t("error.pilot.needs_real"), file=sys.stderr)
+            return 5
+        code = _confirm_real_batch(
+            config,
+            estimate,
+            confirm_cost=confirm_cost,
+            spend_limit_set=spend_limit_set,
+            runs=pending.total_runs,
+        )
+        if code:
+            return code
+
+    interrupt = Interrupt()
+
+    def progress(outcome: object, done: int, total: int) -> None:
+        print(
+            t(
+                "cli.pilot.progress",
+                done=done,
+                total=total,
+                scenario=t(f"scenario.{outcome.trio.scenario.value}"),
+                seed=outcome.trio.seed,
+                status=t(f"campaign.status.{outcome.status}"),
+                seconds=format_number(outcome.seconds),
+            )
+        )
+
+    def execute() -> int:
+        # Checked again under the lock: only what was priced and confirmed runs.
+        if _pending_changed(root, pending, pending_trios(derived, plan, root, resume=resume)):
+            return 5
+        try:
+            result = run_campaign_parallel(
+                derived,
+                pending,
+                root,
+                workers=workers,
+                resume=resume,
+                progress=progress,
+                interrupt=interrupt,
+            )
+            print(
+                t(
+                    "cli.pilot.done",
+                    completed=len(result.by_status("completed")),
+                    skipped=len(result.by_status("skipped")),
+                    failed=len(result.failed),
+                    minutes=format_number(result.wall_seconds / 60),
+                )
+            )
+            _print_failed_trios(result)
+        finally:
+            # Whatever happened to the batch, an exception included: the spend
+            # it records happened either way.
+            # One condition at a time the stage is not whole yet: billing is
+            # checked for what ran, not against the full plan.
+            report = _write_billing(
+                root, expected_runs=None if only_condition is not None else plan.total_runs
+            )
+
+        if interrupt.should_stop():
+            return _stopped(root)
+        if result.failed or not billing_passed(report):
+            print(t("error.pilot.failed"), file=sys.stderr)
+            return 7
+        return 0
+
+    # Held from the first trio to the billing verification: a second process
+    # on the same stage would find the same trios pending and pay for them too.
+    return _locked(root, execute, break_lock=break_lock, interrupt=interrupt)
+
+
 def _confirm_real_batch(
     config: SimulationConfig,
     estimate: object | None,
@@ -1243,6 +1493,50 @@ def _parse_model_pricing(spec: str | None) -> dict[str, tuple[Decimal, Decimal]]
     return table
 
 
+def _derisk_estimate(
+    config: SimulationConfig,
+    models: tuple[str, ...],
+    profile_logs: Path,
+    *,
+    horizon: int,
+    seed: int,
+    pricing_overrides: dict[str, tuple[Decimal, Decimal]] | None = None,
+):
+    """Price the comparison: one trio per model, each as a campaign prices a trio.
+
+    Each arm goes through ``estimate_cost`` on a one-trio plan of its own cell,
+    at its own price: the cell's measured medians rather than every cell pooled,
+    the measured real output rate, the worst case at the caps and the retry
+    multiplier. Returns the arms summed into one estimate.
+    """
+    from rpg_economy.campaign.cost import CostError
+    from rpg_economy.campaign.derisk import derisk_config
+
+    if not models:
+        raise CostError("no models to compare", key="error.derisk.no_models")
+    profile = _stage_profile(profile_logs)
+    overrides = pricing_overrides or {}
+    estimates = []
+    for model in models:
+        if model != config.llm.model and model not in overrides:
+            raise CostError(
+                f"no price for {model!r}; pass --model-pricing {model}=<in>/<out> "
+                f"per 1M tokens. Pricing a comparison model at the configured model's "
+                f"rate would understate it.",
+                key="error.cost.no_model_price",
+                model=model,
+            )
+        pricing = config.llm.pricing
+        if model in overrides:
+            rate_in, rate_out = overrides[model]
+            pricing = pricing.model_copy(
+                update={"input_per_1m_tokens": rate_in, "output_per_1m_tokens": rate_out}
+            )
+        arm = _derisk_arm(derisk_config(config, model=model, horizon=horizon), seed)
+        estimates.append(_trio_estimate(arm, profile, pricing=pricing))
+    return _summed_estimates(estimates, model=", ".join(models))
+
+
 def _summed_estimates(estimates: list, *, model: str):
     """Several estimates in one currency as one: every amount and count added."""
     from rpg_economy.campaign.cost import CostEstimate
@@ -1493,3 +1787,118 @@ def _behavior_check(
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print(t("cli.behavior.written", path=str(path)))
     return 0 if report.passed else 7
+
+
+def _behavior_audit(config: SimulationConfig, logs: list[Path], out: Path | None) -> int:
+    """Judge every activation of real runs by the behaviour obligations. Offline."""
+    import json
+
+    from rpg_economy.behavior import OBLIGATIONS, audit_log
+
+    payloads = []
+    for log in logs:
+        try:
+            report = audit_log(log, config)
+        except (OSError, ValueError, KeyError) as exc:
+            print(t("error.behavior.audit", log=str(log), detail=str(exc)), file=sys.stderr)
+            return 2
+        payloads.append(report.to_payload())
+        print(
+            t(
+                "cli.audit.header",
+                log=str(log),
+                condition=report.condition,
+                version=report.prompt_version or "-",
+                activations=report.activations,
+            )
+        )
+        for obligation in OBLIGATIONS:
+            tally = report.tallies[obligation.name]
+            if not tally.applicable:
+                continue
+            below = tally.share < obligation.threshold
+            print(
+                t(
+                    "cli.audit.line",
+                    mark="!" if below else " ",
+                    name=obligation.name,
+                    met=tally.met,
+                    applicable=tally.applicable,
+                    share=f"{tally.share:.0%}",
+                    threshold=f"{obligation.threshold:.0%}",
+                    examples=", ".join(f"{a}@{k}" for a, k in tally.misses[:4]) or "-",
+                )
+            )
+    if out is not None:
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(payloads, indent=2) + "\n", encoding="utf-8")
+        print(t("cli.behavior.written", path=str(out)))
+    return 0
+
+
+def _trio_estimate(
+    config: SimulationConfig, profile: Path | object, *, pricing: object | None = None
+):
+    """Price one trio of ``config``'s cell the way a campaign prices each of its trios.
+
+    A one-trio plan through ``estimate_cost``: per-cell medians, the measured
+    real output rate, the worst case at the caps, and an Experiment 2 trio
+    priced no higher than its token budget. ``profile`` is a directory of mock
+    logs or an already measured profile; ``pricing`` defaults to the configured
+    price.
+    """
+    from rpg_economy.campaign.plan import CampaignPhase, CampaignPlan, PlannedTrio
+
+    if isinstance(profile, (str, Path)):
+        profile = _stage_profile(Path(profile))
+
+    plan = CampaignPlan(
+        phase=CampaignPhase.PILOT,
+        trios=[
+            PlannedTrio(
+                scenario=config.run.scenario,
+                experiment=config.run.experiment,
+                seed=config.run.seed,
+            )
+        ],
+    )
+    return estimate_cost(
+        plan,
+        profile,
+        pricing if pricing is not None else config.llm.pricing,
+        model=config.llm.model,
+        horizon=config.time.horizon_ticks,
+        config=config,
+    )
+
+
+def _dashboard(log_path: Path, *, locale: str) -> int:
+    """Print the read-only observation view of one run log."""
+    from rpg_economy.dashboard import build_dashboard, render_dashboard
+
+    try:
+        data = build_dashboard(log_path)
+    except (OSError, ValueError) as exc:
+        print(t("error.dashboard.unreadable", detail=str(exc)), file=sys.stderr)
+        return 6
+    print(render_dashboard(data, locale=locale))
+    return 0
+
+
+def _print_bounds(estimate: object, *, plan_shown: bool = True) -> None:
+    """The upper bound and worst case, and what the spend limit must cover."""
+    if estimate.worst_case is not None:
+        print(
+            t(
+                "cli.campaign.cost_worst",
+                upper=estimate.upper_bound,
+                worst=estimate.worst_case,
+                currency=estimate.currency,
+                attempts=estimate.retry_attempts,
+                retried=estimate.worst_case_with_retries,
+            )
+        )
+    # The plan's own warnings are printed with the plan, not again here.
+    shown = estimate.plan_warnings if plan_shown else []
+    for warning in [w for w in estimate.warnings if w not in shown]:
+        print(t("cli.campaign.warning", detail=_localized(warning)), file=sys.stderr)
