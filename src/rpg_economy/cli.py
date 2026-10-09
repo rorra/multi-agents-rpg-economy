@@ -1422,6 +1422,232 @@ def _smoke_worst_case(config: SimulationConfig) -> Decimal:
     ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
 
+def _derisk(
+    config: object,
+    out: Path,
+    *,
+    seed: int,
+    horizon: int,
+    models: tuple[str, ...],
+    profile_logs: Path | None,
+    confirm_cost: str | None,
+    spend_limit_set: bool,
+    report_only: bool,
+    model_pricing: str | None = None,
+    allow_final_seed: bool = False,
+    break_lock: bool = False,
+) -> int:
+    """The model de-risk comparison (design v1.0 s13).
+
+    Documentation, not model selection: the design fixes gpt-5-nano regardless
+    of what this shows. It runs against the real provider, so it passes the same
+    cost gate a campaign does, plus an explicit acknowledgement that a
+    provider-side spend limit is in place -- this repository can refuse to
+    launch an unpriced batch, but it cannot cap what the provider will bill.
+    """
+    from rpg_economy.campaign.derisk import collect_comparison, derisk_config
+    from rpg_economy.logging_ import LogError
+
+    root = Path(out)
+
+    try:
+        arms = {model: derisk_config(config, model=model, horizon=horizon) for model in models}
+    except ValueError as exc:  # pydantic's ValidationError is one
+        errors = getattr(exc, "errors", None)
+        if callable(errors) and errors():
+            first = errors()[0]
+            detail = f"{'.'.join(map(str, first['loc']))}: {first['msg']}"
+        else:
+            detail = str(exc).splitlines()[0]
+        print(t("error.derisk.invalid_horizon", horizon=horizon, detail=detail), file=sys.stderr)
+        return 2
+
+    if not report_only:
+        if _refuse_final_seed(config, seed, allowed=allow_final_seed):
+            return 5
+
+        from rpg_economy.campaign.runner import trio_is_complete
+
+        def pending_arms() -> list[str]:
+            # An arm that already finished and passed the gate is kept, so a
+            # failure in the second model never re-pays the first; it is
+            # neither run nor priced, as campaign-run prices only its pending
+            # trios.
+            return [
+                model
+                for model in models
+                if not trio_is_complete(root / model, _derisk_arm(arms[model], seed))
+            ]
+
+        # Priced and confirmed before the lock, so a refused run leaves nothing
+        # behind; checked again under it, below.
+        priced = pending_arms()
+        for model in models:
+            if model not in priced:
+                print(t("cli.derisk.kept", model=model, path=str(root / model)))
+        if priced:
+            code = _derisk_gate(
+                config,
+                tuple(priced),
+                profile_logs=profile_logs,
+                model_pricing=model_pricing,
+                horizon=horizon,
+                seed=seed,
+                confirm_cost=confirm_cost,
+                spend_limit_set=spend_limit_set,
+            )
+            if code:
+                return code
+
+        interrupt = Interrupt()
+
+        def execute() -> int:
+            # Pending again, now that no other run can finish an arm between
+            # this check and the run. Only arms both priced and still pending
+            # run: one finished meanwhile is kept, and nothing unconfirmed runs.
+            still = set(pending_arms())
+            return _derisk_run(
+                config,
+                tuple(model for model in priced if model in still),
+                root,
+                horizon=horizon,
+                seed=seed,
+                interrupt=interrupt,
+            )
+
+        if priced:
+            code = _locked(root, execute, break_lock=break_lock, interrupt=interrupt)
+            if code:
+                return code
+
+    try:
+        comparison = collect_comparison(root, models, seed=seed, horizon=horizon)
+    except LogError, OSError:
+        print(t("error.run.log_unusable", path=str(root)), file=sys.stderr)
+        return 6
+    if not comparison.rates:
+        print(t("error.derisk.no_runs", path=str(root)), file=sys.stderr)
+        return 6
+
+    print()
+    print(t("cli.derisk.header", seed=comparison.seed, horizon=comparison.horizon))
+    for rate in comparison.rates:
+        print(
+            t(
+                "cli.derisk.row",
+                model=rate.model,
+                condition=t(f"condition.{rate.condition}") if rate.condition else "-",
+                invalid=format_number(rate.invalid_output_rate, 3),
+                wasted=format_number(rate.wasted_activation_rate, 3),
+                director=format_number(rate.director_error_rate, 3),
+                calls=format_number(rate.llm_calls),
+            )
+        )
+        print(
+            t(
+                "cli.derisk.row2",
+                tasks=f"{rate.tasks_aligned}/{rate.tasks_assigned}",
+                alignment=f"{rate.task_alignment_rate:.0%}" if rate.tasks_assigned else "—",
+                messages=f"{rate.messages_sent}",
+                statuses=", ".join(f"{k} {v}" for k, v in sorted(rate.result_status.items()))
+                or "—",
+            )
+        )
+
+    import json
+
+    (root / "derisk.json").write_text(
+        json.dumps(comparison.to_payload(), indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    print(t("cli.derisk.written", path=str(root / "derisk.json")))
+    return 0
+
+
+def _derisk_gate(
+    config: SimulationConfig,
+    models: tuple[str, ...],
+    *,
+    profile_logs: Path | None,
+    model_pricing: str | None,
+    horizon: int,
+    seed: int,
+    confirm_cost: str | None,
+    spend_limit_set: bool,
+) -> int:
+    """Price the arms still to run and check the confirmation; 0 to go ahead.
+
+    The same gate a campaign passes: a priced batch, an acknowledged spend
+    limit, and the printed total confirmed by value.
+    """
+    from decimal import InvalidOperation
+
+    from rpg_economy.campaign.cost import CostError
+
+    if _refuse_mock_budget(config):
+        return 5
+    estimate = None
+    if profile_logs is not None:
+        if config.llm.pricing is None:
+            print(
+                t("error.campaign.invalid", detail=t("error.cost.no_pricing")),
+                file=sys.stderr,
+            )
+            return 4
+        try:
+            estimate = _derisk_estimate(
+                config,
+                models,
+                profile_logs,
+                horizon=horizon,
+                seed=seed,
+                pricing_overrides=_parse_model_pricing(model_pricing),
+            )
+        except CostError as exc:
+            # A missing --model-pricing, or no profile to price from: refused
+            # like any unpriceable batch.
+            print(t("error.campaign.invalid", detail=_localized(exc)), file=sys.stderr)
+            return 4
+        except InvalidOperation:
+            print(
+                t(
+                    "error.campaign.invalid",
+                    detail=t("error.cost.bad_model_pricing", spec=repr(model_pricing)),
+                ),
+                file=sys.stderr,
+            )
+            return 4
+        print(
+            t(
+                "cli.derisk.cost",
+                models=", ".join(models),
+                total=estimate.total_cost,
+                currency=estimate.currency,
+                horizon=horizon,
+                seed=seed,
+            )
+        )
+        _print_bounds(estimate, plan_shown=False)
+
+    if estimate is None:
+        print(t("error.campaign.unpriced"), file=sys.stderr)
+        return 5
+    if not spend_limit_set:
+        print(t("error.derisk.no_spend_limit"), file=sys.stderr)
+        return 5
+    if confirm_cost != str(estimate.total_cost):
+        print(
+            t(
+                "error.campaign.unconfirmed",
+                total=str(estimate.total_cost),
+                currency=estimate.currency,
+                runs=len(models) * 3,
+            ),
+            file=sys.stderr,
+        )
+        return 5
+    return 0
+
+
 def _derisk_run(
     config: SimulationConfig,
     models: tuple[str, ...],
@@ -1834,6 +2060,112 @@ def _behavior_audit(config: SimulationConfig, logs: list[Path], out: Path | None
         out.write_text(json.dumps(payloads, indent=2) + "\n", encoding="utf-8")
         print(t("cli.behavior.written", path=str(out)))
     return 0
+
+
+def _trio(
+    config: object,
+    out: Path,
+    *,
+    experiment: str | None,
+    profile_logs: Path | None,
+    confirm_cost: str | None,
+    replay: bool,
+    good: str | None,
+    locale: str,
+    spend_limit_set: bool = False,
+    allow_final_seed: bool = False,
+    break_lock: bool = False,
+) -> int:
+    """Run one seed-paired trio and render its replay.
+
+    The mock path runs freely. A real-provider trio passes the same gate as a
+    campaign: priced from measured mock runs first, and the printed total
+    confirmed by value. Either way it holds the output directory's lock while
+    it runs, as a campaign does.
+    """
+    from rpg_economy.campaign.cost import CostError
+    from rpg_economy.campaign.parallel import run_trio_parallel
+
+    if experiment is not None:
+        try:
+            config = config.for_cell(
+                scenario=config.run.scenario,
+                experiment=ExperimentRegime(experiment),
+                seed=config.run.seed,
+            )
+        except ValueError as exc:  # e.g. Experiment 2 without a derived budget
+            print(t("error.config.invalid", detail=str(exc).splitlines()[0]), file=sys.stderr)
+            return 2
+    seed = config.run.seed
+
+    if not config.llm.mock:
+        if _refuse_final_seed(config, seed, allowed=allow_final_seed):
+            return 5
+        if _refuse_mock_budget(config):
+            return 5
+        if profile_logs is None or config.llm.pricing is None:
+            print(t("error.campaign.unpriced"), file=sys.stderr)
+            return 5
+        if not spend_limit_set:
+            print(t("error.derisk.no_spend_limit"), file=sys.stderr)
+            return 5
+        try:
+            estimate = _trio_estimate(config, profile_logs)
+        except CostError as exc:
+            print(t("error.campaign.invalid", detail=_localized(exc)), file=sys.stderr)
+            return 4
+        print(t("cli.trio.cost", total=estimate.total_cost, currency=config.llm.pricing.currency))
+        _print_bounds(estimate, plan_shown=False)
+        if confirm_cost != str(estimate.total_cost):
+            print(
+                t(
+                    "error.campaign.unconfirmed",
+                    total=str(estimate.total_cost),
+                    currency=config.llm.pricing.currency,
+                    runs=3,
+                ),
+                file=sys.stderr,
+            )
+            return 5
+
+    print(
+        t(
+            "cli.trio.running",
+            seed=seed,
+            scenario=t(f"scenario.{config.run.scenario.value}"),
+            experiment=t(f"experiment.{config.run.experiment.value}"),
+            mode=t("cli.trio.mock") if config.llm.mock else config.llm.model,
+        )
+    )
+    from rpg_economy.campaign.runner import set_aside_previous
+    from rpg_economy.integrity import TrioIntegrityError
+    from rpg_economy.llm import ProviderError
+    from rpg_economy.logging_ import LogError
+    from rpg_economy.runner import RunInterrupted
+
+    interrupt = Interrupt()
+
+    def execute() -> int:
+        try:
+            # A second run into the same directory keeps the first one, set aside.
+            set_aside_previous(out)
+            run_trio_parallel(config, out, seed=seed, interrupt=interrupt)
+        except RunInterrupted:
+            return _stopped(Path(out))
+        except ProviderError as exc:
+            print(t("error.provider.failed", detail=str(exc)), file=sys.stderr)
+            return 8
+        except (LogError, OSError, TrioIntegrityError) as exc:
+            return _unusable_run(exc, Path(out))
+        print(t("cli.trio.done", path=str(out)))
+
+        if not replay:
+            return 0
+        return _replay(
+            out, out / "replay", locale=locale, good=good, all_locales=True, config=config
+        )
+
+    return _locked(Path(out), execute, break_lock=break_lock, interrupt=interrupt)
 
 
 def _trio_estimate(
