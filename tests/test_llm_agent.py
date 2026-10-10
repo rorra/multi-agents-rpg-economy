@@ -2504,3 +2504,407 @@ def test_the_logged_observation_carries_the_own_trades(tmp_path: Path) -> None:
     assert payload["own_trades"] == [
         {"tick": engine.tick, "side": "sell", "good": "iron", "quantity": 1, "price": "9"}
     ]
+
+
+def test_prose_after_the_json_object_does_not_spoil_it() -> None:
+    from rpg_economy.agents.parsing import extract_json
+
+    text = 'Here: {"action": "wait"} and a note with a brace } at the end.'
+    assert extract_json(text) == {"action": "wait"}
+
+
+def test_a_reply_cut_off_mid_batch_is_invalid_not_its_first_order() -> None:
+    """An inner object of an unfinished reply must never pass for the decision."""
+    from rpg_economy.agents.parsing import InvalidAgentOutput, parse_activation
+    from rpg_economy.domain import Condition
+
+    cut = (
+        '{"action": "place_orders", "orders": [{"action": "buy", "target": "iron", '
+        '"quantity": 2, "price": 9}, {"action": "sell", "tar'
+    )
+    with pytest.raises(InvalidAgentOutput):
+        parse_activation(cut, condition=Condition.B)
+
+
+def test_the_world_rules_carry_a_price_guide() -> None:
+    """Pilot: with no anchor, real agents sold a bow at 1.2 gold."""
+    from rpg_economy.agents.prompts import render_world
+
+    config = make_config()
+    text = render_world(config)
+    assert "Price guide" in text and "not an official price" in text
+    for good, price in config.economy.initial_reference_price.items():
+        assert f"{good} {price}" in text
+
+
+def test_the_artisan_brief_says_gold_comes_only_from_selling() -> None:
+    """Pilot: real artisans crafted and kept everything, and went broke."""
+    from rpg_economy.agents.prompts import ROLE_BRIEF
+    from rpg_economy.domain import Role
+
+    brief = ROLE_BRIEF[Role.ARTISAN]
+    assert "only from selling what you craft" in brief
+    assert "storage fee every tick" in brief
+
+
+def test_an_artisans_world_rules_leave_out_gathering() -> None:
+    """Zones, rest and wear are only noise to an artisan; the rest stays."""
+    from rpg_economy.agents.prompts import render_world
+    from rpg_economy.domain import Role
+
+    config = make_config()
+    artisan = render_world(config, Role.ARTISAN)
+    adventurer = render_world(config, Role.ADVENTURER)
+    director = render_world(config)
+    for text in (artisan, adventurer, director):
+        assert "Recipes" in text and "Price guide" in text and "Costs:" in text
+    assert "Zones:" not in artisan and "Equipment wear" not in artisan
+    assert "Zones:" in adventurer and "Equipment wear" in adventurer
+    assert director == adventurer
+
+
+def test_headlines_name_wanted_raw_materials_and_missing_inputs(rig) -> None:
+    """2.29: adventurers sat on raw materials buyers bid for, and
+    smiths without iron never bid for it."""
+    from rpg_economy.domain import OrderSide, Resource
+
+    config, engine, messages = rig
+
+    def state(agent: str) -> str:
+        observation = build_observation(config, engine, agent, messages=messages)
+        return build_agent_prompt(observation, config).sections["state"]
+
+    engine.state.account("smithing_2").gold += Decimal("100")
+    engine.submit_order("smithing_2", OrderSide.BUY, Resource.IRON, 2, "10.00")
+    ranger = engine.state.account("ranger_1")
+    ranger.inventory = {Resource.IRON: 2, Product.HEALTH_POTION: 1}
+    ranger_state = state("ranger_1")
+    assert (
+        "Wanted: iron: you hold 2 and nobody else offers it; buyers bid 10.00 so far, and you "
+        "set the price"
+    ) in ranger_state
+    observation = build_observation(config, engine, "ranger_1", messages=messages)
+    market = build_agent_prompt(observation, config).sections["market"]
+    assert "raw materials: you only sell them; the market refuses your bids" in market
+    signals = build_observation(config, engine, "ranger_1", messages=messages).signals
+    assert any(line.startswith("- iron (you only sell it): SHORT") for line in signals)
+
+    engine.state.account("warrior_1").gold += Decimal("50")
+    engine.submit_order("warrior_1", OrderSide.BUY, Product.MELEE_WEAPON, 1, "46.00")
+    smith = engine.state.account("smithing_1")
+    smith.inventory = {Resource.LEATHER: 1}
+    guide = config.economy.initial_reference_price["iron"]
+    assert (
+        "Wanted: melee_weapon: buyers bid 46.00 and nobody sells it; each run needs 2 iron "
+        f"(nobody offers any: bid about {guide:.2f}), which you lack, and your capacity allows"
+    ) in state("smithing_1")
+    # Told only "bid for the inputs", alchemists bid the guide below the ask.
+    engine.state.account("ranger_2").receive(Resource.IRON, 2)
+    engine.submit_order("ranger_2", OrderSide.SELL, Resource.IRON, 2, "10.40")
+    assert "each run needs 2 iron (offered at 10.40: a bid at that price buys now)" in state(
+        "smithing_1"
+    )
+
+
+def test_an_offer_at_or_below_cost_is_not_told_to_ask_less(rig) -> None:
+    """2.29: told only "ask less", smiths cut armor worth 48 to 41."""
+    from rpg_economy.domain import OrderSide
+
+    config, engine, messages = rig
+    engine.state.account("smithing_2").receive(Product.ARMOR, 1)
+    engine.submit_order("smithing_2", OrderSide.SELL, Product.ARMOR, 1, "30.00")
+    observation = build_observation(config, engine, "smithing_1", messages=messages)
+    armor = next(line for line in observation.signals if line.startswith("- armor:"))
+    assert "offered at 30.00 with no bids, at or below its cost" in armor
+    assert "ask less" not in armor
+
+
+def test_stock_already_on_its_own_orders_is_named(rig) -> None:
+    """2.30: artisans re-offered goods already on their sell orders."""
+    from rpg_economy.domain import OrderSide
+
+    config, engine, messages = rig
+    engine.state.account("smithing_1").receive(Product.ARMOR, 2)
+    engine.submit_order("smithing_1", OrderSide.SELL, Product.ARMOR, 2, "52.00")
+    observation = build_observation(config, engine, "smithing_1", messages=messages)
+    armor = next(line for line in observation.signals if line.startswith("- armor:"))
+    assert "all 2 you hold are on your own sell orders: cancel one to reprice" in armor
+
+
+def test_an_expired_bid_says_bid_higher_only_when_nothing_is_offered(rig) -> None:
+    """Told "bid higher" while sellers offered, buyers chased every ask
+    and raw prices never came back once supply returned."""
+    from rpg_economy.domain import OrderSide, Resource
+
+    config, engine, messages = rig
+    alchemist = engine.state.account("alchemy_1")
+    alchemist.gold += Decimal("100")
+    engine.submit_order("alchemy_1", OrderSide.BUY, Resource.HERBS, 1, "5.00")
+    for _ in range(config.market.order_expiry_ticks + 1):
+        engine.run_cycle()
+
+    def herbs_line() -> str:
+        signals = build_observation(config, engine, "alchemy_1", messages=messages).signals
+        return next(line for line in signals if line.startswith("- herbs:"))
+
+    assert "expired with nothing bought: bid about 5.50 to get any" in herbs_line()
+
+    engine.state.account("ranger_1").receive(Resource.HERBS, 1)
+    engine.submit_order("ranger_1", OrderSide.SELL, Resource.HERBS, 1, "9.00")
+    line = herbs_line()
+    assert "expired with nothing bought; sellers ask 9.00" in line
+    assert "bid higher" not in line
+
+
+def test_a_buyer_whose_bids_filled_is_told_a_lower_bid_may_fill(rig) -> None:
+    """Once supply returned, buyers kept paying the shock price and
+    the herb price never came back."""
+    from rpg_economy.domain import OrderSide, Resource
+
+    config, engine, messages = rig
+    engine.state.account("alchemy_1").gold += Decimal("100")
+    engine.state.account("ranger_1").receive(Resource.HERBS, 2)
+    engine.submit_order("ranger_1", OrderSide.SELL, Resource.HERBS, 1, "10.00")
+    engine.submit_order("alchemy_1", OrderSide.BUY, Resource.HERBS, 1, "10.00")
+
+    def herbs_line(agent: str) -> str:
+        signals = build_observation(config, engine, agent, messages=messages).signals
+        return next((line for line in signals if line.startswith("- herbs")), "")
+
+    assert "may also fill" not in herbs_line("alchemy_1")
+    engine.submit_order("ranger_1", OrderSide.SELL, Resource.HERBS, 1, "10.00")
+    assert (
+        "your bids filled and sellers still offer at 10.00: a bid of about 8.00 may also fill"
+    ) in herbs_line("alchemy_1")
+    # Only artisans buying inputs: adventurers' gear purchases are never pushed down.
+    assert "may also fill" not in herbs_line("ranger_2")
+
+
+def test_wanted_is_not_shown_while_the_stock_limit_blocks_the_craft(rig) -> None:
+    """The line "your inputs allow 1 run now" sat two lines above "not allowed"."""
+    from rpg_economy.domain import OrderSide, Resource
+
+    config, engine, messages = rig
+    alchemist = engine.state.account("alchemy_1")
+    alchemist.receive(Product.HEALTH_POTION, 2)
+    alchemist.receive(Resource.HERBS, 1)
+    engine.state.account("mage_1").gold += Decimal("20")
+    engine.submit_order("mage_1", OrderSide.BUY, Product.HEALTH_POTION, 1, "10.00")
+    status = build_observation(config, engine, "alchemy_1", messages=messages).status
+    assert not any(x.startswith("Wanted: health_potion") for x in status)
+    assert any(x.startswith("Ready to sell: health_potion x2") for x in status)
+
+
+def test_an_adventurer_sees_how_crowded_each_zone_is_and_what_a_trip_is_worth(rig) -> None:
+    """22 trips of 23 went to the safe zone, never told what the others paid."""
+    config, engine, messages = rig
+    status = build_observation(config, engine, "warrior_1", messages=messages).status
+    (line,) = [x for x in status if x.startswith("Zones now: ")]
+    for zone in ("green_hollow", "iron_marches", "arcane_deeps"):
+        assert f"{zone}: 0 trips set out in the last 30 ticks (even, success +0.00)" in line
+    assert "green_hollow: 0 trips" in line and "a success likely finds about 3 units and" in line
+    assert " gold" in line
+    assert "a tick with the rest after it" in line
+    # Artisans do not go on expeditions.
+    artisan = build_observation(config, engine, "smithing_1", messages=messages).status
+    assert not any(x.startswith("Zones now") for x in artisan)
+
+
+def test_the_world_says_what_each_zone_yields_most_and_that_crowds_share_it(rig) -> None:
+    from rpg_economy.agents.prompts import render_world
+    from rpg_economy.domain import Role
+
+    config, _engine, _messages = rig
+    world = render_world(config, Role.ADVENTURER)
+    assert "green_hollow: risk low, 2 ticks" in world and "mostly herbs (" in world
+    assert "a success carries up to 7 units, as many as the zone holds" in world
+    assert "Its gold is limited the same way" in world
+    assert "trips that arrive together share it" in world
+    assert "0.02 less success for each trip over that share, up to 0.15" in world
+
+
+def test_a_narrow_raw_material_spread_suggests_meeting_halfway(rig) -> None:
+    """Alchemists bid 6.00 and adventurers asked 6.60 for herbs, and no
+    herb traded for 30 ticks."""
+    from rpg_economy.domain import OrderSide, Resource
+
+    config, engine, messages = rig
+    engine.state.account("ranger_1").receive(Resource.HERBS, 2)
+    engine.submit_order("ranger_1", OrderSide.SELL, Resource.HERBS, 2, "6.60")
+    engine.state.account("alchemy_2").gold += Decimal("20")
+    engine.submit_order("alchemy_2", OrderSide.BUY, Resource.HERBS, 1, "6.00")
+
+    def line(agent: str, good: str) -> str:
+        signals = build_observation(config, engine, agent, messages=messages).signals
+        return next(x for x in signals if x.startswith(f"- {good}"))
+
+    assert "bid 6.00, offered 6.60: a deal at about 6.30, halfway, would trade" in line(
+        "alchemy_1", "herbs"
+    )
+    # A wide spread, and products, get no midpoint.
+    engine.state.account("ranger_2").receive(Resource.IRON, 1)
+    engine.submit_order("ranger_2", OrderSide.SELL, Resource.IRON, 1, "20.00")
+    engine.state.account("smithing_2").gold += Decimal("20")
+    engine.submit_order("smithing_2", OrderSide.BUY, Resource.IRON, 1, "10.00")
+    assert "halfway" not in line("smithing_1", "iron")
+    engine.state.account("smithing_2").receive(Product.ARMOR, 1)
+    engine.submit_order("smithing_2", OrderSide.SELL, Product.ARMOR, 1, "66.00")
+    engine.state.account("mage_2").gold += Decimal("70")
+    engine.submit_order("mage_2", OrderSide.BUY, Product.ARMOR, 1, "63.00")
+    assert "halfway" not in line("warrior_1", "armor")
+
+
+def test_a_bid_at_input_cost_is_not_a_reason_to_sell(rig) -> None:
+    """Told a 6.00 bid was "above its 6.00 input cost", alchemists sold
+    every potion for the price of its herb."""
+    from rpg_economy.domain import OrderSide
+
+    config, engine, messages = rig
+    engine.state.account("alchemy_1").receive(Product.HEALTH_POTION, 1)
+    mage = engine.state.account("mage_1")
+    mage.gold += Decimal("50")
+    engine.submit_order("mage_1", OrderSide.BUY, Product.HEALTH_POTION, 1, "6.00")
+
+    def seen() -> tuple[list[str], str]:
+        observation = build_observation(config, engine, "alchemy_1", messages=messages)
+        line = next(x for x in observation.signals if x.startswith("- health_potion"))
+        return observation.status, line
+
+    status, line = seen()
+    assert not any(x.startswith("Ready to sell") for x in status)
+    assert not any("sell some" in x for x in status)
+    assert "the only bid is 6.00, equal to what one costs you: selling there earns nothing" in line
+    # Told holding costs storage but never how little, they sold "to reduce storage".
+    assert "holding one costs 0.03 a tick, so waiting for a buyer near its 10.00 reference" in line
+
+    engine.submit_order("mage_1", OrderSide.BUY, Product.HEALTH_POTION, 1, "7.00")
+    status, line = seen()
+    assert any(x.startswith("Ready to sell: health_potion x1: buyers bid 7.00") for x in status)
+
+
+def test_a_price_far_from_its_typical_level_says_both(rig) -> None:
+    """The last trades were all the shock's, and herbs stayed at 2.6x
+    base through the recovery."""
+    from rpg_economy.domain import OrderSide, Resource
+
+    config, engine, messages = rig
+    assert config.market.usual_price_ticks == 340
+
+    def trade(price: str) -> None:
+        engine.state.account("ranger_1").receive(Resource.HERBS, 1)
+        engine.state.account("alchemy_1").gold += Decimal("20")
+        engine.submit_order("ranger_1", OrderSide.SELL, Resource.HERBS, 1, price)
+        engine.submit_order("alchemy_1", OrderSide.BUY, Resource.HERBS, 1, price)
+
+    def herbs_line() -> str:
+        signals = build_observation(config, engine, "alchemy_2", messages=messages).signals
+        return next((line for line in signals if line.startswith("- herbs")), "")
+
+    # Too few trades for a typical price, so the guide stands in.
+    trade("3.00")
+    assert "the price guide puts it at 6.00; the latest trade was 3.00" in herbs_line()
+
+    for price in ("6.30", "6.30", "6.30", "6.30", "6.30", "17.00"):
+        trade(price)
+    assert "it typically traded at 6.30 over the last 340 ticks; the latest trade was 17.00" in (
+        herbs_line()
+    )
+    trade("7.00")
+    line = herbs_line()
+    assert "typically" not in line
+    assert "price guide" not in line
+
+
+def test_the_artisan_brief_says_a_sale_at_cost_earns_nothing(rig) -> None:
+    """Told a held product "earns nothing and pays storage", alchemists
+    sold every potion at its input cost to clear stock."""
+    from rpg_economy.agents.prompts import ROLE_BRIEF
+    from rpg_economy.domain import Role
+
+    brief = ROLE_BRIEF[Role.ARTISAN]
+    assert "a sale at or below that cost earns nothing" in brief
+    assert "small storage fee" in brief and "so hold out for one" in brief
+
+
+def test_the_rules_read_a_price_reference_as_a_reference_not_a_limit(rig) -> None:
+    """Agents should know the reference without refusing to trade away from it."""
+    from rpg_economy.agents.prompts import RULES
+
+    assert "a reference for what it is worth, not a limit" in RULES
+    assert "above the reference if that is what it takes to trade" in RULES
+    assert "not from the guide" not in RULES
+
+
+def test_a_price_signal_suggests_a_step_and_never_below_cost(rig) -> None:
+    """Told only "ask less", sellers cut 0.05 at a time and the herb
+    price took the whole recovery to fall 3%."""
+    from rpg_economy.domain import OrderSide, Resource
+
+    config, engine, messages = rig
+    assert config.market.price_step_pct == Decimal("0.10")
+    engine.state.account("ranger_2").receive(Resource.HERBS, 1)
+    engine.submit_order("ranger_2", OrderSide.SELL, Resource.HERBS, 1, "8.00")
+    ranger = build_observation(config, engine, "ranger_1", messages=messages).signals
+    assert (
+        "- herbs (you only sell it): offered at 8.00 with no bids: a seller who wants to "
+        "sell must ask about 7.00"
+    ) in ranger
+
+    # An artisan's product: the step stops at the input cost.
+    from rpg_economy.agents.observation import unit_cost
+
+    smith = engine.state.account("smithing_2")
+    smith.receive(Product.ARMOR, 1)
+    cost = unit_cost(config, engine.market, Product.ARMOR)
+    price = (cost * Decimal("1.05")).quantize(Decimal("0.01"))
+    engine.submit_order("smithing_2", OrderSide.SELL, Product.ARMOR, 1, str(price))
+    armor = next(
+        line
+        for line in build_observation(config, engine, "smithing_1", messages=messages).signals
+        if line.startswith("- armor:")
+    )
+    assert f"must ask less, but not below its {cost} cost" in armor
+
+
+def test_a_raw_material_far_from_its_typical_price_moves_back_halfway(rig) -> None:
+    """10% at a time, herbs took 70 ticks to come from 14 to 10 against
+    a 6.00 typical price with sellers offering."""
+    from rpg_economy.agents.observation import moved
+    from rpg_economy.domain import Resource
+
+    config, engine, _ = rig
+    # Dear and offered: halfway down, never under the typical price.
+    assert moved(config, engine, Resource.HERBS, Decimal("14.00"), False) == Decimal("10.00")
+    assert moved(config, engine, Resource.HERBS, Decimal("6.50"), False) == Decimal("6.00")
+    # Cheap and short: halfway up.
+    assert moved(config, engine, Resource.HERBS, Decimal("3.00"), True) == Decimal("4.50")
+    # Away from it, or near it, one step.
+    assert moved(config, engine, Resource.HERBS, Decimal("6.00"), True) == Decimal("6.60")
+    assert moved(config, engine, Resource.HERBS, Decimal("4.00"), False) == Decimal("3.60")
+    # Products follow their inputs, not this.
+    assert moved(config, engine, Product.HEALTH_POTION, Decimal("20.00"), False) == Decimal("18.00")
+
+
+def test_a_buyer_facing_a_dear_ask_is_told_the_last_sale_not_the_sellers_cut(rig) -> None:
+    """Herbs sold at 5.40, one seller asked 11.39, and an alchemist told
+    "a seller who wants to sell must ask about 8.70" bid 8.70."""
+    from rpg_economy.agents.observation import market_signals
+    from rpg_economy.domain import OrderSide, Resource
+
+    config, engine, _ = rig
+    engine.state.account("warrior_1").receive(Resource.HERBS, 3)
+    engine.state.account("alchemy_2").gold += Decimal("100")
+    engine.submit_order("warrior_1", OrderSide.SELL, Resource.HERBS, 1, "5.40")
+    engine.submit_order("alchemy_2", OrderSide.BUY, Resource.HERBS, 1, "5.40")
+    engine.submit_order("warrior_1", OrderSide.SELL, Resource.HERBS, 2, "11.39")
+    alchemist = engine.state.account("alchemy_1")
+    (line,) = [
+        x for x in market_signals(config, engine, alchemist, [Resource.HERBS]) if "herbs" in x
+    ]
+    assert "offered at 11.39 with no bids, above its last sale at 5.40" in line
+    assert "a bid about 5.40 may fill" in line
+    assert "must ask" not in line
+    # The seller is still told to cut.
+    ranger = engine.state.account("ranger_1")
+    (line,) = [x for x in market_signals(config, engine, ranger, [Resource.HERBS]) if "herbs" in x]
+    assert "a seller who wants to sell must ask about 8.70" in line
