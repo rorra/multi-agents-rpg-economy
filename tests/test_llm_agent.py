@@ -1403,3 +1403,539 @@ def test_a_stray_orders_list_beside_another_action_is_ignored() -> None:
     )
     assert action.action is ActionType.WAIT
     assert not action.orders
+
+
+def test_place_orders_is_available_in_condition_a_too() -> None:
+    action = parse_action(
+        _orders_json([{"action": "sell", "target": "iron", "quantity": 1, "price": 9}]),
+        condition=Condition.A,
+    )
+    assert action.action is ActionType.PLACE_ORDERS
+
+
+def test_every_schema_explains_place_orders_and_the_cap_is_in_the_world_rules() -> None:
+    from rpg_economy.agents.prompts import ACTION_SCHEMA, ACTION_SCHEMA_A, render_world
+
+    for schema in (ACTION_SCHEMA, ACTION_SCHEMA_A):
+        assert "place_orders" in schema and '"orders"' in schema
+    config = make_config()
+    cap = config.market.max_orders_per_activation
+    assert f"one place_orders carries at most {cap} orders" in render_world(config)
+
+
+def test_the_mock_writes_orders_the_parser_reads_back() -> None:
+    from rpg_economy.agents.offline import action_to_json
+
+    orders = (
+        AgentAction(action=ActionType.SELL, target="iron", quantity=2, price=Decimal("10.5")),
+        AgentAction(action=ActionType.BUY, target="health_potion", quantity=1, price=Decimal("15")),
+    )
+    action = AgentAction(action=ActionType.PLACE_ORDERS, orders=orders, short_reason="x")
+    back = parse_action(action_to_json(action), condition=Condition.B)
+    assert [(o.action, o.target, o.quantity, o.price) for o in back.orders] == [
+        (o.action, o.target, o.quantity, o.price) for o in orders
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Prompt 2.7: the extra rest after a failed trip
+# ---------------------------------------------------------------------------
+def test_the_failure_rest_clause_states_the_extra_rest_by_risk() -> None:
+    from rpg_economy.agents.prompts import render_world
+
+    text = render_world(make_config())
+    assert "after a failed one, more by zone risk: high +4, low +1, medium +2 ticks" in text
+
+    none = make_config(
+        expeditions={"recovery_ticks_on_failure": {"low": 0, "medium": 0, "high": 0}}
+    )
+    assert "after a failed one" not in render_world(none)
+
+
+def test_the_own_order_clause_follows_the_self_trade_switch() -> None:
+    from rpg_economy.agents.prompts import render_world
+
+    assert "open order of the same agent" in render_world(make_config())
+    allowed = make_config(market={"allow_self_trade": True})
+    assert "open order of the same agent" not in render_world(allowed)
+
+
+# ---------------------------------------------------------------------------
+# Prompt 2.2: neutral world rules
+# ---------------------------------------------------------------------------
+def test_the_rules_say_place_orders_is_judged_order_by_order() -> None:
+    from rpg_economy.agents.prompts import RULES
+
+    assert "not partially applied, except place_orders" in RULES
+
+
+def test_the_adventurer_brief_states_the_away_rule_and_no_fixed_potion_use() -> None:
+    from rpg_economy.agents.prompts import ROLE_BRIEF
+
+    brief = ROLE_BRIEF[Role.ADVENTURER]
+    assert "each trip uses one up" not in brief
+    assert "While away on an expedition you can trade" in brief
+    assert "cannot equip or set out" in brief
+
+
+def test_production_is_described_in_recipe_runs() -> None:
+    from rpg_economy.agents.prompts import ACTION_SCHEMA, ACTION_SCHEMA_A, ROLE_BRIEF
+
+    for schema in (ACTION_SCHEMA, ACTION_SCHEMA_A):
+        assert "a number of recipe runs" in schema
+        assert "production_capacity_left counts runs" in schema
+    assert "capacity counted in recipe runs" in ROLE_BRIEF[Role.ARTISAN]
+
+
+def test_the_peer_visibility_line_fits_each_condition() -> None:
+    """Only B and C can tell a peer anything; in A the channel is the RESULT."""
+    from rpg_economy.agents.prompts import ACTION_SCHEMA, ACTION_SCHEMA_A, RULES
+
+    assert "unless you tell them" not in RULES
+    assert "Peers cannot see your needs unless you tell them" in ACTION_SCHEMA
+    assert "unless you tell them" not in ACTION_SCHEMA_A
+    assert "You cannot message other agents" in ACTION_SCHEMA_A
+
+
+def test_the_messaging_text_is_protocol_not_tactics() -> None:
+    from rpg_economy.agents.prompts import ACTION_SCHEMA
+
+    lowered = ACTION_SCHEMA.lower()
+    for tactic in ("another counterparty", "change your price", "look for"):
+        assert tactic not in lowered
+
+
+def test_the_task_section_states_the_task_purpose(rig) -> None:
+    from rpg_economy.domain import TaskType
+    from rpg_economy.orchestration.protocol import TASK_PURPOSES
+
+    config, engine, messages = rig
+    observation = build_observation(config, engine, "smithing_1", messages=messages)
+    task = {"task_id": "task-1", "type": "MANAGE_PROCUREMENT", "params": {}, "context": []}
+    prompt = build_agent_prompt(observation, config, condition=Condition.A, task=task)
+    assert f"MANAGE_PROCUREMENT: {TASK_PURPOSES[TaskType.MANAGE_PROCUREMENT]}" in prompt.user
+
+
+# ---------------------------------------------------------------------------
+# Parsing: ids are case-folded
+# ---------------------------------------------------------------------------
+def test_a_capitalized_target_names_the_same_good() -> None:
+    upper = parse_action(
+        json_action(action="sell", target=" Iron ", quantity=1, price=10.0),
+        condition=Condition.B,
+    )
+    assert upper.target == "iron"
+
+    batch = parse_action(
+        '{"action": "place_orders", "orders": ['
+        '{"action": "buy", "target": "HEALTH_POTION", "quantity": 1, "price": 5},'
+        '{"action": "sell", "target": "Iron", "quantity": 2, "price": 9}]}',
+        condition=Condition.B,
+    )
+    assert [o.target for o in batch.orders] == ["health_potion", "iron"]
+
+    message = parse_action(
+        json_action(
+            action="send_message",
+            message_type="OFFER",
+            target="IRON",
+            quantity=1,
+            price=10.0,
+            recipient="smithing_1",
+        ),
+        condition=Condition.B,
+    )
+    assert message.target == "iron"
+
+
+# ---------------------------------------------------------------------------
+# The WAIT after invalid output, and its log record
+# ---------------------------------------------------------------------------
+class FixedCostClient:
+    """Returns the same text at a fixed token cost per call."""
+
+    model = "fixed"
+
+    def __init__(self, text: str, tokens: int) -> None:
+        self.text, self.tokens, self.calls = text, tokens, 0
+
+    def complete(self, *, system: str, user: str):
+        from rpg_economy.llm.client import LLMResponse
+
+        self.calls += 1
+        return LLMResponse(
+            text=self.text, input_tokens=self.tokens, output_tokens=0, model=self.model
+        )
+
+
+def test_the_wait_says_invalid_output_when_the_retry_spends_the_budget(rig) -> None:
+    """Both attempts invalid; the second call exhausts the budget. The loop
+    ended because the output was invalid, not because the budget stopped it."""
+    from rpg_economy.llm.budget import TokenBudget
+
+    config, engine, messages = rig
+    client = FixedCostClient("not json", tokens=100)
+    budget = TokenBudget(cap=150)
+    agents = LLMAgentRunner(config, client, TokenLedger(), messages=messages, budget=budget)
+    result = agents.activate(engine, "woodworking_1")
+
+    assert client.calls == 2
+    assert budget.exhausted
+    assert result.action.action is ActionType.WAIT
+    assert result.action.short_reason == "invalid output after retry"
+
+
+def test_the_wait_says_invalid_output_when_the_budget_stops_the_retry(rig) -> None:
+    """The first attempt was invalid and spent the budget, so no retry was
+    made. A call was made and its output was invalid: that is why the
+    activation ended in WAIT, not that the budget stopped it."""
+    from rpg_economy.agents.llm_agent import WAIT_INVALID_NO_RETRY
+    from rpg_economy.llm.budget import TokenBudget
+
+    config, engine, messages = rig
+    client = FixedCostClient("not json", tokens=100)
+    budget = TokenBudget(cap=50)
+    agents = LLMAgentRunner(config, client, TokenLedger(), messages=messages, budget=budget)
+    result = agents.activate(engine, "woodworking_1")
+
+    assert client.calls == 1
+    assert result.action.short_reason == WAIT_INVALID_NO_RETRY
+    assert "invalid output" in result.action.short_reason
+    assert result.invalid_outputs == 1
+
+
+def test_the_wait_says_budget_exhausted_only_when_no_call_was_made(rig) -> None:
+    from rpg_economy.llm.budget import TokenBudget
+
+    config, engine, messages = rig
+    client = FixedCostClient("not json", tokens=100)
+    budget = TokenBudget(cap=50)
+    budget.charge(60, tick=0, cycle=0)
+    assert not budget.may_call()
+    agents = LLMAgentRunner(config, client, TokenLedger(), messages=messages, budget=budget)
+    result = agents.activate(engine, "woodworking_1")
+
+    assert client.calls == 0
+    assert result.action.short_reason == "budget exhausted"
+
+
+def test_invalid_output_is_logged_in_full(rig) -> None:
+    config, engine, messages = rig
+    long_invalid = "no action here " * 60
+    agents, _ = runner(config, engine, messages, always(long_invalid))
+    agents.activate(engine, "woodworking_1")
+    engine.log.close()
+
+    invalid = [e for e in read_events(engine.log.path) if e.type is EventType.AGENT_OUTPUT_INVALID]
+    assert len(invalid) == MAX_ATTEMPTS
+    assert all(e.payload["raw"] == long_invalid for e in invalid)
+
+
+# ---------------------------------------------------------------------------
+# The offline mock: its messaging draws leave the agents' decisions alone
+# ---------------------------------------------------------------------------
+def test_the_mock_draws_its_messages_from_a_stream_of_its_own(tmp_path: Path) -> None:
+    """B's mock messages must not shift the rule-based draws A makes.
+
+    The same artisans answer the same prompts in A and in B; afterwards every
+    agent's own stream is in the same state in both, while B did send messages.
+    """
+    import json as _json
+
+    from rpg_economy.agents.offline import rule_based_responder
+
+    states = {}
+    sent = {}
+    for condition in ("A", "B"):
+        config = make_config(run={"condition": condition})
+        with EventLogWriter(tmp_path / f"{condition}.jsonl", make_metadata(config)) as log:
+            engine = Engine(config, build_world(config), log)
+            # A smith with only a finished weapon to sell and no gold: its
+            # action is a single sell, which the mock may turn into an OFFER.
+            smith = engine.state.account("smithing_1")
+            smith.inventory.clear()
+            smith.gold = Decimal(0)
+            smith.receive(Product.MELEE_WEAPON, 3)
+            respond = rule_based_responder(config, engine, reply_to_messages=False)
+            replies = [_json.loads(respond("", '"agent_id":"smithing_1"')) for _ in range(20)]
+            sent[condition] = sum(1 for r in replies if r["action"] == "send_message")
+            states[condition] = {
+                a: engine.random.agent(a).getstate() for a in engine.state.agent_ids
+            }
+
+    assert sent["A"] == 0
+    assert sent["B"] > 0, "the mock sent no message; the test proves nothing"
+    assert states["A"] == states["B"]
+
+
+def test_the_mock_never_trades_a_batch_for_one_message() -> None:
+    from rpg_economy.agents.offline import _single_quote
+
+    sell = AgentAction(action=ActionType.SELL, target="iron", quantity=1, price=Decimal("9"))
+    buy = AgentAction(action=ActionType.BUY, target="wood", quantity=1, price=Decimal("5"))
+    assert _single_quote(sell) is sell
+    one = AgentAction(action=ActionType.PLACE_ORDERS, orders=(buy,))
+    assert _single_quote(one) is buy
+    batch = AgentAction(action=ActionType.PLACE_ORDERS, orders=(sell, buy))
+    assert _single_quote(batch) is None
+    assert _single_quote(AgentAction(action=ActionType.WAIT)) is None
+
+
+# ---------------------------------------------------------------------------
+# Prompt 2.3: available gold, the wealth tax, one open proposal per good
+# ---------------------------------------------------------------------------
+def test_the_rules_say_what_available_gold_leaves_out() -> None:
+    from rpg_economy.agents.prompts import RULES
+
+    assert "gold your open orders reserve, frozen gold, and wealth tax you owe" in RULES
+
+
+def test_the_costs_state_the_wealth_tax_as_the_engine_charges_it() -> None:
+    from rpg_economy.agents.prompts import render_world
+
+    world = render_world(make_config())
+    assert "frozen gold and tax already owed not taxed" in world
+    assert "is owed (tax_owed), collected from free gold at the start of every tick" in world
+
+
+def test_the_message_rules_state_one_open_proposal_per_good() -> None:
+    from rpg_economy.agents.prompts import ACTION_SCHEMA, ACTION_SCHEMA_A
+
+    rule = "At most one REQUEST or OFFER from one agent to another about a good is open"
+    assert rule in ACTION_SCHEMA
+    assert rule not in ACTION_SCHEMA_A
+
+
+def test_the_adventurer_brief_claims_no_spread_the_config_lacks() -> None:
+    """yield_spread is equal for medium and high risk, so no 'wider spread'."""
+    from rpg_economy.agents.prompts import ROLE_BRIEF
+    from rpg_economy.domain import Role
+
+    assert "spread" not in ROLE_BRIEF[Role.ADVENTURER]
+
+
+# ---------------------------------------------------------------------------
+# RESULT fields: Condition A only
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("price", [0, "0", 0.0])
+def test_an_offer_priced_at_zero_is_read_as_unpriced(price) -> None:
+    from rpg_economy.agents.parsing import parse_activation
+
+    text = json_action(action="wait", offers=[{"good": "iron", "quantity": 2, "price": price}])
+    _, fields = parse_activation(text, condition=Condition.A)
+    (offer,) = fields.offers
+    assert offer.price is None
+
+
+def test_an_offer_with_a_negative_price_is_dropped_not_the_action() -> None:
+    from rpg_economy.agents.parsing import parse_activation
+
+    text = json_action(action="wait", offers=[{"good": "iron", "quantity": 2, "price": -1}])
+    action, fields = parse_activation(text, condition=Condition.A)
+    assert action.action is ActionType.WAIT
+    assert fields.offers == []
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"needs": "iron please"},
+        {"offers": [{"good": "gold", "quantity": 1}]},
+        {"observations": [{"signal": "x", "good": "iron"}] * 11},
+    ],
+)
+def test_b_and_c_ignore_result_fields_that_a_would_refuse(fields) -> None:
+    from rpg_economy.agents.parsing import parse_activation
+
+    text = json_action(action="wait", **fields)
+    for condition in (Condition.B, Condition.C):
+        action, result = parse_activation(text, condition=condition)
+        assert action.action is ActionType.WAIT
+        assert result.needs == result.offers == result.observations == []
+    # In A the malformed entries are dropped and the decision stands.
+    action, result = parse_activation(text, condition=Condition.A)
+    assert action.action is ActionType.WAIT
+
+
+def test_a_keeps_at_most_the_cap_of_result_entries() -> None:
+    from rpg_economy.agents.parsing import MAX_RESULT_ENTRIES, parse_activation
+
+    needs = [{"good": "iron", "quantity": 1}] * (MAX_RESULT_ENTRIES + 1)
+    _, fields = parse_activation(json_action(action="wait", needs=needs), condition=Condition.A)
+    assert len(fields.needs) == MAX_RESULT_ENTRIES
+
+
+def test_a_malformed_result_entry_is_dropped_and_the_rest_kept() -> None:
+    """Pilot: a quantity sent as text discarded whole decisions in A."""
+    from rpg_economy.agents.parsing import parse_activation
+
+    text = json_action(
+        action="buy",
+        target="iron",
+        quantity=1,
+        price=9,
+        needs=[{"good": "iron", "quantity": "a few"}, {"good": "leather", "quantity": 2}],
+        observations=[{"signal": "panic", "good": "iron"}],
+    )
+    action, fields = parse_activation(text, condition=Condition.A)
+    assert action.action is ActionType.BUY
+    assert [n.good for n in fields.needs] == ["leather"]
+    assert fields.observations == []
+
+
+# ---------------------------------------------------------------------------
+# The log: raw completions, delivered messages, the bulletin in a prompt
+# ---------------------------------------------------------------------------
+def test_a_valid_completion_is_logged_in_full(rig) -> None:
+    config, engine, messages = rig
+    text = json_action(action="wait", short_reason="nothing to do")
+    agent, _ = runner(config, engine, messages, always(text))
+    agent.activate(engine, "woodworking_1")
+    engine.log.close()
+
+    (call,) = [e for e in read_events(engine.log.path) if e.type is EventType.LLM_CALL]
+    assert call.payload["raw"] == text
+
+
+def test_delivered_messages_are_logged_with_their_tokens(rig) -> None:
+    config, engine, messages = rig
+    sent = messages.send(
+        sender_id="warrior_1",
+        recipient_id="woodworking_1",
+        message_type=MessageType.INFORM,
+        tick=0,
+        payload={"good": "iron"},
+    )
+    agent, ledger = runner(config, engine, messages, always(json_action(action="wait")))
+    agent.activate(engine, "warrior_1")  # an empty inbox delivers nothing
+    agent.activate(engine, "woodworking_1")
+    engine.log.close()
+
+    events = list(read_events(engine.log.path))
+    (delivered,) = [e for e in events if e.type is EventType.MESSAGE_DELIVERED]
+    assert delivered.agent_id == "woodworking_1"
+    assert delivered.payload["message_ids"] == [sent.message_id]
+    assert delivered.payload["tokens"] > 0
+    assert delivered.payload["tokens"] == ledger.input_tokens(TokenBucket.P2P_CONTENT)
+    assert not [e for e in events if e.type is EventType.BULLETIN_INCLUDED_IN_PROMPT]
+
+
+def test_the_bulletin_is_logged_only_when_a_prompt_carries_it(tmp_path: Path) -> None:
+    included = {}
+    for condition in (Condition.B, Condition.C):
+        config = make_config(run={"condition": condition.value})
+        with EventLogWriter(tmp_path / f"{condition.value}.jsonl", make_metadata(config)) as log:
+            engine = Engine(config, build_world(config), log)
+            engine.publish_bulletin(build_global_summary(config, engine))
+            messages = MessageBus(build_directory(engine))
+            agent, ledger = runner(config, engine, messages, always(json_action(action="wait")))
+            agent.activate(engine, "woodworking_1")
+        included[condition] = (
+            [e for e in read_events(log.path) if e.type is EventType.BULLETIN_INCLUDED_IN_PROMPT],
+            ledger,
+        )
+
+    assert included[Condition.B][0] == []
+    (event,), ledger = included[Condition.C]
+    assert event.agent_id == "woodworking_1"
+    assert event.payload["tokens"] == ledger.input_tokens(TokenBucket.BULLETIN) > 0
+
+
+# ---------------------------------------------------------------------------
+# Parsing parity with the Director's tolerance
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    "spelling", ["start_expedition", "start-expedition", "Start Expedition", " START-EXPEDITION "]
+)
+def test_an_action_spelled_with_hyphens_or_spaces_is_read(spelling: str) -> None:
+    action = parse_action(
+        json_action(action=spelling, target="green_hollow"), condition=Condition.B
+    )
+    assert action.action is ActionType.START_EXPEDITION
+
+
+def test_a_misspelled_action_is_still_invalid() -> None:
+    with pytest.raises(InvalidAgentOutput, match="unknown action"):
+        parse_action(json_action(action="start expeditions"), condition=Condition.B)
+
+
+@pytest.mark.parametrize("message_type", ["", "  ", "none", "None", "null", "NULL"])
+@pytest.mark.parametrize("condition", [Condition.A, Condition.B, Condition.C])
+def test_a_null_spelled_message_type_outside_send_message_is_ignored(
+    message_type: str, condition: Condition
+) -> None:
+    action = parse_action(
+        json_action(action="wait", message_type=message_type), condition=condition
+    )
+    assert action.message_type is None
+
+
+def test_a_null_spelled_message_type_on_send_message_is_still_invalid() -> None:
+    with pytest.raises(InvalidAgentOutput, match="unknown message_type"):
+        parse_action(
+            json_action(
+                action="send_message", message_type="none", target="iron", recipient="warrior_1"
+            ),
+            condition=Condition.B,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Tax owed is a lien the agent can see (user ruling)
+# ---------------------------------------------------------------------------
+def test_the_observation_and_prompt_show_the_tax_owed(rig) -> None:
+    import json as json_module
+
+    config, engine, messages = rig
+    engine.state.account("woodworking_1").tax_arrears = Decimal("12.34")
+    observation = build_observation(config, engine, "woodworking_1", messages=messages)
+    assert observation.tax_owed == Decimal("12.34")
+    assert observation.to_payload()["tax_owed"] == "12.34"
+
+    state = build_agent_prompt(observation, config).sections["state"]
+    payload = json_module.loads(state.split("\n", 1)[1])
+    assert payload["tax_owed"] == "12.34"
+
+
+def test_the_tax_owed_is_zero_when_nothing_is_owed(rig) -> None:
+    config, engine, messages = rig
+    observation = build_observation(config, engine, "woodworking_1", messages=messages)
+    assert observation.tax_owed == 0
+    assert '"tax_owed":"0' in build_agent_prompt(observation, config).sections["state"]
+
+
+def test_the_rules_say_owed_tax_is_a_lien_on_available_gold() -> None:
+    from rpg_economy.agents.prompts import RULES, render_world
+
+    assert "wealth tax you owe (tax_owed)" in RULES
+    assert "Tax owed is collected from free gold (see Costs)" in RULES
+    assert "cannot be spent or bid" in RULES
+    costs = render_world(make_config())
+    assert "tax already owed not taxed" in costs
+    assert "cannot be spent or bid meanwhile" in costs
+
+
+# ---------------------------------------------------------------------------
+# Prompt hashes cover every piece of code that shapes prompt text
+# ---------------------------------------------------------------------------
+def test_the_agent_prompt_hash_covers_every_payload_builder() -> None:
+    from rpg_economy.agents.observation import MarketView, Observation
+    from rpg_economy.agents.prompts import agent_prompt_sources
+    from rpg_economy.messaging import Message
+    from rpg_economy.orchestration.protocol import Result, ResultReference, Task
+
+    sources = agent_prompt_sources()
+    for function in (
+        build_agent_prompt,
+        Task.to_payload,
+        Task.to_agent_payload,
+        ResultReference.public_view,
+        Result.to_reference,
+        Message.to_payload,
+        Observation.message_payloads,
+        MarketView.to_payload,
+    ):
+        assert function in sources
+    import inspect
+
+    assert '"tax_owed": observation.tax_owed' in inspect.getsource(build_agent_prompt)
