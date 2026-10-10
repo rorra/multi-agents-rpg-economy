@@ -2,16 +2,20 @@
 
 from __future__ import annotations
 
+import collections
 from pathlib import Path
 
 import pytest
 
 from rpg_economy.domain import Condition, TokenBucket
 from rpg_economy.engine import Engine, build_world
-from rpg_economy.logging_ import EventLogWriter, EventType, read_events
-from rpg_economy.orchestration.global_view import build_global_summary, render_global_summary
-from rpg_economy.runner import run_trio
-from tests.conftest import make_config, make_metadata
+from rpg_economy.logging_ import EventLogWriter, EventType, log_digest, read_events
+from rpg_economy.orchestration.global_view import (
+    build_global_summary,
+    render_global_summary,
+)
+from rpg_economy.runner import run_condition, run_trio
+from tests.conftest import gold_flow, make_config, make_metadata
 
 CYCLES = 40
 
@@ -318,3 +322,296 @@ def test_the_bulletin_fires_no_trigger_in_a_full_run(tmp_path: Path) -> None:
     }
     assert fired[Condition.B], "no trigger fired; the comparison proves nothing"
     assert fired[Condition.B] == fired[Condition.C]
+
+
+# ---------------------------------------------------------------------------
+# Trio pairing (design v1.0 s12)
+# ---------------------------------------------------------------------------
+@pytest.mark.invariant
+def test_a_trio_shares_its_shock_type_and_tick(tmp_path: Path) -> None:
+    config = compressed()
+    runs = run_trio(config, tmp_path, seed=1001, cycles=config.time.total_cycles)
+    shocks = {c: shocks_of(r.log_path) for c, r in runs.items()}
+
+    assert shocks[Condition.A] == shocks[Condition.B] == shocks[Condition.C]
+    assert shocks[Condition.A] == [
+        ("shock_applied", config.phases.shock_tick),
+        ("shock_reverted", config.phases.reversion_tick),
+    ]
+
+
+@pytest.mark.invariant
+def test_a_trio_shares_its_agents_and_endowments(tmp_path: Path) -> None:
+    runs = run_trio(make_config(), tmp_path, seed=1001, cycles=1)
+    populations = {
+        c: sorted(
+            (a, r.state.account(a).role.value, r.state.account(a).specialization)
+            for a in r.state.agent_ids
+        )
+        for c, r in runs.items()
+    }
+    assert populations[Condition.A] == populations[Condition.B] == populations[Condition.C]
+
+
+@pytest.mark.invariant
+def test_a_trio_shares_world_random_streams(tmp_path: Path) -> None:
+    """Named streams mean an agent draws the same sequence in every condition.
+
+    Activation *order* differs between A and B/C by design, so expeditions do
+    not happen at the same ticks. What must match is the draw an agent gets on
+    its n-th expedition, which is what makes the trio one world.
+    """
+    from rpg_economy.engine import RunRandom
+
+    seeds = [RunRandom(1001), RunRandom(1001), RunRandom(1001)]
+    draws = [[r.agent("warrior_1").random() for _ in range(6)] for r in seeds]
+    assert draws[0] == draws[1] == draws[2]
+
+    runs = run_trio(make_config(), tmp_path, seed=1001, cycles=CYCLES)
+    for condition, result in runs.items():
+        assert result.config.run.seed == 1001, condition
+
+
+def test_a_trio_differs_only_in_its_condition(tmp_path: Path) -> None:
+    runs = run_trio(make_config(), tmp_path, seed=1001, cycles=1)
+    configs = {c: r.config.model_dump(mode="json") for c, r in runs.items()}
+
+    a, b = configs[Condition.A], configs[Condition.B]
+    differing = {k for k in a if a[k] != b[k]}
+    assert differing == {"run"}
+    assert a["run"]["seed"] == b["run"]["seed"]
+    assert a["run"]["scenario"] == b["run"]["scenario"]
+
+
+@pytest.mark.invariant
+def test_each_condition_in_a_trio_is_reproducible(tmp_path: Path) -> None:
+    first = run_trio(make_config(), tmp_path / "one", seed=1001, cycles=CYCLES)
+    second = run_trio(make_config(), tmp_path / "two", seed=1001, cycles=CYCLES)
+
+    for condition in Condition:
+        assert log_digest(first[condition].log_path) == log_digest(second[condition].log_path), (
+            condition
+        )
+
+
+def test_a_different_seed_gives_a_different_trio(tmp_path: Path) -> None:
+    first = run_trio(make_config(), tmp_path / "one", seed=1001, cycles=CYCLES)
+    second = run_trio(make_config(), tmp_path / "two", seed=2002, cycles=CYCLES)
+
+    for condition in Condition:
+        assert log_digest(first[condition].log_path) != log_digest(second[condition].log_path), (
+            condition
+        )
+
+
+# ---------------------------------------------------------------------------
+# Condition A end to end
+# ---------------------------------------------------------------------------
+def test_condition_a_runs_end_to_end_offline(tmp_path: Path) -> None:
+    config = make_config(run={"condition": "A"})
+    result = run_condition(config, tmp_path / "a.jsonl", cycles=CYCLES)
+    seen = collections.Counter(e.type.value for e in read_events(result.log_path))
+
+    for required in (
+        EventType.DIRECTOR_CALL,
+        EventType.DIRECTOR_TASK_ASSIGNED,
+        EventType.RESULT_RETURNED,
+        EventType.AGENT_OUTPUT,
+        EventType.ACTION_EXECUTED,
+    ):
+        assert seen.get(required.value, 0) > 0, f"condition A never produced {required}"
+
+
+@pytest.mark.invariant
+def test_condition_a_never_exceeds_the_cap_over_a_run(tmp_path: Path) -> None:
+    config = make_config(run={"condition": "A"})
+    result = run_condition(config, tmp_path / "a.jsonl", cycles=CYCLES)
+    cap = config.time.k_activations + 1
+
+    for event in read_events(result.log_path):
+        if event.type is EventType.DIRECTOR_CALL:
+            assert event.payload["call_in_cycle"] <= cap
+        if event.type is EventType.CYCLE_END:
+            assert event.payload["effective_activations"] <= config.time.k_activations
+            assert event.payload["director_calls"] <= cap
+
+
+@pytest.mark.invariant
+def test_all_three_conditions_conserve_gold(tmp_path: Path) -> None:
+    expected = build_world(make_config()).total_gold()
+    runs = run_trio(make_config(), tmp_path, seed=1001, cycles=CYCLES)
+    for condition, result in runs.items():
+        assert result.state.total_gold() == expected + gold_flow(result.log_path), condition
+
+
+@pytest.mark.invariant
+def test_the_bulletin_is_published_when_the_director_would_read_its_view(tmp_path: Path) -> None:
+    """After the cycle's mechanical ticks, before anyone acts (design s3.3)."""
+    runs = run_trio(make_config(), tmp_path, seed=1001, cycles=10)
+    events = list(read_events(runs[Condition.C].log_path))
+    for cycle in range(10):
+        in_cycle = [e for e in events if e.cycle == cycle]
+        kinds = [e.type for e in in_cycle]
+        bulletin = kinds.index(EventType.BULLETIN_PUBLISHED)
+        last_tick = max(i for i, kind in enumerate(kinds) if kind is EventType.TICK)
+        assert last_tick < bulletin
+        assert all(kind is not EventType.AGENT_OUTPUT for kind in kinds[:bulletin]), (
+            f"an agent acted before cycle {cycle}'s bulletin"
+        )
+
+
+@pytest.mark.invariant
+def test_a_provider_failure_ends_the_run_instead_of_becoming_waits(tmp_path) -> None:
+    """An outage is not an agent's decision; the run must not complete around it."""
+    from rpg_economy.llm.client import ProviderError
+    from rpg_economy.logging_ import log_is_finished
+    from rpg_economy.runner import run_condition
+    from tests.conftest import make_config
+
+    class Down:
+        model = "down"
+
+        def complete(self, *, system: str, user: str):
+            raise ProviderError("Error code: 401 - invalid_api_key")
+
+    for condition in ("A", "B"):
+        path = tmp_path / f"{condition}.jsonl"
+        with pytest.raises(ProviderError):
+            run_condition(make_config(run={"condition": condition}), path, client=Down(), cycles=10)
+        assert not log_is_finished(path)
+
+
+# ---------------------------------------------------------------------------
+# Two-level stop: abort a run mid-way, or stop a trio between conditions
+# ---------------------------------------------------------------------------
+def test_an_abort_mid_run_leaves_an_unfinished_log(tmp_path: Path) -> None:
+    from rpg_economy.logging_ import log_is_finished
+    from rpg_economy.runner import INTERRUPT_ABORT, RunInterrupted
+
+    config = make_config(run={"condition": "B"})
+    asked = []
+
+    def should_abort() -> bool:
+        asked.append(True)
+        return len(asked) > 3  # three cycles run, the fourth is refused
+
+    path = tmp_path / "b.jsonl"
+    with pytest.raises(RunInterrupted) as caught:
+        run_condition(config, path, cycles=10, should_abort=should_abort)
+
+    assert caught.value.reason == INTERRUPT_ABORT
+    assert caught.value.interrupted is Condition.B
+    assert caught.value.completed == {}
+    assert caught.value.log_path == path
+    assert not log_is_finished(path)
+    events = events_of(path)
+    assert EventType.RUN_END not in {e.type for e in events}
+    assert events[-1].type is EventType.RUN_ABORTED
+    aborted = events[-1].payload
+    assert aborted["cycles_completed"] == 3
+    assert aborted["cycles_planned"] == 10
+    assert sum(e.type is EventType.CYCLE_END for e in events) == 3
+    # The spend so far is in the aborted run's own log, in tokens_consumed's
+    # shape: the ledger snapshot and the budget's.
+    assert {"grand_total", "authoritative_total", "billed_total", "budget"} <= aborted.keys()
+    assert aborted["budget"]["cap"] is None
+
+
+def test_run_aborted_carries_what_tokens_consumed_carries(tmp_path: Path) -> None:
+    from rpg_economy.runner import RunInterrupted
+
+    config = make_config(run={"condition": "B"})
+    cycles = 6
+    finished = run_condition(config, tmp_path / "done.jsonl", cycles=cycles)
+    consumed = next(
+        e for e in events_of(finished.log_path) if e.type is EventType.TOKENS_CONSUMED
+    ).payload
+    assert consumed["grand_total"] > 0, "nothing was spent; the comparison proves nothing"
+
+    asked = []
+    with pytest.raises(RunInterrupted):
+        run_condition(
+            config,
+            tmp_path / "cut.jsonl",
+            cycles=cycles + 4,
+            should_abort=lambda: asked.append(True) or len(asked) > cycles,
+        )
+    aborted = events_of(tmp_path / "cut.jsonl")[-1].payload
+    # The same cycles run: the same spend, with the cycle counts beside it.
+    assert aborted["cycles_completed"] == cycles
+    assert {k: v for k, v in aborted.items() if not k.startswith("cycles_")} == consumed
+
+
+def test_run_interrupted_has_a_short_repr() -> None:
+    from rpg_economy.runner import INTERRUPT_ABORT, RunInterrupted
+
+    exc = RunInterrupted(reason=INTERRUPT_ABORT, interrupted=Condition.B)
+    assert repr(exc) == "RunInterrupted(reason='abort', interrupted='B')"
+    assert str(exc) == "run interrupted (abort during B); finished: none"
+    # eq=False: two interruptions are two events, never equal by value.
+    assert exc != RunInterrupted(reason=INTERRUPT_ABORT, interrupted=Condition.B)
+
+
+def test_a_run_without_an_abort_callback_is_unchanged(tmp_path: Path) -> None:
+    config = make_config(run={"condition": "B"})
+    plain = run_condition(config, tmp_path / "plain.jsonl", cycles=5)
+    asked = run_condition(config, tmp_path / "asked.jsonl", cycles=5, should_abort=lambda: False)
+    assert log_digest(plain.log_path) == log_digest(asked.log_path)
+    assert EventType.RUN_ABORTED not in {e.type for e in events_of(asked.log_path)}
+
+
+def test_a_stop_between_conditions_keeps_the_finished_ones(tmp_path: Path) -> None:
+    from rpg_economy.logging_ import log_is_finished
+    from rpg_economy.runner import INTERRUPT_STOP, RunInterrupted
+
+    asked = []
+
+    def should_stop() -> bool:
+        asked.append(True)
+        return len(asked) > 2  # A and B start; C does not
+
+    with pytest.raises(RunInterrupted) as caught:
+        run_trio(make_config(), tmp_path, seed=1001, cycles=3, should_stop=should_stop)
+
+    assert caught.value.reason == INTERRUPT_STOP
+    assert caught.value.interrupted is None
+    assert set(caught.value.completed) == {Condition.A, Condition.B}
+    for result in caught.value.completed.values():
+        assert log_is_finished(result.log_path)
+    assert not (tmp_path / "C.jsonl").exists()
+
+
+def test_an_abort_inside_a_trio_keeps_the_conditions_already_finished(tmp_path: Path) -> None:
+    from rpg_economy.logging_ import log_is_finished
+    from rpg_economy.runner import INTERRUPT_ABORT, RunInterrupted
+
+    asked = []
+
+    def should_abort() -> bool:
+        asked.append(True)
+        return len(asked) > 5  # A's three cycles, then two of B's
+
+    with pytest.raises(RunInterrupted) as caught:
+        run_trio(make_config(), tmp_path, seed=1001, cycles=3, should_abort=should_abort)
+
+    assert caught.value.reason == INTERRUPT_ABORT
+    assert caught.value.interrupted is Condition.B
+    assert set(caught.value.completed) == {Condition.A}
+    assert log_is_finished(caught.value.completed[Condition.A].log_path)
+    assert not log_is_finished(tmp_path / "B.jsonl")
+    assert not (tmp_path / "C.jsonl").exists()
+
+
+@pytest.mark.parametrize("phase", ["pilot", "final", "adhoc"])
+def test_the_run_phase_is_recorded_in_the_metadata(tmp_path: Path, phase: str) -> None:
+    from rpg_economy.logging_ import read_metadata
+
+    config = make_config(run={"condition": "B", "phase": phase})
+    result = run_condition(config, tmp_path / "run.jsonl", cycles=1)
+    assert read_metadata(result.log_path).phase == phase
+
+
+def test_a_log_without_a_phase_still_reads() -> None:
+    from rpg_economy.logging_ import RunMetadata
+
+    assert RunMetadata.model_fields["phase"].default is None
