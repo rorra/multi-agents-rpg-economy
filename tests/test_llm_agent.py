@@ -1939,3 +1939,568 @@ def test_the_agent_prompt_hash_covers_every_payload_builder() -> None:
     import inspect
 
     assert '"tax_owed": observation.tax_owed' in inspect.getsource(build_agent_prompt)
+
+
+def test_the_director_and_global_view_hashes_cover_their_helpers() -> None:
+    from rpg_economy.orchestration import global_view
+    from rpg_economy.orchestration.director import (
+        Director,
+        director_prompt_sources,
+        global_view_sources,
+    )
+    from rpg_economy.orchestration.protocol import Result
+
+    assert Result.to_reference in director_prompt_sources()
+    assert Director._user_prompt in director_prompt_sources()
+    view = global_view_sources()
+    assert global_view._mean in view and global_view._stdev in view
+    assert global_view.render_global_summary in view
+
+
+def test_a_change_to_a_payload_builder_changes_the_agent_prompt_hash(monkeypatch) -> None:
+    import inspect
+
+    from rpg_economy.messaging import Message
+
+    prompt_hashes.cache_clear()
+    before = prompt_hashes()["agent_prompt_builder"]
+    real = inspect.getsource
+
+    def edited(obj):
+        text = real(obj)
+        return text + "# edited\n" if obj is Message.to_payload else text
+
+    monkeypatch.setattr(inspect, "getsource", edited)
+    try:
+        # Cached: the edit is invisible until the cache is cleared, as a file
+        # edited on disk mid-campaign must be.
+        assert prompt_hashes()["agent_prompt_builder"] == before
+        prompt_hashes.cache_clear()
+        assert prompt_hashes()["agent_prompt_builder"] != before
+    finally:
+        monkeypatch.undo()
+        prompt_hashes.cache_clear()
+
+
+# ---------------------------------------------------------------------------
+# Delivery events repeat per attempt and name their activation
+# ---------------------------------------------------------------------------
+def test_a_retry_repeats_delivery_events_under_one_activation(tmp_path: Path) -> None:
+    config = make_config(run={"condition": "C"})
+    with EventLogWriter(tmp_path / "run.jsonl", make_metadata(config)) as log:
+        engine = Engine(config, build_world(config), log)
+        engine.publish_bulletin(build_global_summary(config, engine))
+        messages = MessageBus(build_directory(engine))
+        messages.send(
+            sender_id="warrior_1",
+            recipient_id="woodworking_1",
+            message_type=MessageType.INFORM,
+            tick=0,
+            payload={"good": "iron"},
+        )
+        agent, ledger = runner(
+            config,
+            engine,
+            messages,
+            scripted(["not json", json_action(action="wait"), json_action(action="wait")]),
+        )
+        agent.activate(engine, "woodworking_1")  # invalid, then the retry
+        agent.activate(engine, "woodworking_1")  # a second activation, same tick
+    events = list(read_events(log.path))
+
+    for kind, bucket in (
+        (EventType.MESSAGE_DELIVERED, TokenBucket.P2P_CONTENT),
+        (EventType.BULLETIN_INCLUDED_IN_PROMPT, TokenBucket.BULLETIN),
+    ):
+        delivered = [e for e in events if e.type is kind]
+        assert [e.payload["attempt"] for e in delivered] == [1, 2, 1]
+        activations = [e.payload["activation"] for e in delivered]
+        assert activations[0] == activations[1] != activations[2]
+        assert activations[0] == {"tick": engine.tick, "agent_id": "woodworking_1", "seq": 1}
+        assert activations[2]["seq"] == 2
+        # Tokens are per call and sum to the bucket; deliveries de-duplicate.
+        assert sum(e.payload["tokens"] for e in delivered) == ledger.input_tokens(bucket)
+        assert len({tuple(sorted(a.items())) for a in activations}) == 2
+
+
+# ---------------------------------------------------------------------------
+# Still-open proposals are shown until answered or expired (B and C)
+# ---------------------------------------------------------------------------
+def _recording():
+    """A responder that records each user prompt and answers WAIT."""
+    prompts: list[str] = []
+
+    def respond(system: str, user: str) -> str:
+        prompts.append(user)
+        return json_action(action="wait")
+
+    return prompts, respond
+
+
+def _offer(messages: MessageBus, tick: int = 0, good: str = "iron") -> None:
+    messages.send(
+        sender_id="warrior_1",
+        recipient_id="woodworking_1",
+        message_type=MessageType.OFFER,
+        tick=tick,
+        payload={"good": good, "quantity": 3, "price": "7.50"},
+    )
+
+
+@pytest.fixture
+def proposal_rig(tmp_path: Path):
+    """Build a rig whose bus expires proposals as a run's does."""
+    logs: list[EventLogWriter] = []
+
+    def build(condition: str = "B"):
+        config = make_config(run={"condition": condition})
+        log = EventLogWriter(tmp_path / f"{condition}.jsonl", make_metadata(config))
+        log.__enter__()
+        logs.append(log)
+        engine = Engine(config, build_world(config), log)
+        messages = MessageBus(build_directory(engine))
+        messages.set_proposal_expiry(config.market.order_expiry_ticks, lambda: engine.tick)
+        return config, engine, messages, log
+
+    yield build
+    for log in logs:
+        log.close()
+
+
+def test_a_proposal_is_shown_once_as_new_then_as_still_open(proposal_rig) -> None:
+    config, engine, messages, log = proposal_rig()
+    expiry = config.market.order_expiry_ticks
+    _offer(messages, tick=0)
+    prompts, respond = _recording()
+    agent, ledger = runner(config, engine, messages, respond)
+
+    agent.activate(engine, "woodworking_1")
+    messages.drain("woodworking_1")  # what the trigger layer does after activation
+    engine.state.tick = 2
+    agent.activate(engine, "woodworking_1")
+    log.close()
+
+    first, second = prompts
+    # New: under the inbox only, never duplicated as an open proposal.
+    assert "Messages addressed to you" in first
+    assert "Proposals still open" not in first
+    # Drained but unanswered: still visible, with what it takes to answer it.
+    assert "Messages addressed to you" not in second
+    assert "Proposals still open" in second
+    observations = [
+        e.payload["observation"]
+        for e in read_events(log.path)
+        if e.type is EventType.OBSERVATION_DELIVERED
+    ]
+    assert observations[0]["open_proposals"] == []
+    assert observations[1]["open_proposals"] == [
+        {
+            "message_id": 1,
+            "sender_id": "warrior_1",
+            "type": "OFFER",
+            "good": "iron",
+            "quantity": 3,
+            "price": "7.50",
+            "ticks_left": expiry - 2,
+        }
+    ]
+    assert f'"ticks_left":{expiry - 2}' in second
+
+
+def test_open_proposals_are_charged_to_the_p2p_bucket(proposal_rig) -> None:
+    config, engine, messages, log = proposal_rig()
+    _offer(messages, tick=0)
+    messages.drain("woodworking_1")
+    engine.state.tick = 1
+    prompts, respond = _recording()
+    agent, ledger = runner(config, engine, messages, respond)
+    agent.activate(engine, "woodworking_1")
+    log.close()
+
+    assert ledger.input_tokens(TokenBucket.P2P_CONTENT) > 0
+    delivered = [e for e in read_events(log.path) if e.type is EventType.MESSAGE_DELIVERED]
+    assert len(delivered) == 1
+    assert delivered[0].payload["message_ids"] == []
+    assert delivered[0].payload["open_proposal_ids"] == [1]
+    assert delivered[0].payload["tokens"] == ledger.input_tokens(TokenBucket.P2P_CONTENT)
+
+
+def test_an_expired_proposal_is_no_longer_shown(proposal_rig) -> None:
+    config, engine, messages, log = proposal_rig()
+    _offer(messages, tick=0)
+    messages.drain("woodworking_1")
+    engine.state.tick = config.market.order_expiry_ticks
+    prompts, respond = _recording()
+    agent, ledger = runner(config, engine, messages, respond)
+    agent.activate(engine, "woodworking_1")
+    log.close()
+
+    assert "Proposals still open" not in prompts[0]
+    assert ledger.input_tokens(TokenBucket.P2P_CONTENT) == 0
+    assert not [e for e in read_events(log.path) if e.type is EventType.MESSAGE_DELIVERED]
+
+
+def test_an_answered_proposal_is_no_longer_shown(proposal_rig) -> None:
+    config, engine, messages, log = proposal_rig()
+    _offer(messages, tick=0)
+    _offer(messages, tick=0, good="wood")
+    messages.drain("woodworking_1")
+    messages.send(
+        sender_id="woodworking_1",
+        recipient_id="warrior_1",
+        message_type=MessageType.REJECT,
+        tick=1,
+        payload={"good": "iron"},
+    )
+    engine.state.tick = 1
+    prompts, respond = _recording()
+    agent, ledger = runner(config, engine, messages, respond)
+    agent.activate(engine, "woodworking_1")
+    log.close()
+
+    (observation,) = [
+        e.payload["observation"]
+        for e in read_events(log.path)
+        if e.type is EventType.OBSERVATION_DELIVERED
+    ]
+    assert [p["good"] for p in observation["open_proposals"]] == ["wood"]
+
+
+def test_condition_a_shows_no_open_proposals(proposal_rig) -> None:
+    config, engine, messages, log = proposal_rig("A")
+    _offer(messages, tick=0)
+    messages.drain("woodworking_1")
+    prompts, respond = _recording()
+    agent, ledger = runner(config, engine, messages, respond)
+    agent.activate(engine, "woodworking_1")
+    log.close()
+
+    assert "Proposals still open" not in prompts[0]
+    assert ledger.input_tokens(TokenBucket.P2P_CONTENT) == 0
+    (observation,) = [
+        e.payload["observation"]
+        for e in read_events(log.path)
+        if e.type is EventType.OBSERVATION_DELIVERED
+    ]
+    assert observation["open_proposals"] == []
+
+
+def test_the_message_rules_say_open_proposals_are_shown_again() -> None:
+    from rpg_economy.agents.prompts import ACTION_SCHEMA, ACTION_SCHEMA_A
+
+    assert "stays listed after that, among the open proposals" in ACTION_SCHEMA
+    assert "open proposals" not in ACTION_SCHEMA_A
+    # The headers appear only where there is content under them.
+    assert "Proposals still open" not in ACTION_SCHEMA
+    assert "Messages addressed to you" not in ACTION_SCHEMA
+
+
+# ---------------------------------------------------------------------------
+# One activation's events share a join key
+# ---------------------------------------------------------------------------
+def test_observation_calls_and_deliveries_carry_the_activation_key(tmp_path: Path) -> None:
+    config = make_config(run={"condition": "C"})
+    with EventLogWriter(tmp_path / "run.jsonl", make_metadata(config)) as log:
+        engine = Engine(config, build_world(config), log)
+        engine.publish_bulletin(build_global_summary(config, engine))
+        messages = MessageBus(build_directory(engine))
+        messages.send(
+            sender_id="warrior_1",
+            recipient_id="woodworking_1",
+            message_type=MessageType.INFORM,
+            tick=0,
+            payload={"good": "iron"},
+        )
+        agent, _ = runner(
+            config, engine, messages, scripted(["not json", json_action(action="wait")])
+        )
+        agent.activate(engine, "woodworking_1")
+    events = list(read_events(log.path))
+    key = {"tick": engine.tick, "agent_id": "woodworking_1", "seq": 1}
+    for kind, count in (
+        (EventType.OBSERVATION_DELIVERED, 1),
+        (EventType.LLM_CALL, 2),
+        (EventType.MESSAGE_DELIVERED, 2),
+        (EventType.BULLETIN_INCLUDED_IN_PROMPT, 2),
+    ):
+        found = [e for e in events if e.type is kind]
+        assert len(found) == count, kind
+        assert all(e.payload["activation"] == key for e in found), kind
+
+
+# ---------------------------------------------------------------------------
+# Id-like values fold spaces and hyphens, as the Director's params do
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    ("target", "expected"),
+    [
+        ("Arcane Crystal", "arcane_crystal"),
+        ("arcane-crystal", "arcane_crystal"),
+        (" Melee  Weapon ", "melee_weapon"),
+        ("Iron-Marches", "iron_marches"),
+    ],
+)
+def test_an_id_like_target_folds_spaces_and_hyphens(target, expected) -> None:
+    action = parse_action(
+        json_action(action="buy", target=target, quantity=1, price=5), condition=Condition.B
+    )
+    assert action.target == expected
+
+
+def test_orders_and_result_fields_fold_ids_too() -> None:
+    from rpg_economy.agents.parsing import parse_activation
+
+    text = (
+        '{"action": "place_orders", "orders": [{"action": "sell", "target": "Arcane Crystal", '
+        '"quantity": 1, "price": 9}], "needs": [{"good": "health potion", "quantity": 2}], '
+        '"observations": [{"signal": "Price-Rising", "good": "arcane-crystal"}]}'
+    )
+    action, fields = parse_activation(text, condition=Condition.A)
+    assert action.orders[0].target == "arcane_crystal"
+    assert fields.needs[0].good == "health_potion"
+    assert fields.observations[0].signal.value == "price_rising"
+    assert fields.observations[0].good == "arcane_crystal"
+
+
+@pytest.mark.parametrize("responses", [["not json", "still not json"], ["not json", None]])
+def test_invalid_outputs_the_action_and_the_waste_carry_the_activation_key(
+    tmp_path: Path, responses: list
+) -> None:
+    """agent_output_invalid, agent_output and activation_wasted join on the key too."""
+    from rpg_economy.llm import LLMError
+
+    config = make_config(run={"condition": "B"})
+    replies = iter(responses)
+
+    def respond(system: str, user: str) -> str:
+        reply = next(replies)
+        if reply is None:
+            raise LLMError("no completion")  # the llm-error path of an invalid output
+        return reply
+
+    with EventLogWriter(tmp_path / "run.jsonl", make_metadata(config)) as log:
+        engine = Engine(config, build_world(config), log)
+        messages = MessageBus(build_directory(engine))
+        agent, _ = runner(config, engine, messages, respond)
+        result = agent.activate(engine, "woodworking_1")
+    assert result.wasted
+    events = list(read_events(log.path))
+    key = {"tick": engine.tick, "agent_id": "woodworking_1", "seq": 1}
+    for kind, count in (
+        (EventType.AGENT_OUTPUT_INVALID, 2),
+        (EventType.AGENT_OUTPUT, 1),
+        (EventType.ACTIVATION_WASTED, 1),
+    ):
+        found = [e for e in events if e.type is kind]
+        assert len(found) == count, kind
+        assert all(e.payload["activation"] == key for e in found), kind
+
+
+def test_a_failed_call_logs_the_prompt_it_attempted(tmp_path: Path) -> None:
+    """No reply came back, but what was sent is in the log, and nothing was charged."""
+    from rpg_economy.llm import LLMError
+
+    config = make_config(run={"condition": "B"})
+    sent: list[tuple[str, str]] = []
+    replies = iter([None, json_action(action="wait")])
+
+    def respond(system: str, user: str) -> str:
+        sent.append((system, user))
+        reply = next(replies)
+        if reply is None:
+            raise LLMError("no completion")
+        return reply
+
+    with EventLogWriter(tmp_path / "run.jsonl", make_metadata(config)) as log:
+        engine = Engine(config, build_world(config), log)
+        messages = MessageBus(build_directory(engine))
+        agent, _ = runner(config, engine, messages, respond)
+        agent.activate(engine, "woodworking_1")
+    events = list(read_events(log.path))
+    systems = {
+        e.payload["sha"]: e.payload["text"] for e in events if e.type is EventType.PROMPT_SYSTEM
+    }
+    (failed,) = [e for e in events if e.type is EventType.AGENT_OUTPUT_INVALID]
+    (call,) = [e for e in events if e.type is EventType.LLM_CALL]
+    assert (systems[failed.payload["system_sha"]], failed.payload["user"]) == sent[0]
+    assert (systems[call.payload["system_sha"]], call.payload["user"]) == sent[1]
+    assert len(systems) == 1, "the system prompt is logged once, not per attempt"
+    assert "input_tokens" not in failed.payload
+
+
+# ---------------------------------------------------------------------------
+# Each call says whether it was billed, as the client reports it
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("billed", [False, True])
+def test_an_llm_call_records_whether_it_was_billed(rig, billed: bool) -> None:
+    from dataclasses import replace
+
+    config, engine, messages = rig
+
+    class Client(MockLLMClient):
+        def complete(self, *, system: str, user: str):
+            return replace(super().complete(system=system, user=user), billed=billed)
+
+    agent = LLMAgentRunner(
+        config, Client(always(json_action(action="wait"))), TokenLedger(), messages=messages
+    )
+    agent.activate(engine, "woodworking_1")
+    engine.log.close()
+    (call,) = [e for e in read_events(engine.log.path) if e.type is EventType.LLM_CALL]
+    assert call.payload["billed"] is billed
+
+
+# ---------------------------------------------------------------------------
+# Inbox proposals say whether they can still be answered
+# ---------------------------------------------------------------------------
+def _inbox_of(log_path: Path) -> list[dict]:
+    (observation,) = [
+        e.payload["observation"]
+        for e in read_events(log_path)
+        if e.type is EventType.OBSERVATION_DELIVERED
+    ]
+    return observation["messages"]
+
+
+def test_a_replaced_inbox_proposal_is_marked_closed(proposal_rig) -> None:
+    config, engine, messages, log = proposal_rig()
+    expiry = config.market.order_expiry_ticks
+    _offer(messages, tick=0)
+    _offer(messages, tick=1)  # replaces the first: same sender, same good
+    engine.state.tick = 1
+    prompts, respond = _recording()
+    agent, _ = runner(config, engine, messages, respond)
+    agent.activate(engine, "woodworking_1")
+    log.close()
+
+    first, second = _inbox_of(log.path)
+    assert (first["open"], first["ticks_left"]) == (False, None)
+    assert (second["open"], second["ticks_left"]) == (True, expiry)
+    # Both are still shown, the closed one as information.
+    assert '"message_id":1' in prompts[0] and '"open":false' in prompts[0]
+    assert "shown for information only" in prompts[0]
+
+
+def test_an_expired_inbox_proposal_is_marked_closed(proposal_rig) -> None:
+    config, engine, messages, log = proposal_rig()
+    _offer(messages, tick=0)
+    messages.send(
+        sender_id="warrior_1",
+        recipient_id="woodworking_1",
+        message_type=MessageType.INFORM,
+        tick=0,
+        payload={"good": "iron"},
+    )
+    engine.state.tick = config.market.order_expiry_ticks  # never activated meanwhile
+    prompts, respond = _recording()
+    agent, _ = runner(config, engine, messages, respond)
+    agent.activate(engine, "woodworking_1")
+    log.close()
+
+    offer, inform = _inbox_of(log.path)
+    assert (offer["open"], offer["ticks_left"]) == (False, None)
+    # Only REQUESTs and OFFERs can be answered, so only they are marked.
+    assert "open" not in inform and "ticks_left" not in inform
+
+
+def test_the_mock_skips_an_inbox_proposal_marked_closed(rig) -> None:
+    from rpg_economy.agents.offline import _reply_to_sender
+
+    config, engine, messages = rig
+    closed = {
+        "sender_id": "warrior_1",
+        "type": "OFFER",
+        "sent_tick": engine.tick,
+        "payload": {"good": "iron", "quantity": 1, "price": "1.00"},
+        "open": False,
+    }
+    assert _reply_to_sender(engine, "woodworking_1", [closed]) is None
+    assert _reply_to_sender(engine, "woodworking_1", [{**closed, "open": True}]) is not None
+
+
+def test_the_mock_answers_a_still_open_proposal(proposal_rig) -> None:
+    """Offline B and C exercise the open-proposals path end to end."""
+    from rpg_economy.agents.offline import rule_based_responder
+
+    config, engine, messages, log = proposal_rig()
+    # Priced far above anything recent: the mock declines, which always sends.
+    messages.send(
+        sender_id="warrior_1",
+        recipient_id="woodworking_1",
+        message_type=MessageType.OFFER,
+        tick=0,
+        payload={"good": "iron", "quantity": 3, "price": "9999.00"},
+    )
+    messages.drain("woodworking_1")
+    engine.state.tick = 1
+    agent, _ = runner(
+        config, engine, messages, rule_based_responder(config, engine, messages=messages)
+    )
+    agent.activate(engine, "woodworking_1")
+    log.close()
+
+    events = list(read_events(log.path))
+    (output,) = [e.payload for e in events if e.type is EventType.AGENT_OUTPUT]
+    assert output["action"] == ActionType.SEND_MESSAGE.value
+    assert output["message_type"] == MessageType.REJECT.value
+    assert (output["recipient"], output["target"]) == ("warrior_1", "iron")
+    assert messages.open_proposals("woodworking_1", tick=1) == []
+
+
+# ---------------------------------------------------------------------------
+# Equipment wear is stated from the configuration
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    ("loss", "expected"),
+    [
+        (1, "each expedition takes 1 durability point from every equipped item"),
+        (3, "each expedition takes 3 durability points from every equipped item"),
+        (0, "Equipment wear: none"),
+    ],
+)
+def test_the_world_states_the_wear_per_expedition(loss: int, expected: str) -> None:
+    from rpg_economy.agents.prompts import ROLE_BRIEF, render_world
+
+    config = make_config(expeditions={"durability_loss_per_expedition": loss})
+    assert expected in render_world(config)
+    # The brief no longer equates durability with expeditions left.
+    assert "expeditions each has left" not in ROLE_BRIEF[Role.ADVENTURER]
+
+
+def test_an_agent_sees_its_own_recent_trades(tmp_path: Path) -> None:
+    """Design s5.2: an agent observes its own orders and trades."""
+    from decimal import Decimal
+
+    from rpg_economy.agents.observation import build_observation
+    from rpg_economy.domain import OrderSide, Resource
+
+    config = make_config(run={"condition": "B"})
+    with EventLogWriter(tmp_path / "run.jsonl", make_metadata(config)) as log:
+        engine = Engine(config, build_world(config), log)
+        seller, buyer = "warrior_1", "smithing_1"
+        engine.state.account(seller).receive(Resource.IRON, 2)
+        engine.submit_order(seller, OrderSide.SELL, Resource.IRON, 2, Decimal("9"))
+        engine.submit_order(buyer, OrderSide.BUY, Resource.IRON, 2, Decimal("9"))
+        seen = build_observation(config, engine, buyer)
+    assert seen.own_trades == [
+        {"tick": engine.tick, "side": "buy", "good": "iron", "quantity": 2, "price": "9"}
+    ]
+
+
+def test_the_logged_observation_carries_the_own_trades(tmp_path: Path) -> None:
+    """observation_delivered is the full observation (s15): own trades included."""
+    from decimal import Decimal
+
+    from rpg_economy.agents.observation import build_observation
+    from rpg_economy.domain import OrderSide, Resource
+
+    config = make_config(run={"condition": "B"})
+    with EventLogWriter(tmp_path / "run.jsonl", make_metadata(config)) as log:
+        engine = Engine(config, build_world(config), log)
+        engine.state.account("warrior_1").receive(Resource.IRON, 1)
+        engine.submit_order("warrior_1", OrderSide.SELL, Resource.IRON, 1, Decimal("9"))
+        engine.submit_order("smithing_1", OrderSide.BUY, Resource.IRON, 1, Decimal("9"))
+        payload = build_observation(config, engine, "warrior_1").to_payload()
+    assert payload["own_trades"] == [
+        {"tick": engine.tick, "side": "sell", "good": "iron", "quantity": 1, "price": "9"}
+    ]
