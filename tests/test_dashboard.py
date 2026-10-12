@@ -1203,3 +1203,231 @@ def test_the_text_view_formats_numbers_for_its_language(tmp_path: Path) -> None:
     whole, _, cents = f"{float(gold):.2f}".partition(".")
     assert f"{int(whole):,}.{cents}" in english
     assert f"{int(whole):,}".replace(",", ".") + f",{cents}" in spanish
+
+
+def test_the_page_script_handles_the_reported_interactions() -> None:
+    """Static checks on the player script for behaviour a browser test would need."""
+    script = (DASHBOARD / "assets" / "replay.js").read_text(encoding="utf-8")
+    # Tax lines drawn in the tax colour.
+    assert '"panel", "tax"]' in script
+    # Space on a summary, link or tab is left to that control.
+    assert 'closest("button,summary,a,[role=button],[role=tab]")' in script
+    # Home and End do not also scroll the page.
+    assert 'e.key === "Home") { e.preventDefault();' in script
+    assert 'e.key === "End") { e.preventDefault();' in script
+    # The tax jump is disabled after the last collection.
+    assert '$("#taxjump").disabled = nextTaxTick() === null' in script
+    # A crossed book falls back to the last trade.
+    assert "bid >= ask) return m" in script
+    # Tabs name their panel.
+    assert 'setAttribute("aria-controls"' in script and '"tabpanel"' in script
+
+
+def test_agent_items_are_reconstructed_for_every_agent_and_tick(tmp_path: Path) -> None:
+    """Per-agent units end at the logged holdings, add up to the world stock, and
+    match what each agent was shown whenever nothing moved its stock earlier that tick."""
+    from rpg_economy.dashboard.replay import build_track
+
+    moving = {
+        "trade_executed",
+        "expedition_resolved",
+        "production_completed",
+        "consumption",
+        "equipment_equipped",
+        "goods_confiscated",
+    }
+    trio = _trio(tmp_path)
+    for condition, result in trio.items():
+        events = _events(result.log_path)
+        holdings = next(e for e in reversed(events) if e["type"] == "run_end")["payload"][
+            "holdings"
+        ]
+        track = build_track(result.log_path)
+        final = dict(zip(track.agent_ids, track.frames[-1].agent_items, strict=True))
+        for agent, holding in holdings.items():
+            assert final[agent] == sum(holding["inventory"].values()), (condition.value, agent)
+        for frame in track.frames:
+            assert frame.to_payload()["ai"] == frame.agent_items
+            assert sum(frame.agent_items) == sum(frame.world_stock.values())
+            assert min(frame.agent_items) >= 0
+
+        index = {agent: k for k, agent in enumerate(track.agent_ids)}
+        touched: set[str] = set()
+        tick = -1
+        checked = 0
+        for event in events:
+            if event["tick"] != tick:
+                tick, touched = event["tick"], set()
+            payload = event["payload"]
+            if event["type"] in moving:
+                touched |= {
+                    event.get("agent_id"),
+                    payload.get("buyer_id"),
+                    payload.get("seller_id"),
+                }
+            elif event["type"] == "observation_delivered" and tick > 0:
+                agent = event["agent_id"]
+                if agent in touched:
+                    continue
+                shown = sum((payload["observation"].get("inventory") or {}).values())
+                assert track.frames[tick - 1].agent_items[index[agent]] == shown, (tick, agent)
+                checked += 1
+        assert checked, condition.value
+
+
+def test_rejections_are_labelled_by_code(tmp_path: Path) -> None:
+    """A rejected action carries the engine's code, which the page translates."""
+    from rpg_economy.dashboard.html import REJECTION_KEYS
+    from rpg_economy.dashboard.replay import build_track
+    from rpg_economy.domain import RejectionCode
+    from rpg_economy.i18n import Catalog
+
+    assert {code.value for code in RejectionCode} <= set(REJECTION_KEYS)
+    assert "resting" in REJECTION_KEYS
+    for locale in ("en", "es"):
+        catalog = Catalog.load(locale)
+        for code in REJECTION_KEYS:
+            assert catalog.raw(f"rejection.{code}")
+
+    trio = _trio(tmp_path)
+    for result in trio.values():
+        rejected = [e for e in _events(result.log_path) if e["type"] == "action_rejected"]
+        shown = [
+            entry[1]
+            for frame in build_track(result.log_path).frames
+            for step in frame.steps
+            for entry in step["e"]
+            if entry[0] == "rejected"
+        ]
+        assert shown == [e["payload"].get("code") or e["payload"]["reason"] for e in rejected]
+
+
+def test_the_replay_page_is_byte_reproducible(tmp_path: Path) -> None:
+    """The template table is emitted in key order, whatever the hash seed."""
+    import re
+
+    from rpg_economy.dashboard.html import render_replay
+    from rpg_economy.dashboard.replay import build_bundle, trio_logs
+
+    _trio(tmp_path / "runs")
+    bundle = build_bundle(trio_logs(tmp_path / "runs"))
+    html = render_replay(bundle, locale="es")
+    strings = json.loads(re.search(r"window\.STR=(\{.*?\});</script>", html).group(1))
+    assert list(strings["tpl"]) == sorted(strings["tpl"])
+    assert render_replay(bundle, locale="es") == html
+
+
+def test_a_two_model_header_joins_the_models_in_the_page_language(tmp_path: Path) -> None:
+    from rpg_economy.dashboard.html import render_replay
+    from rpg_economy.dashboard.replay import build_bundle, trio_logs
+    from rpg_economy.i18n import t
+
+    _trio(tmp_path / "runs")
+    bundle = build_bundle(trio_logs(tmp_path / "runs"))
+    bundle.tracks[0].model_observed = "model-one"
+    bundle.tracks[1].model_observed = "model-two"
+    for locale in ("en", "es"):
+        joined = t("replay.meta.versus", locale=locale).join(["model-one", "model-two"])
+        assert joined in render_replay(bundle, locale=locale)
+
+
+def test_the_text_view_names_the_triggers(tmp_path: Path) -> None:
+    from rpg_economy.i18n import t
+
+    config = short_config(run={"condition": "B"})
+    result = run_condition(config, tmp_path / "run.jsonl", cycles=config.time.total_cycles)
+    data = build_dashboard(result.log_path)
+    assert data.trigger_counts
+    for locale in ("en", "es"):
+        text = render_dashboard(data, locale=locale)
+        for trigger in data.trigger_counts:
+            assert t(f"trigger.{trigger}", locale=locale) in text
+
+
+def test_the_text_view_sorts_prices_by_the_localized_label() -> None:
+    """Each language lists the goods in its own alphabetical order."""
+    from decimal import Decimal
+
+    from rpg_economy.dashboard.view import DashboardData, PricePoint
+    from rpg_economy.i18n import t
+
+    goods = ("iron", "wood", "leather", "herbs", "arcane_crystal", "mana_potion", "armor")
+    data = DashboardData(
+        run_id="r",
+        condition="B",
+        scenario="resource_scarcity",
+        experiment="experiment_1",
+        seed=1,
+        ticks=1,
+    )
+    for good in goods:
+        data.prices[good] = [PricePoint(tick=0, good=good, price=Decimal("1"), quantity=1)]
+    for locale in ("en", "es"):
+        text = render_dashboard(data, locale=locale)
+        section = text.split(t("dashboard.section.prices", locale=locale), 1)[1]
+        section = section.split("\n\n", 1)[0]
+        rows = [line.strip().split(":", 1)[0] for line in section.splitlines() if line.strip()]
+        assert len(rows) == len(goods)
+        assert rows == sorted(rows, key=lambda label: label.casefold().replace("ó", "o")), locale
+
+
+def test_the_page_script_keeps_focus_and_links(tmp_path: Path) -> None:
+    """Static checks for keyboard focus, table semantics and deep links."""
+    script = (DASHBOARD / "assets" / "replay.js").read_text(encoding="utf-8")
+    # Re-rendered controls carry a stable key and get focus back.
+    assert 'setAttribute("data-key", "step:"' in script
+    assert 'setAttribute("data-key", "agent:"' in script
+    assert "again.focus()" in script
+    # Agent rows keep table semantics: a real button, not a role=button row.
+    assert "activatable(row" not in script
+    assert 'el("button", "agentbtn"' in script
+    # Guide cards point at their text.
+    assert "aria-describedby" in script
+    # Axis labels are formatted for the page's language.
+    assert "toFixed(opts.integer" not in script and "num(v, decimals)" in script
+    # Gridlines sit on round 1/2/5 x 10^n steps.
+    assert "function niceStep(raw)" in script and "niceStep((hi - lo) / 4)" in script
+    # The current-value dot does not depend on the line style.
+    assert "!l.dash" not in script and "l.dot" in script
+    # The link carries the tab and the followed agent, and a bad tab is ignored.
+    assert '"tab=" +' in script and '"agent=" +' in script
+    assert "TABS.some(" in script
+    # A link with no agent clears whatever was being followed.
+    assert "tr.ui.focus = q.agent && tr.agentIds.indexOf(q.agent) >= 0 ? q.agent : null" in script
+    # The protocol label goes through the catalog, not a literal.
+    assert '"RESULT ' not in script and "replay.result_status" in script
+    # The wealth card names who could not pay, in the singular too.
+    assert "replay.wealth.summary_unpaid" in script
+    assert "replay.wealth.nobody_unpaid_one" in script
+    # Codes are translated; a shock on every agent says so.
+    assert "reasonL(e[1])" in script and "replay.shock.liquidity_loss_all" in script
+
+
+@pytest.mark.parametrize(
+    ("payload", "kind"),
+    [
+        ({"reason": "no JSON object found in completion: ''", "truncated": True}, "truncated"),
+        ({"reason": "llm error: no completion"}, "llm_error"),
+        ({"reason": "no JSON object found in completion: 'hi'"}, "invalid_json"),
+        ({"reason": "invalid RESULT fields: bad"}, "result_fields"),
+        ({"reason": "action failed schema validation: x"}, "schema"),
+    ],
+)
+def test_invalid_outputs_get_a_kind_the_page_can_label(payload: dict, kind: str) -> None:
+    from rpg_economy.dashboard.replay import _invalid_kind
+    from rpg_economy.i18n import Catalog
+
+    assert _invalid_kind(payload) == kind
+    for locale in ("en", "es"):
+        assert Catalog.load(locale).raw(f"replay.invalid.{kind}")
+
+
+def test_the_check_command_summarizes_a_trio(tmp_path: Path, capsys) -> None:
+    from rpg_economy.cli import main
+
+    _trio(tmp_path / "runs")
+    assert main(["check", str(tmp_path / "runs")]) == 0
+    out = capsys.readouterr().out
+    assert "condition A" in out and "condition B" in out and "condition C" in out
+    assert "Director tasks to" in out
+    assert main(["check", str(tmp_path / "empty")]) == 2
