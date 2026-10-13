@@ -1676,3 +1676,548 @@ def test_a_trio_that_fails_on_every_attempt_stops_at_the_ceiling(
     assert outcome.attempts == parallel.MAX_PROVIDER_ATTEMPTS
     assert len(attempts) == parallel.MAX_PROVIDER_ATTEMPTS
     assert "503 after retries" in outcome.detail
+
+
+# ---------------------------------------------------------------------------
+# One source for the secondary scenarios planned
+# ---------------------------------------------------------------------------
+def test_the_planned_secondaries_are_what_the_plan_runs() -> None:
+    from rpg_economy.campaign import planned_secondary_scenarios
+
+    for secondary in ([], ["demand_surge"], ["liquidity_loss", "demand_surge"]):
+        config = campaign_config(campaign={"secondary_scenarios": secondary})
+        plan = build_plan(config, phase="pilot")
+        assert list(plan.by_scenario()) == [
+            Scenario.RESOURCE_SCARCITY,
+            *planned_secondary_scenarios(config),
+        ]
+    empty = campaign_config(campaign={"secondary_scenarios": []})
+    assert planned_secondary_scenarios(empty) == [
+        Scenario.DEMAND_SURGE,
+        Scenario.PRODUCTIVITY_DROP,
+        Scenario.LIQUIDITY_LOSS,
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Errors and notices carry a catalog key, so the CLI prints them translated
+# ---------------------------------------------------------------------------
+def test_plan_errors_and_notices_carry_catalog_keys() -> None:
+    from rpg_economy.campaign.plan import Notice
+
+    with pytest.raises(PlanError) as info:
+        build_plan(campaign_config(seeds={"pilot": [1, 2, 3], "final": [101]}), phase="pilot")
+    assert info.value.key == "error.plan.pilot_seeds"
+    assert info.value.params == {"count": 3, "min": 8, "max": 10}
+
+    config = campaign_config(
+        seeds={"pilot": PILOT_SEEDS, "final": list(range(101, 113))},
+        budget={"experiment_2_total_tokens": 1_000},
+    )
+    plan = build_plan(config, phase="final", scenarios=(Scenario.RESOURCE_SCARCITY,))
+    warning = next(w for w in plan.warnings if "targets 15" in w)
+    assert isinstance(warning, Notice)
+    assert warning.key == "campaign.warning.below_target"
+    assert json.loads(json.dumps(plan.to_payload()))["warnings"] == [str(w) for w in plan.warnings]
+
+
+def test_plan_errors_print_in_the_readers_language(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config = _write_config(tmp_path / "few.yaml", mock=True, seeds=[1, 2, 3])
+    assert main(["--locale", "es", "campaign-plan", "--config", str(config)]) == 4
+    err = capsys.readouterr().err
+    assert "el piloto usa 3 semillas" in err
+    assert "pilot uses" not in err
+
+
+# ---------------------------------------------------------------------------
+# An Experiment 2 run's upper bound stops at its budget, as the run does
+# ---------------------------------------------------------------------------
+def test_the_experiment_2_upper_bound_never_exceeds_the_worst_case() -> None:
+    """Inflating output past the budget would price tokens the run never spends."""
+    from decimal import Decimal
+
+    from rpg_economy.campaign.cost import OUTPUT_UNCERTAINTY_MULTIPLIER
+
+    cap = 50_000
+    calls = 100
+    # Output-heavy runs, so tripling their output lands well past the budget.
+    inputs = {"A": 100_000, "B": 100_000, "C": 100_000}
+    config = campaign_config(budget={"experiment_2_total_tokens": cap})
+    plan = _by_experiment(
+        build_plan(config, phase="final", scenarios=(Scenario.RESOURCE_SCARCITY,)),
+        ExperimentRegime.EQUAL_COST,
+    )
+
+    estimate = estimate_cost(
+        plan, _per_call_profile(inputs, calls), PRICING, model="m", config=config
+    )
+
+    uncapped = estimate.input_cost + estimate.output_cost * OUTPUT_UNCERTAINTY_MULTIPLIER
+    assert uncapped > estimate.worst_case, "the case this guards against does not arise"
+    assert estimate.worst_case is not None
+    assert estimate.total_cost <= estimate.upper_bound <= estimate.worst_case
+    ceiling = sum(
+        Decimal(cap + inputs[c.value] // calls + config.llm.max_output_tokens)
+        / 1_000_000
+        * PRICING.output_per_1m_tokens
+        for trio in plan.trios
+        for c in trio.conditions
+    )
+    assert estimate.upper_bound <= ceiling.quantize(Decimal("0.01")) + Decimal("0.01")
+
+
+# ---------------------------------------------------------------------------
+# Ctrl-C stops a campaign: queued trios never start
+# ---------------------------------------------------------------------------
+def test_an_interrupted_campaign_cancels_its_queued_trios(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import threading
+
+    from rpg_economy.campaign import parallel
+
+    config = campaign_config()
+    plan = build_plan(config, phase="pilot", scenarios=(Scenario.RESOURCE_SCARCITY,))
+    assert len(plan.trios) >= 4
+    started: list[Path] = []
+    release = threading.Event()
+
+    def fake_execute(cell, destination, *, reuse=True, **kwargs):
+        started.append(Path(destination))
+        if len(started) > 1:
+            release.wait(5)  # still running when the interrupt arrives
+        return ("A", "B", "C")
+
+    def interrupt(outcome, done, total):
+        release.set()
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(parallel, "execute_trio", fake_execute)
+
+    with pytest.raises(KeyboardInterrupt):
+        parallel.run_campaign_parallel(config, plan, tmp_path, workers=1, progress=interrupt)
+
+    # The first trio, and at most the one the worker had already picked up.
+    assert 1 <= len(started) <= 2 < len(plan.trios)
+
+
+def test_an_interrupted_trio_starts_no_further_attempt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from rpg_economy.campaign import parallel
+    from rpg_economy.campaign.interrupt import Interrupt
+    from rpg_economy.llm import ProviderError
+
+    config = campaign_config()
+    _, trio, _ = _one_trio(config)
+    interrupt = Interrupt()
+    attempts: list[int] = []
+
+    def failing(cell, destination, *, reuse=True, **kwargs):
+        attempts.append(1)
+        interrupt.request_stop()  # interrupted while this attempt ran
+        raise ProviderError("503", transient=True)
+
+    monkeypatch.setattr(parallel, "execute_trio", failing)
+    monkeypatch.setattr(parallel, "backoff_delay", lambda attempt, *, rng: 30.0)
+
+    outcome = parallel._run_one(config, trio, tmp_path / "trio", rng_seed=0, interrupt=interrupt)
+
+    assert attempts == [1], "a retry started after the interrupt"
+    assert outcome.status == "interrupted"
+    assert outcome.seconds < 30, "the backoff was slept out instead of cut short"
+
+
+def test_the_lock_is_released_when_a_campaign_is_interrupted(tmp_path: Path) -> None:
+    from rpg_economy.campaign.lock import LOCK_NAME
+    from rpg_economy.cli import _locked
+
+    def interrupted() -> int:
+        assert (tmp_path / LOCK_NAME).exists()
+        raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        _locked(tmp_path, interrupted, break_lock=False)
+    assert not (tmp_path / LOCK_NAME).exists()
+
+
+# ---------------------------------------------------------------------------
+# A resumed trio keeps only logs written by the code running now
+# ---------------------------------------------------------------------------
+@pytest.mark.invariant
+def test_a_log_from_other_code_is_not_resumed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from rpg_economy import logging_
+    from rpg_economy.campaign.runner import (
+        condition_log_matches,
+        execute_trio,
+        trio_is_complete,
+    )
+    from rpg_economy.logging_ import read_metadata
+
+    config = campaign_config()
+    plan, trio, cell = _one_trio(config)
+    run_campaign(config, plan, tmp_path / "runs")
+    directory = trio_directory(tmp_path / "runs", trio)
+    assert read_metadata(directory / "A.jsonl").code_digest == logging_.code_digest()
+    assert trio_is_complete(directory, cell)
+
+    monkeypatch.setattr(logging_, "code_digest", lambda: "0" * 64)
+
+    assert not condition_log_matches(directory, Condition.A, cell)
+    assert not trio_is_complete(directory, cell)
+    # Resumed, every condition runs again and the old logs are set aside.
+    assert execute_trio(cell, directory) == (Condition.A, Condition.B, Condition.C)
+    assert (directory / "previous-1" / "A.jsonl").exists()
+
+
+def test_a_log_without_a_code_digest_is_not_resumed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A log written before the digest was recorded cannot vouch for its code."""
+    from rpg_economy import logging_
+    from rpg_economy.campaign.runner import condition_log_matches
+
+    config = campaign_config()
+    plan, trio, cell = _one_trio(config)
+    run_campaign(config, plan, tmp_path / "runs")
+    directory = trio_directory(tmp_path / "runs", trio)
+    real_read = logging_.read_metadata
+
+    def without_digest(path):
+        return real_read(path).model_copy(update={"code_digest": None})
+
+    monkeypatch.setattr(logging_, "read_metadata", without_digest)
+    assert not condition_log_matches(directory, Condition.A, cell)
+
+
+# ---------------------------------------------------------------------------
+# Two-level Ctrl-C: a first one stops new work, a second aborts
+# ---------------------------------------------------------------------------
+def test_a_stop_between_conditions_keeps_the_finished_ones_for_the_resume(
+    tmp_path: Path,
+) -> None:
+    from rpg_economy.campaign.runner import execute_trio, trio_is_complete
+    from rpg_economy.integrity import INTEGRITY_MARKER
+    from rpg_economy.logging_ import log_is_finished
+    from rpg_economy.runner import INTERRUPT_STOP, RunInterrupted
+
+    config = campaign_config()
+    _, _, cell = _one_trio(config)
+    directory = tmp_path / "trio"
+
+    # The first Ctrl-C arrives while A runs: A finishes, B never starts.
+    with pytest.raises(RunInterrupted) as info:
+        execute_trio(cell, directory, should_stop=lambda: log_is_finished(directory / "A.jsonl"))
+    assert info.value.reason == INTERRUPT_STOP
+    assert log_is_finished(directory / "A.jsonl")
+    assert not (directory / "B.jsonl").exists()
+    assert not (directory / INTEGRITY_MARKER).exists(), "an interrupted trio was marked"
+    kept = (directory / "A.jsonl").read_bytes()
+
+    # The resume pays only for what is missing.
+    assert execute_trio(cell, directory) == (Condition.B, Condition.C)
+    assert (directory / "A.jsonl").read_bytes() == kept
+    assert trio_is_complete(directory, cell)
+
+
+def test_an_abort_leaves_the_running_condition_unfinished_and_the_trio_unmarked(
+    tmp_path: Path,
+) -> None:
+    from rpg_economy.campaign.runner import execute_trio
+    from rpg_economy.integrity import INTEGRITY_MARKER
+    from rpg_economy.logging_ import log_is_finished
+    from rpg_economy.runner import INTERRUPT_ABORT, RunInterrupted
+
+    config = campaign_config()
+    _, _, cell = _one_trio(config)
+    directory = tmp_path / "trio"
+
+    with pytest.raises(RunInterrupted) as info:
+        execute_trio(cell, directory, should_abort=lambda: True)
+    assert info.value.reason == INTERRUPT_ABORT
+    assert (directory / "A.jsonl").exists()
+    assert not log_is_finished(directory / "A.jsonl")
+    assert not (directory / "B.jsonl").exists()
+    assert not (directory / INTEGRITY_MARKER).exists()
+
+
+def test_a_stopped_campaign_starts_no_queued_trio_and_reports_them_interrupted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from rpg_economy.campaign import parallel
+    from rpg_economy.campaign.interrupt import Interrupt
+
+    config = campaign_config()
+    plan = build_plan(config, phase="pilot", scenarios=(Scenario.RESOURCE_SCARCITY,))
+    interrupt = Interrupt()
+    started: list[Path] = []
+    progressed: list[str] = []
+
+    def fake_execute(
+        cell,
+        destination,
+        *,
+        reuse=True,
+        should_stop=None,
+        should_abort=None,
+        concurrent=False,
+        only=None,
+    ):
+        started.append(Path(destination))
+        assert should_stop is not None and should_abort is not None
+        interrupt.request_stop()  # the first Ctrl-C, while this trio runs
+        return (Condition.A, Condition.B, Condition.C)
+
+    monkeypatch.setattr(parallel, "execute_trio", fake_execute)
+
+    result = parallel.run_campaign_parallel(
+        config,
+        plan,
+        tmp_path,
+        workers=1,
+        interrupt=interrupt,
+        progress=lambda outcome, done, total: progressed.append(outcome.status),
+    )
+
+    assert len(started) == 1
+    assert progressed == ["completed"], "a trio that never started was reported as progress"
+    assert len(result.interrupted) == len(plan.trios) - 1
+    assert not result.failed
+    assert all(o.attempts == 0 for o in result.interrupted)
+    assert result.to_payload()["interrupted"] == len(plan.trios) - 1
+
+
+def test_an_interrupted_attempt_is_reported_interrupted_not_failed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from rpg_economy.campaign import parallel
+    from rpg_economy.runner import INTERRUPT_ABORT, RunInterrupted
+
+    config = campaign_config()
+    _, trio, _ = _one_trio(config)
+
+    def aborted(cell, destination, **kwargs):
+        raise RunInterrupted(reason=INTERRUPT_ABORT, interrupted=Condition.B)
+
+    monkeypatch.setattr(parallel, "execute_trio", aborted)
+    outcome = parallel._run_one(config, trio, tmp_path / "trio", rng_seed=0)
+
+    assert outcome.status == "interrupted"
+    assert outcome.attempts == 1
+
+
+def test_a_parallel_trio_aborted_is_not_verified(tmp_path: Path) -> None:
+    from rpg_economy.campaign.interrupt import Interrupt
+    from rpg_economy.campaign.parallel import run_trio_parallel
+    from rpg_economy.integrity import INTEGRITY_MARKER
+    from rpg_economy.logging_ import log_is_finished
+    from rpg_economy.runner import INTERRUPT_ABORT, INTERRUPT_STOP, RunInterrupted
+
+    config = campaign_config()
+    interrupt = Interrupt()
+    interrupt.request_stop()
+
+    # Stopped before it began: nothing starts.
+    with pytest.raises(RunInterrupted) as info:
+        run_trio_parallel(config, tmp_path, seed=1, interrupt=interrupt)
+    assert info.value.reason == INTERRUPT_STOP
+    assert not (tmp_path / "A.jsonl").exists()
+
+    # An abort that arrives once the three are running cuts each of them.
+    running = Interrupt()
+    calls = {"n": 0}
+
+    def abort_soon() -> bool:
+        calls["n"] += 1
+        return calls["n"] > 3
+
+    running.should_abort = abort_soon  # type: ignore[method-assign]
+    with pytest.raises(RunInterrupted) as info:
+        run_trio_parallel(config, tmp_path / "running", seed=1, interrupt=running)
+    assert info.value.reason == INTERRUPT_ABORT
+    assert not (tmp_path / "running" / INTEGRITY_MARKER).exists()
+    assert not all(log_is_finished(tmp_path / "running" / f"{c}.jsonl") for c in ("A", "B", "C"))
+
+
+def test_the_sigint_handler_escalates_and_exits_on_the_third(
+    capfd: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import signal
+
+    from rpg_economy.campaign import interrupt as interrupt_module
+    from rpg_economy.campaign.interrupt import ABORT, EXIT, EXIT_STATUS, STOP, Interrupt
+
+    class Exited(BaseException):
+        pass
+
+    exits: list[int] = []
+
+    def fake_exit(status: int) -> None:
+        exits.append(status)
+        raise Exited  # os._exit never returns
+
+    monkeypatch.setattr(interrupt_module.os, "_exit", fake_exit)
+    before = signal.getsignal(signal.SIGINT)
+    interrupt = Interrupt()
+    with interrupt.handling_sigint(stopping="soft stop", aborting="hard abort", exiting="exit now"):
+        handler = signal.getsignal(signal.SIGINT)
+        assert callable(handler) and handler is not before
+        handler(signal.SIGINT, None)  # returns: no KeyboardInterrupt
+        assert interrupt.should_stop() and not interrupt.should_abort()
+        handler(signal.SIGINT, None)
+        assert interrupt.should_abort()
+        assert not exits
+        with pytest.raises(Exited):
+            handler(signal.SIGINT, None)  # the third exits at once
+    assert exits == [EXIT_STATUS] == [130]
+    assert signal.getsignal(signal.SIGINT) is before
+    err = capfd.readouterr().err
+    assert err.count("soft stop") == 1 and err.count("hard abort") == 1
+    # Written before exiting, so the reader knows why the process ended.
+    assert err.count("exit now") == 1
+    assert err.index("hard abort") < err.index("exit now")
+
+    fresh = Interrupt()
+    assert [fresh.escalate(), fresh.escalate(), fresh.escalate()] == [STOP, ABORT, EXIT]
+
+
+def test_a_third_ctrl_c_ends_a_real_process_with_130(tmp_path: Path) -> None:
+    """Delivered as a real SIGINT: the process exits 130 even while its main thread waits."""
+    import subprocess
+    import sys
+
+    script = tmp_path / "wait.py"
+    script.write_text(
+        "import os, signal, sys, threading\n"
+        "from rpg_economy.campaign.interrupt import Interrupt\n"
+        "interrupt = Interrupt()\n"
+        "with interrupt.handling_sigint(stopping='s', aborting='a', exiting='x'):\n"
+        "    for _ in range(3):\n"
+        "        os.kill(os.getpid(), signal.SIGINT)\n"
+        "    threading.Event().wait(30)\n"
+        "sys.exit(0)\n",
+        encoding="utf-8",
+    )
+    done = subprocess.run(
+        [sys.executable, str(script)], capture_output=True, text=True, timeout=60, check=False
+    )
+    assert done.returncode == 130
+    assert done.stderr.splitlines() == ["s", "a", "x"]
+
+
+def test_joining_the_workers_survives_repeated_keyboard_interrupts() -> None:
+    """A Ctrl-C during shutdown must not return before every worker has joined."""
+    from rpg_economy.campaign.interrupt import Interrupt
+    from rpg_economy.campaign.parallel import join_pool
+
+    class Pool:
+        def __init__(self) -> None:
+            self.calls: list[bool] = []
+
+        def shutdown(self, *, wait: bool, cancel_futures: bool) -> None:
+            self.calls.append(cancel_futures)
+            if len(self.calls) < 3:
+                raise KeyboardInterrupt
+
+    pool = Pool()
+    interrupt = Interrupt()
+    join_pool(pool, interrupt)  # type: ignore[arg-type]
+
+    assert pool.calls == [False, True, True]
+    assert interrupt.should_abort(), "two Ctrl-C during the join did not escalate"
+
+
+# ---------------------------------------------------------------------------
+# Adding seeds, or deriving a budget, never re-pays a finished trio
+# ---------------------------------------------------------------------------
+@pytest.mark.invariant
+def test_extending_the_seed_lists_keeps_finished_trios(tmp_path: Path) -> None:
+    from rpg_economy.campaign.runner import pending_trios, trio_is_complete
+
+    config = campaign_config()
+    plan, trio, cell = _one_trio(config)
+    run_campaign(config, plan, tmp_path / "runs")
+    directory = trio_directory(tmp_path / "runs", trio)
+
+    extended = campaign_config(
+        seeds={"pilot": [*PILOT_SEEDS, 9, 10], "final": list(range(101, 131))},
+        campaign={"secondary_scenarios": ["demand_surge"], "secondary_final_seeds": 8},
+    )
+    extended_cell = extended.for_cell(
+        scenario=trio.scenario, experiment=trio.experiment, seed=trio.seed
+    )
+    assert trio_is_complete(directory, extended_cell)
+    assert not pending_trios(extended, plan, tmp_path / "runs", resume=True).trios
+
+
+@pytest.mark.invariant
+def test_the_experiment_2_budget_is_part_of_the_hash_only_where_it_is_read() -> None:
+    from rpg_economy.config import config_hash, setup_hash
+
+    unbudgeted = campaign_config()
+    budgeted = campaign_config(budget={"experiment_2_total_tokens": 123_456})
+    other = campaign_config(budget={"experiment_2_total_tokens": 654_321})
+
+    def cell(config, experiment):
+        return config.for_cell(
+            scenario=Scenario.RESOURCE_SCARCITY, experiment=experiment, seed=1
+        ).for_condition(Condition.A, seed=1)
+
+    one = ExperimentRegime.EQUAL_ACTIVITY
+    assert config_hash(cell(unbudgeted, one)) == config_hash(cell(budgeted, one))
+    assert setup_hash(cell(unbudgeted, one)) == setup_hash(cell(budgeted, one))
+
+    two = ExperimentRegime.EQUAL_COST
+    assert config_hash(cell(budgeted, two)) != config_hash(cell(other, two))
+
+    # A mock-derived budget is a different setup, in either experiment.
+    mocked = campaign_config(
+        budget={"experiment_2_total_tokens": 123_456, "derived_from_mock": True}
+    )
+    assert config_hash(cell(mocked, one)) != config_hash(cell(budgeted, one))
+    assert config_hash(cell(mocked, two)) != config_hash(cell(budgeted, two))
+
+
+# ---------------------------------------------------------------------------
+# The integrity gate: metadata parity, and the recorded active horizon
+# ---------------------------------------------------------------------------
+def _tamper_metadata(path: Path, **fields: object) -> None:
+    lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+    first = json.loads(lines[0])
+    first["payload"].update(fields)
+    lines[0] = json.dumps(first) + "\n"
+    path.write_text("".join(lines), encoding="utf-8")
+
+
+@pytest.mark.invariant
+@pytest.mark.parametrize(
+    "field, value",
+    [
+        ("code_digest", "0" * 64),
+        ("prompt_hashes", {"version": "another"}),
+        ("python_version", "3.14.0"),
+        ("setup_hash", "f" * 64),
+        # A mock run is never paired with real ones, although its setup hash
+        # (which leaves ``llm.mock`` out) is the same.
+        ("llm_mock", False),
+    ],
+)
+def test_the_gate_refuses_a_trio_run_by_different_code_or_setups(
+    tmp_path: Path, field: str, value: object
+) -> None:
+    from rpg_economy.integrity import TrioIntegrityError, verify_trio_logs
+
+    config = campaign_config()
+    plan, trio, _ = _one_trio(config)
+    run_campaign(config, plan, tmp_path)
+    directory = trio_directory(tmp_path, trio)
+    report = verify_trio_logs(directory)
+    assert "metadata_parity" in report.checks_passed
+
+    _tamper_metadata(directory / "B.jsonl", **{field: value})
+    with pytest.raises(TrioIntegrityError, match=field):
+        verify_trio_logs(directory)
