@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from pathlib import Path
 
@@ -565,6 +566,38 @@ def test_a_resumed_campaign_never_reruns_a_finished_trio(tmp_path: Path) -> None
     assert len(second.by_status("skipped")) == len(PILOT_SEEDS)
 
 
+@pytest.mark.invariant
+def test_a_truncated_log_is_not_treated_as_finished(tmp_path: Path) -> None:
+    """Only a log that reached run_end is finished; a cut-off one never is.
+
+    Asserted on the log checks themselves: the trio's integrity marker would
+    reject any edited log on its own, and so would prove nothing about them.
+    """
+    from rpg_economy.campaign.runner import condition_log_matches
+    from rpg_economy.logging_ import log_is_finished
+
+    config = campaign_config()
+    plan, trio, cell = _one_trio(config)
+    run_campaign(config, plan, tmp_path / "runs")
+    directory = trio_directory(tmp_path / "runs", trio)
+    log = directory / "A.jsonl"
+    assert log_is_finished(log)
+    assert condition_log_matches(directory, Condition.A, cell)
+
+    whole = log.read_bytes()
+    lines = whole.splitlines(keepends=True)
+    cases = {
+        "a log without its run_end is not finished": b"".join(lines[:-1]),
+        "a log cut mid-line is not finished": whole[:-15],
+        "a non-empty file is not a finished run": b"{}\n",
+    }
+    for reason, content in cases.items():
+        log.write_bytes(content)
+        assert not log_is_finished(log), reason
+        assert not condition_log_matches(directory, Condition.A), reason
+        assert not condition_log_matches(directory, Condition.A, cell), reason
+
+
 def test_only_transient_provider_failures_are_retried() -> None:
     """Rate limits and outages are waited out; refusals and bugs are not."""
     from rpg_economy.campaign.parallel import is_retryable
@@ -589,3 +622,521 @@ def test_backoff_is_jittered_and_capped() -> None:
     assert len(set(draws)) > 1, "backoff is not jittered"
     assert all(0 <= d <= BACKOFF_CAP_SECONDS for d in draws)
     assert backoff_delay(99, rng=_random.Random(0)) <= BACKOFF_CAP_SECONDS
+
+
+@pytest.mark.invariant
+def test_a_parallel_trio_is_identical_to_a_serial_one(tmp_path: Path) -> None:
+    """Condition-level parallelism must not change a run either.
+
+    A trio's critical path is otherwise A + B + C in series and A is the longest,
+    so this is where most of the wall-clock saving lives -- which makes it the
+    place a difference would matter most.
+    """
+    from rpg_economy.campaign.parallel import run_trio_parallel
+    from rpg_economy.logging_ import log_digest
+    from rpg_economy.runner import run_trio
+
+    config = campaign_config()
+    run_trio(config, tmp_path / "serial", seed=1004)
+    run_trio_parallel(config, tmp_path / "parallel", seed=1004)
+
+    for condition in (Condition.A, Condition.B, Condition.C):
+        serial = tmp_path / "serial" / f"{condition.value}.jsonl"
+        par = tmp_path / "parallel" / f"{condition.value}.jsonl"
+        assert log_digest(serial) == log_digest(par), f"{condition.value} differs"
+
+
+@pytest.mark.invariant
+def test_a_parallel_trio_still_passes_the_integrity_gate(tmp_path: Path) -> None:
+    """The trio integrity gate (design s12) applies however the trio was scheduled."""
+    from rpg_economy.campaign.parallel import run_trio_parallel
+
+    runs = run_trio_parallel(campaign_config(), tmp_path / "runs", seed=1004)
+    assert set(runs) == {Condition.A, Condition.B, Condition.C}
+
+
+# ---------------------------------------------------------------------------
+# Billing provenance (IMPLEMENTATION.md section 4.7)
+# ---------------------------------------------------------------------------
+@pytest.mark.invariant
+def test_a_mock_call_can_never_enter_the_billed_ledger(tmp_path: Path) -> None:
+    """Real and mock spend must be structurally unmixable.
+
+    Configuration cannot be the guard -- a config can say ``mock: false`` while
+    the run executes offline -- so the flag comes from the provider response,
+    and a mock response can never set it.
+    """
+    config = campaign_config(run={"condition": "A"})
+    plan = build_plan(config, phase="pilot", scenarios=(Scenario.RESOURCE_SCARCITY,))
+    run_campaign(config, plan, tmp_path / "runs")
+
+    directory = trio_directory(tmp_path / "runs", plan.trios[0])
+    for condition in (Condition.A, Condition.B, Condition.C):
+        events = [
+            json.loads(line)
+            for line in (directory / f"{condition.value}.jsonl").read_text().splitlines()
+        ]
+        consumed = next(e for e in events if e["type"] == "tokens_consumed")
+        assert consumed["payload"]["authoritative_total"] > 0, "the run made no calls"
+        assert consumed["payload"]["billed_total"] == 0, "mock spend entered the billed ledger"
+        assert consumed["payload"]["billed_calls"] == 0
+
+
+@pytest.mark.invariant
+def test_billing_provenance_comes_from_the_response_not_the_config() -> None:
+    """``mock: false`` is a statement of intent, not evidence of a billed call."""
+    from rpg_economy.llm.client import LLMResponse, MockLLMClient
+
+    mock = MockLLMClient(lambda system, user: '{"action":"wait","short_reason":"x"}')
+    assert mock.complete(system="s", user="u").billed is False
+
+    # The default is unbilled, so any client that forgets to set it is safe.
+    assert LLMResponse(text="", input_tokens=1, output_tokens=1, model="m").billed is False
+
+
+@pytest.mark.invariant
+def test_an_unbilled_call_is_absent_from_billed_totals_but_not_from_the_ledger() -> None:
+    """The Experiment 2 budget still binds on every call; only *spend* is billed."""
+    from rpg_economy.domain import TokenBucket
+    from rpg_economy.llm.tokens import TokenLedger
+
+    ledger = TokenLedger()
+    ledger.record(
+        input_by_bucket={TokenBucket.AGENT: 100},
+        output_tokens=10,
+        output_bucket=TokenBucket.AGENT,
+        authoritative_total=110,
+        billed=False,
+    )
+    ledger.record(
+        input_by_bucket={TokenBucket.AGENT: 200},
+        output_tokens=20,
+        output_bucket=TokenBucket.AGENT,
+        authoritative_total=220,
+        billed=True,
+    )
+
+    assert ledger.authoritative_total == 330, "the budget must see every call"
+    assert ledger.billed_total == 220, "only the billed call is spend"
+    assert ledger.billed_calls == 1
+
+
+# ---------------------------------------------------------------------------
+# The two-stage pilot (design s11.4, s15)
+# ---------------------------------------------------------------------------
+@pytest.mark.invariant
+def test_budget_derivation_runs_at_the_full_horizon() -> None:
+    """Design v1.0 s8.4 pools runs at the horizon the finals will use.
+
+    A budget derived from compressed runs would be a fraction of what a final run
+    needs, and every Experiment 2 run would exhaust almost immediately.
+    """
+    from rpg_economy.campaign.pilot import BUDGET_DERIVATION, CALIBRATION, stage_config
+
+    base = campaign_config()
+    assert stage_config(base, BUDGET_DERIVATION).time.horizon_ticks == base.time.horizon_ticks
+    assert BUDGET_DERIVATION.uses_full_horizon
+    # Calibration may compress, because its output is a judgement not a number.
+    assert not CALIBRATION.uses_full_horizon
+
+
+@pytest.mark.invariant
+def test_a_stage_derives_only_the_horizon_from_the_base_config() -> None:
+    """One recorded dimension of difference, and no other.
+
+    Everything that governs behaviour -- K, population, recipes, thresholds,
+    traits, prompts, model, inference parameters -- must come from the base
+    configuration untouched, or the pilot is not testing it.
+    """
+    from rpg_economy.campaign.pilot import CALIBRATION, stage_config
+
+    base = campaign_config()
+    derived = stage_config(base, CALIBRATION)
+
+    before = base.model_dump(mode="python")
+    after = derived.model_dump(mode="python")
+    changed = {key for key in before if before[key] != after[key]}
+    assert changed == {"time", "phases"}, f"a stage changed more than the horizon: {changed}"
+    assert after["time"]["k_activations"] == before["time"]["k_activations"]
+    assert after["llm"] == before["llm"]
+    assert after["agents"] == before["agents"]
+    assert after["economy"] == before["economy"]
+
+
+@pytest.mark.invariant
+def test_a_compressed_stage_keeps_every_phase_measurable() -> None:
+    """A horizon that cannot express recovery would censor every observation."""
+    from rpg_economy.campaign.pilot import CALIBRATION, PilotStage, stage_config
+
+    base = campaign_config()
+    derived = stage_config(base, CALIBRATION)
+
+    assert derived.phases.base_ticks >= derived.metrics.volatility_window_w
+    assert derived.phases.recovery_ticks >= derived.metrics.recovery_hold_ticks_m
+    assert derived.phases.shock_ticks > 0
+
+    # Derived from the fixture rather than hardcoded: a literal horizon that is
+    # "obviously too short" depends on W and M, which differ between the test
+    # config and the base one.
+    too_short = max(3, base.metrics.volatility_window_w)
+    impossible = PilotStage(
+        name="too-short", horizon=too_short, scenarios=None, purpose="x", purpose_key="x"
+    )
+    with pytest.raises(ValueError, match=r"volatility window|hold requirement"):
+        stage_config(base, impossible)
+
+
+def test_stage_billing_verification_reads_logs(tmp_path: Path) -> None:
+    """Billing provenance applied to a whole stage: every run real and fully billed."""
+    from rpg_economy.campaign.pilot import verify_stage_billing
+
+    config = campaign_config(seeds={"pilot": PILOT_SEEDS, "final": list(range(101, 116))})
+    plan = build_plan(config, phase="pilot", scenarios=(Scenario.RESOURCE_SCARCITY,))
+    run_campaign(config, plan, tmp_path / "runs")
+
+    report = verify_stage_billing(tmp_path / "runs")
+
+    assert report["runs"] == len(PILOT_SEEDS) * 3
+    # Mock runs: real in no sense, billed in no sense. Both flags must be False.
+    assert report["all_real"] is False
+    assert report["all_fully_billed"] is False
+    assert report["billed_total"] == 0
+
+
+@pytest.mark.invariant
+def test_an_unfinished_trio_is_set_aside_and_run_again(tmp_path: Path) -> None:
+    """Resuming re-runs an unfinished trio and keeps its partial logs, never deletes them."""
+    config = campaign_config()
+    plan = build_plan(config, phase="pilot", scenarios=(Scenario.RESOURCE_SCARCITY,))
+    plan = dataclasses.replace(plan, trios=plan.trios[:1])
+    run_campaign(config, plan, tmp_path / "runs")
+
+    directory = trio_directory(tmp_path / "runs", plan.trios[0])
+    log = directory / "B.jsonl"
+    cut = b"".join(log.read_bytes().splitlines(keepends=True)[:-3])
+    log.write_bytes(cut)
+
+    second = run_campaign(config, plan, tmp_path / "runs")
+    assert second.completed == plan.trios
+    assert (directory / "previous-1" / "B.jsonl").read_bytes() == cut
+    from rpg_economy.campaign.parallel import trio_is_complete
+
+    assert trio_is_complete(directory)
+
+
+def test_an_unfinished_log_is_left_out_of_a_profile(tmp_path: Path) -> None:
+    config = campaign_config()
+    plan = build_plan(config, phase="pilot", scenarios=(Scenario.RESOURCE_SCARCITY,))
+    plan = dataclasses.replace(plan, trios=plan.trios[:1])
+    run_campaign(config, plan, tmp_path / "runs")
+    log = trio_directory(tmp_path / "runs", plan.trios[0]) / "A.jsonl"
+    log.write_bytes(b"".join(log.read_bytes().splitlines(keepends=True)[:-2]))
+
+    profile = measure_profile(tmp_path / "runs")
+    assert profile.runs_measured == 2
+    assert profile.skipped == 1
+
+
+@pytest.mark.invariant
+def test_the_estimate_is_priced_at_the_planned_horizon(tmp_path: Path) -> None:
+    """A profile of short runs must not price a long campaign as if it were short."""
+    config = campaign_config()
+    plan = build_plan(config, phase="pilot", scenarios=(Scenario.RESOURCE_SCARCITY,))
+    run_campaign(config, plan, tmp_path / "runs")
+    profile = measure_profile(tmp_path / "runs")
+
+    short = estimate_cost(plan, profile, PRICING, model="gpt-5", horizon=12)
+    double = estimate_cost(plan, profile, PRICING, model="gpt-5", horizon=24)
+    assert abs(double.input_tokens - 2 * short.input_tokens) <= plan.total_runs
+    assert double.total_cost > short.total_cost
+
+
+# ---------------------------------------------------------------------------
+# A finished trio counts only for the setup it ran
+# ---------------------------------------------------------------------------
+def _one_trio(config):
+    plan = build_plan(config, phase="pilot", scenarios=(Scenario.RESOURCE_SCARCITY,))
+    plan = dataclasses.replace(plan, trios=plan.trios[:1])
+    trio = plan.trios[0]
+    cell = config.for_cell(scenario=trio.scenario, experiment=trio.experiment, seed=trio.seed)
+    return plan, trio, cell
+
+
+@pytest.mark.invariant
+def test_a_finished_trio_is_complete_only_for_the_setup_it_ran(tmp_path: Path) -> None:
+    from rpg_economy.campaign.runner import trio_is_complete
+
+    config = campaign_config()
+    plan, trio, cell = _one_trio(config)
+    run_campaign(config, plan, tmp_path / "runs")
+    directory = trio_directory(tmp_path / "runs", trio)
+
+    assert trio_is_complete(directory)
+    assert trio_is_complete(directory, cell)
+
+    longer = campaign_config(
+        phases={"base_ticks": 4, "shock_ticks": 4, "recovery_ticks": 8},
+        time={"horizon_ticks": 16},
+    )
+    _, _, longer_cell = _one_trio(longer)
+    assert not trio_is_complete(directory, longer_cell), "another setup's trio was accepted"
+
+
+@pytest.mark.invariant
+def test_a_mock_trio_never_stands_in_for_a_real_one(tmp_path: Path) -> None:
+    """The hash ignores the mode, so the mode is checked on its own."""
+    from rpg_economy.campaign.runner import trio_is_complete
+    from rpg_economy.cli import with_real_provider
+    from rpg_economy.config import config_hash
+
+    config = campaign_config()
+    plan, trio, cell = _one_trio(config)
+    run_campaign(config, plan, tmp_path / "runs")
+    directory = trio_directory(tmp_path / "runs", trio)
+
+    real = with_real_provider(cell)
+    assert config_hash(real) == config_hash(cell)
+    assert not trio_is_complete(directory, real)
+
+
+def test_a_resumed_campaign_reruns_a_trio_from_another_setup(tmp_path: Path) -> None:
+    config = campaign_config()
+    plan, _, _ = _one_trio(config)
+    run_campaign(config, plan, tmp_path / "runs")
+
+    longer = campaign_config(
+        phases={"base_ticks": 4, "shock_ticks": 4, "recovery_ticks": 8},
+        time={"horizon_ticks": 16},
+    )
+    longer_plan, _, _ = _one_trio(longer)
+    second = run_campaign(longer, longer_plan, tmp_path / "runs")
+
+    assert second.skipped == []
+    assert second.completed == longer_plan.trios
+
+
+# ---------------------------------------------------------------------------
+# The worst case and the Experiment 2 budget in the estimate
+# ---------------------------------------------------------------------------
+def test_the_worst_case_covers_the_projected_cost() -> None:
+    config = campaign_config(budget={"experiment_2_total_tokens": 50_000})
+    plan = build_plan(config, phase="final", scenarios=(Scenario.RESOURCE_SCARCITY,))
+    profile = _profile(A=(40_000, 4_000), B=(20_000, 2_000), C=(30_000, 3_000))
+
+    estimate = estimate_cost(plan, profile, PRICING, model="gpt-5", config=config)
+
+    assert estimate.worst_case is not None
+    assert estimate.worst_case >= estimate.total_cost
+    assert estimate.to_payload()["worst_case"] == str(estimate.worst_case)
+
+
+def test_without_a_config_there_is_no_worst_case() -> None:
+    config = campaign_config()
+    plan = build_plan(config, phase="pilot", scenarios=(Scenario.RESOURCE_SCARCITY,))
+    profile = _profile(A=(1_000, 100), B=(1_000, 100), C=(1_000, 100))
+
+    estimate = estimate_cost(plan, profile, PRICING, model="gpt-5")
+
+    assert estimate.worst_case is None
+    assert estimate.to_payload()["worst_case"] is None
+
+
+@pytest.mark.invariant
+def test_an_experiment_2_run_is_priced_no_higher_than_its_budget() -> None:
+    """A run stops calling once its token budget is spent."""
+    cap = 50_000
+    config = campaign_config(budget={"experiment_2_total_tokens": cap})
+    plan = build_plan(config, phase="final", scenarios=(Scenario.RESOURCE_SCARCITY,))
+    profile = _profile(A=(1_000_000, 100_000), B=(1_000_000, 100_000), C=(1_000_000, 100_000))
+
+    capped = estimate_cost(plan, profile, PRICING, model="gpt-5", config=config)
+    uncapped = estimate_cost(plan, profile, PRICING, model="gpt-5")
+
+    exp1_runs = sum(
+        len(t.conditions) for t in plan.trios if t.experiment is ExperimentRegime.EQUAL_ACTIVITY
+    )
+    exp2_runs = sum(
+        len(t.conditions) for t in plan.trios if t.experiment is ExperimentRegime.EQUAL_COST
+    )
+    assert exp2_runs > 0
+    bucket = capped.per_scenario[Scenario.RESOURCE_SCARCITY.value]
+    assert bucket["input_tokens"] + bucket["output_tokens"] == exp1_runs * 1_100_000 + (
+        exp2_runs * cap
+    )
+    assert capped.output_tokens < uncapped.output_tokens
+    assert capped.total_cost < uncapped.total_cost
+    # The headline totals are the per-scenario buckets summed, capped runs included.
+    assert capped.input_tokens == sum(b["input_tokens"] for b in capped.per_scenario.values())
+    assert capped.output_tokens == sum(b["output_tokens"] for b in capped.per_scenario.values())
+
+
+# ---------------------------------------------------------------------------
+# Resume never pays again for a finished trio
+# ---------------------------------------------------------------------------
+def _single_trio_plan(config, seed_index: int = 0):
+    plan = build_plan(config, phase="pilot", scenarios=(Scenario.RESOURCE_SCARCITY,))
+    return dataclasses.replace(plan, trios=[plan.trios[seed_index]])
+
+
+@pytest.mark.invariant
+def test_pricing_and_transport_are_not_part_of_the_config_hash() -> None:
+    """A price or timeout edited between a crash and its resume changes no run."""
+    from rpg_economy.config import config_hash, config_payload
+
+    config = campaign_config()
+    edited = campaign_config(
+        llm={
+            "pricing": {
+                "input_per_1m_tokens": "9.99",
+                "output_per_1m_tokens": "99.99",
+                "currency": "USD",
+                "quoted_on": "2027-01-01",
+            },
+            "request_timeout_s": 5.0,
+            "max_transient_retries": 1,
+            "retry_base_delay_s": 0.5,
+            "retry_max_delay_s": 1.0,
+        }
+    )
+
+    assert config_hash(edited) == config_hash(config)
+    for name in ("pricing", "request_timeout_s", "max_transient_retries", "mock"):
+        assert name not in config_payload(config)["llm"]
+    # What the model sees still counts.
+    assert config_hash(campaign_config(llm={"max_output_tokens": 77})) != config_hash(config)
+
+
+@pytest.mark.invariant
+def test_a_price_update_does_not_rerun_a_finished_trio(tmp_path: Path) -> None:
+    config = campaign_config()
+    plan = _single_trio_plan(config)
+    run_campaign(config, plan, tmp_path / "runs")
+
+    repriced = campaign_config(
+        llm={
+            "pricing": {
+                "input_per_1m_tokens": "2.00",
+                "output_per_1m_tokens": "20.00",
+                "quoted_on": "2027-01-01",
+            },
+            "request_timeout_s": 10.0,
+        }
+    )
+    second = run_campaign(repriced, plan, tmp_path / "runs")
+    assert second.completed == []
+    assert second.skipped == plan.trios
+
+
+@pytest.mark.invariant
+def test_a_trio_is_complete_only_for_its_own_seed(tmp_path: Path) -> None:
+    """The cell's seed is the reference, not whatever seed the log reports."""
+    import shutil
+
+    from rpg_economy.campaign.runner import trio_is_complete
+
+    config = campaign_config()
+    plan = _single_trio_plan(config)
+    run_campaign(config, plan, tmp_path / "runs")
+    trio = plan.trios[0]
+    finished = trio_directory(tmp_path / "runs", trio)
+
+    other = dataclasses.replace(trio, seed=trio.seed + 1)
+    misplaced = trio_directory(tmp_path / "runs", other)
+    shutil.copytree(finished, misplaced)
+    cell = config.for_cell(scenario=other.scenario, experiment=other.experiment, seed=other.seed)
+    assert not trio_is_complete(misplaced, cell), "a trio of another seed was accepted"
+
+
+def test_a_resumed_batch_is_priced_only_on_the_trios_still_to_run(tmp_path: Path) -> None:
+    from rpg_economy.campaign.runner import pending_trios
+
+    config = campaign_config()
+    plan = build_plan(config, phase="pilot", scenarios=(Scenario.RESOURCE_SCARCITY,))
+    run_campaign(config, dataclasses.replace(plan, trios=plan.trios[:3]), tmp_path / "runs")
+
+    pending = pending_trios(config, plan, tmp_path / "runs", resume=True)
+    assert pending.trios == plan.trios[3:]
+    assert pending_trios(config, plan, tmp_path / "runs", resume=False).trios == plan.trios
+
+    profile = _profile(A=(1_000, 100), B=(1_000, 100), C=(1_000, 100))
+    full = estimate_cost(plan, profile, PRICING, model="gpt-5", config=config)
+    remaining = estimate_cost(pending, profile, PRICING, model="gpt-5", config=config)
+    assert remaining.total_runs == 3 * len(pending.trios)
+    assert remaining.total_cost < full.total_cost
+
+
+def test_a_resumed_campaign_run_says_what_it_prices(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config = _write_config(tmp_path / "mock.yaml", mock=True, seeds=PILOT_SEEDS)
+    argv = ["campaign-run", "--config", str(config), "--phase", "pilot"]
+    argv += ["--out", str(tmp_path / "runs")]
+    assert main(argv) == 0
+    capsys.readouterr()
+
+    assert main([*argv, "--profile-logs", str(tmp_path / "runs")]) == 0
+    out = capsys.readouterr().out
+    assert "already complete and verified" in out
+
+
+# ---------------------------------------------------------------------------
+# The integrity marker: a trio that failed the gate is never skipped
+# ---------------------------------------------------------------------------
+@pytest.mark.invariant
+def test_a_verified_trio_carries_a_marker_pinned_to_its_logs(tmp_path: Path) -> None:
+    from rpg_economy.campaign.runner import trio_is_complete
+    from rpg_economy.integrity import INTEGRITY_MARKER, has_integrity_marker
+
+    config = campaign_config()
+    plan = _single_trio_plan(config)
+    run_campaign(config, plan, tmp_path / "runs")
+    directory = trio_directory(tmp_path / "runs", plan.trios[0])
+
+    assert (directory / INTEGRITY_MARKER).exists()
+    assert has_integrity_marker(directory)
+
+    # A log changed after the check no longer carries the verdict.
+    log = directory / "B.jsonl"
+    original = log.read_bytes()
+    log.write_bytes(original + b"\n")
+    assert not has_integrity_marker(directory)
+    assert not trio_is_complete(directory)
+    log.write_bytes(original)
+    assert trio_is_complete(directory)
+
+    (directory / INTEGRITY_MARKER).unlink()
+    assert not trio_is_complete(directory), "a trio without a verdict was complete"
+
+
+@pytest.mark.invariant
+def test_a_trio_that_failed_the_gate_is_not_skipped_on_resume(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from rpg_economy import integrity
+    from rpg_economy.campaign.parallel import run_campaign_parallel
+    from rpg_economy.campaign.runner import trio_is_complete
+
+    config = campaign_config()
+    plan = _single_trio_plan(config)
+    directory = trio_directory(tmp_path / "runs", plan.trios[0])
+    real_verify = integrity.verify_trio
+
+    def failing(runs):
+        raise integrity.TrioIntegrityError("injected")
+
+    monkeypatch.setattr(integrity, "verify_trio", failing)
+    first = run_campaign_parallel(config, plan, tmp_path / "runs", workers=1)
+    assert len(first.failed) == 1
+    assert "injected" in first.failed[0].detail
+    # Three finished logs, but no verdict: not complete.
+    assert all((directory / f"{c.value}.jsonl").exists() for c in Condition)
+    assert not trio_is_complete(directory)
+
+    # Resumed after the defect is fixed: the gate runs again on the logs that
+    # exist, and nothing is re-run to get there.
+    monkeypatch.setattr(integrity, "verify_trio", real_verify)
+    second = run_campaign_parallel(config, plan, tmp_path / "runs", workers=1)
+    assert second.by_status("skipped") == []
+    assert len(second.by_status("completed")) == 1
+    assert trio_is_complete(directory)
+    assert not list(directory.glob("previous-*"))
