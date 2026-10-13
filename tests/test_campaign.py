@@ -1140,3 +1140,539 @@ def test_a_trio_that_failed_the_gate_is_not_skipped_on_resume(
     assert len(second.by_status("completed")) == 1
     assert trio_is_complete(directory)
     assert not list(directory.glob("previous-*"))
+
+
+@pytest.mark.invariant
+def test_kept_logs_that_fail_the_gate_together_are_run_again_whole(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from rpg_economy import integrity
+    from rpg_economy.campaign.runner import execute_trio, trio_is_complete
+
+    config = campaign_config()
+    plan = _single_trio_plan(config)
+    trio = plan.trios[0]
+    cell = config.for_cell(scenario=trio.scenario, experiment=trio.experiment, seed=trio.seed)
+    directory = trio_directory(tmp_path / "runs", trio)
+    run_campaign(config, plan, tmp_path / "runs")
+    (directory / integrity.INTEGRITY_MARKER).unlink()
+
+    real_verify = integrity.verify_trio
+    calls = {"n": 0}
+
+    def fails_once(runs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise integrity.TrioIntegrityError("injected")
+        return real_verify(runs)
+
+    monkeypatch.setattr(integrity, "verify_trio", fails_once)
+    ran = execute_trio(cell, directory)
+
+    assert ran == (Condition.A, Condition.B, Condition.C)
+    assert {p.name for p in (directory / "previous-1").iterdir()} == {
+        "A.jsonl",
+        "B.jsonl",
+        "C.jsonl",
+    }
+    assert trio_is_complete(directory, cell)
+
+
+# ---------------------------------------------------------------------------
+# A transient provider failure re-runs only the failed condition
+# ---------------------------------------------------------------------------
+@pytest.mark.invariant
+def test_a_transient_failure_reruns_only_the_failed_condition(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from rpg_economy import runner as run_module
+    from rpg_economy.campaign import parallel
+    from rpg_economy.campaign.runner import trio_is_complete
+    from rpg_economy.llm import ProviderError
+    from rpg_economy.logging_ import log_digest
+
+    config = campaign_config()
+    plan = _single_trio_plan(config)
+    trio = plan.trios[0]
+    directory = trio_directory(tmp_path / "runs", trio)
+    run_campaign(config, plan, tmp_path / "reference")
+
+    real_run = run_module.run_condition
+    calls: list[str] = []
+
+    def flaky(cell, log_path, **kwargs):
+        condition = cell.run.condition.value
+        calls.append(condition)
+        if condition == "C" and calls.count("C") == 1:
+            Path(log_path).write_text('{"partial": true}\n', encoding="utf-8")
+            raise ProviderError("503 after retries", transient=True)
+        return real_run(cell, log_path, **kwargs)
+
+    monkeypatch.setattr(run_module, "run_condition", flaky)
+    monkeypatch.setattr(parallel, "backoff_delay", lambda attempt, *, rng: 0.0)
+
+    result = parallel.run_campaign_parallel(config, plan, tmp_path / "runs", workers=1)
+
+    outcome = result.outcomes[0]
+    assert outcome.status == "completed"
+    assert outcome.attempts == 2
+    assert calls == ["A", "B", "C", "C"], "A or B was paid for twice"
+    assert [p.name for p in (directory / "previous-1").iterdir()] == ["C.jsonl"]
+    assert trio_is_complete(directory)
+    for condition in ("A", "B", "C"):
+        reference = trio_directory(tmp_path / "reference", trio) / f"{condition}.jsonl"
+        assert log_digest(directory / f"{condition}.jsonl") == log_digest(reference)
+
+
+def test_set_aside_spend_is_counted_in_stage_billing(tmp_path: Path) -> None:
+    from rpg_economy.campaign.pilot import verify_stage_billing
+
+    aside = tmp_path / "resource_scarcity" / "experiment_1" / "seed_1" / "previous-1"
+    aside.mkdir(parents=True)
+    lines = [
+        {
+            "type": "llm_call",
+            "payload": {"model": "gpt-5-nano", "input_tokens": 100, "output_tokens": 40},
+        },
+        {
+            "type": "director_call",
+            "payload": {"model": "gpt-5-nano", "input_tokens": 50, "output_tokens": 10},
+        },
+        {
+            "type": "director_call",
+            "payload": {"model": None, "input_tokens": 0, "output_tokens": 0},
+        },
+    ]
+    # A crashed run: no tokens_consumed, and cut mid-line at the end.
+    text = "\n".join(json.dumps(line) for line in lines) + '\n{"type": "llm_'
+    (aside / "C.jsonl").write_text(text, encoding="utf-8")
+
+    report = verify_stage_billing(tmp_path)
+
+    assert report["runs"] == 0
+    assert report["set_aside"] == {"logs": 1, "llm_calls": 2, "billed_total": 200}
+    assert report["billed_total_with_set_aside"] == 200
+
+
+def _write_log(path: Path, events: list[dict]) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("".join(json.dumps(e) + "\n" for e in events), encoding="utf-8")
+    return path
+
+
+def _call(kind: str, model: str, tokens: tuple[int, int], billed: bool | None = None) -> dict:
+    payload: dict = {"model": model, "input_tokens": tokens[0], "output_tokens": tokens[1]}
+    if billed is not None:
+        payload["billed"] = billed
+    return {"type": kind, "payload": payload}
+
+
+def test_unfinished_logs_report_their_spend_and_the_total_includes_it(tmp_path: Path) -> None:
+    from rpg_economy.campaign.pilot import billing_passed, verify_stage_billing
+
+    trio = tmp_path / "resource_scarcity" / "experiment_1" / "seed_1"
+    finished = [
+        {"type": "run_metadata", "payload": {}},
+        _call("llm_call", "gpt-5-nano", (60, 40), billed=True),
+        {"type": "tokens_consumed", "payload": {"authoritative_total": 100, "billed_total": 100}},
+        {"type": "run_end", "payload": {}},
+    ]
+    _write_log(trio / "A.jsonl", finished)
+    # Aborted by a second Ctrl-C: the run_aborted ledger snapshot governs.
+    _write_log(
+        trio / "B.jsonl",
+        [
+            {"type": "run_metadata", "payload": {}},
+            _call("llm_call", "gpt-5-nano", (10, 5), billed=True),
+            {
+                "type": "run_aborted",
+                "payload": {"cycles_completed": 1, "authoritative_total": 70, "billed_total": 70},
+            },
+        ],
+    )
+    # Killed outright (a third Ctrl-C): summed from its calls, by their billed
+    # flag, and by the model name where a call has none.
+    _write_log(
+        trio / "C.jsonl",
+        [
+            {"type": "run_metadata", "payload": {}},
+            _call("llm_call", "gpt-5-nano", (30, 10), billed=True),
+            _call("director_call", "gpt-5-nano", (20, 5), billed=False),
+            _call("llm_call", "gpt-5-nano", (4, 1)),
+            _call("llm_call", "mock-model", (1000, 1000)),
+        ],
+    )
+
+    report = verify_stage_billing(tmp_path, expected_runs=3)
+
+    assert report["runs"] == 1
+    assert report["billed_total"] == 100
+    assert report["unfinished"] == [
+        str((trio / name).relative_to(tmp_path)) for name in ("B.jsonl", "C.jsonl")
+    ]
+    spend = report["unfinished_spend"]
+    assert [d["source"] for d in spend["detail"]] == ["run_aborted", "calls"]
+    assert [d["billed_total"] for d in spend["detail"]] == [70, 45]
+    assert spend["logs"] == 2 and spend["billed_total"] == 115 and spend["llm_calls"] == 5
+    assert report["billed_total_all"] == 215
+    assert report["complete"] is False
+    assert not billing_passed(report)
+
+
+def test_a_run_aborted_without_a_ledger_falls_back_to_its_calls(tmp_path: Path) -> None:
+    from rpg_economy.campaign.pilot import log_spend
+
+    log = _write_log(
+        tmp_path / "A.jsonl",
+        [
+            _call("llm_call", "gpt-5-nano", (10, 5), billed=True),
+            {"type": "run_aborted", "payload": {"cycles_completed": 1}},
+        ],
+    )
+    assert log_spend(log) == {"llm_calls": 1, "billed_total": 15, "source": "calls"}
+
+
+def test_the_retry_multiplier_is_stated_with_the_worst_case() -> None:
+    from rpg_economy.campaign.parallel import MAX_PROVIDER_ATTEMPTS
+
+    config = campaign_config(budget={"experiment_2_total_tokens": 50_000})
+    plan = build_plan(config, phase="final", scenarios=(Scenario.RESOURCE_SCARCITY,))
+    profile = _profile(A=(40_000, 4_000), B=(20_000, 2_000), C=(30_000, 3_000))
+
+    estimate = estimate_cost(plan, profile, PRICING, model="gpt-5", config=config)
+
+    assert estimate.retry_attempts == MAX_PROVIDER_ATTEMPTS
+    assert estimate.worst_case_with_retries == estimate.worst_case * MAX_PROVIDER_ATTEMPTS
+    payload = estimate.to_payload()
+    assert payload["retry_attempts"] == MAX_PROVIDER_ATTEMPTS
+    assert payload["worst_case_with_retries"] == str(estimate.worst_case_with_retries)
+
+
+# ---------------------------------------------------------------------------
+# A plan never holds the same trio twice
+# ---------------------------------------------------------------------------
+@pytest.mark.invariant
+def test_a_plan_never_holds_the_same_trio_twice() -> None:
+    """Two workers must never write the same trio directory."""
+    config = campaign_config()
+    # model_copy skips validation, as a hand-built config might.
+    repeated = config.model_copy(
+        update={"seeds": config.seeds.model_copy(update={"pilot": [*PILOT_SEEDS, 1, 2]})}
+    )
+
+    plan = build_plan(
+        repeated,
+        phase="pilot",
+        scenarios=(Scenario.RESOURCE_SCARCITY, Scenario.RESOURCE_SCARCITY),
+    )
+
+    assert len(plan.trios) == len(set(plan.trios)) == len(PILOT_SEEDS)
+    assert [t.seed for t in plan.trios] == PILOT_SEEDS
+
+
+# ---------------------------------------------------------------------------
+# Stage verification and the cost basis
+# ---------------------------------------------------------------------------
+def test_stage_verification_fails_an_incomplete_stage(tmp_path: Path) -> None:
+    from rpg_economy.campaign.pilot import billing_passed, verify_stage_billing
+
+    config = campaign_config()
+    plan = build_plan(config, phase="pilot", scenarios=(Scenario.RESOURCE_SCARCITY,))
+    run_campaign(config, dataclasses.replace(plan, trios=plan.trios[:2]), tmp_path / "runs")
+    log = trio_directory(tmp_path / "runs", plan.trios[0]) / "B.jsonl"
+    log.write_bytes(b"".join(log.read_bytes().splitlines(keepends=True)[:-1]))
+
+    report = verify_stage_billing(tmp_path / "runs", expected_runs=plan.total_runs)
+
+    assert report["expected_runs"] == plan.total_runs
+    # The cut log is spend, not a run.
+    assert report["runs"] == 5
+    assert report["unfinished"] == [str(log.relative_to(tmp_path / "runs"))]
+    assert report["unfinished_spend"]["logs"] == 1
+    assert report["unfinished_spend"]["detail"][0]["source"] == "tokens_consumed"
+    assert report["missing"] == plan.total_runs - 5
+    assert report["complete"] is False
+    assert not billing_passed(report)
+
+
+def test_mock_calls_are_counted_per_call_not_per_model(tmp_path: Path) -> None:
+    from rpg_economy.campaign.pilot import verify_stage_billing
+
+    config = campaign_config()
+    run_campaign(config, _single_trio_plan(config), tmp_path / "runs")
+
+    report = verify_stage_billing(tmp_path / "runs")
+
+    for run in report["detail"]:
+        assert run["llm_calls"] > 1
+        assert run["mock_calls"] == run["llm_calls"]
+
+
+def test_call_counts_are_taken_per_cell() -> None:
+    """An Experiment 2 cell that stops calling is not priced at Experiment 1's calls."""
+    from rpg_economy.campaign.cost import MEASURED_OUTPUT_PER_CALL
+
+    profile = TokenProfile()
+    for experiment, calls in (
+        (ExperimentRegime.EQUAL_ACTIVITY, 100),
+        (ExperimentRegime.EQUAL_COST, 10),
+    ):
+        for condition in Condition:
+            profile.record(
+                RunTokens(
+                    condition=condition,
+                    scenario=Scenario.RESOURCE_SCARCITY,
+                    experiment=experiment,
+                    seed=1,
+                    input_tokens=1_000,
+                    output_tokens=100,
+                    calls=calls,
+                )
+            )
+
+    assert (
+        profile.calls_for(
+            Condition.A, scenario=Scenario.RESOURCE_SCARCITY, experiment=ExperimentRegime.EQUAL_COST
+        )
+        == 10
+    )
+    # An unmeasured cell falls back to the condition across every cell.
+    assert (
+        profile.calls_for(
+            Condition.A, scenario=Scenario.DEMAND_SURGE, experiment=ExperimentRegime.EQUAL_ACTIVITY
+        )
+        == 55
+    )
+
+    config = campaign_config(budget={"experiment_2_total_tokens": 10_000_000})
+    plan = build_plan(config, phase="final", scenarios=(Scenario.RESOURCE_SCARCITY,))
+    estimate = estimate_cost(plan, profile, PRICING, model="gpt-5")
+    trios = {e: sum(1 for t in plan.trios if t.experiment is e) for e in ExperimentRegime}
+    expected = (
+        3
+        * MEASURED_OUTPUT_PER_CALL
+        * (100 * trios[ExperimentRegime.EQUAL_ACTIVITY] + 10 * trios[ExperimentRegime.EQUAL_COST])
+    )
+    assert estimate.output_tokens == expected
+
+
+# ---------------------------------------------------------------------------
+# Resume never mixes code versions in one trio
+# ---------------------------------------------------------------------------
+def _changed_prompts(monkeypatch: pytest.MonkeyPatch, key: str) -> None:
+    """Simulate a prompt edit: new runs record, and resume expects, other hashes."""
+    from rpg_economy import runner as run_module
+    from rpg_economy.orchestration import director
+
+    changed = {**director.prompt_hashes(), key: "0" * 16}
+    monkeypatch.setattr(director, "prompt_hashes", lambda: changed)
+    monkeypatch.setattr(run_module, "prompt_hashes", lambda: changed)
+
+
+def test_a_fresh_log_records_the_prompt_hashes_resume_expects(tmp_path: Path) -> None:
+    """Resume compares against what a run records; the two must not drift apart."""
+    from rpg_economy.campaign.runner import current_prompt_hashes
+    from rpg_economy.logging_ import current_python_version, read_metadata
+
+    config = campaign_config()
+    plan, trio, _ = _one_trio(config)
+    run_campaign(config, plan, tmp_path / "runs")
+    metadata = read_metadata(trio_directory(tmp_path / "runs", trio) / "A.jsonl")
+
+    assert metadata.prompt_hashes == current_prompt_hashes()
+    assert "global_view_format" in metadata.prompt_hashes
+    assert metadata.python_version == current_python_version()
+
+
+@pytest.mark.invariant
+@pytest.mark.parametrize("key", ["director_system", "global_view_format"])
+def test_resume_rejects_a_log_written_under_other_prompts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, key: str
+) -> None:
+    """A trio kept across a prompt edit would pair two versions of the code."""
+    from rpg_economy.campaign.runner import condition_log_matches, trio_is_complete
+
+    config = campaign_config()
+    plan, trio, cell = _one_trio(config)
+    directory = trio_directory(tmp_path / "runs", trio)
+    run_campaign(config, plan, tmp_path / "runs")
+    assert trio_is_complete(directory, cell)
+
+    _changed_prompts(monkeypatch, key)
+
+    for condition in Condition:
+        assert not condition_log_matches(directory, condition, cell)
+    assert not trio_is_complete(directory, cell)
+
+    second = run_campaign(config, plan, tmp_path / "runs")
+    assert second.skipped == []
+    assert second.completed == plan.trios
+    assert {p.name for p in (directory / "previous-1").iterdir()} == {
+        "A.jsonl",
+        "B.jsonl",
+        "C.jsonl",
+    }
+    assert trio_is_complete(directory, cell)
+
+
+def test_resume_rejects_a_log_from_another_interpreter_release(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import rpg_economy.logging_
+    from rpg_economy.campaign.runner import condition_log_matches
+
+    config = campaign_config()
+    plan, trio, cell = _one_trio(config)
+    run_campaign(config, plan, tmp_path / "runs")
+    directory = trio_directory(tmp_path / "runs", trio)
+    assert condition_log_matches(directory, Condition.A, cell)
+
+    monkeypatch.setattr(rpg_economy.logging_, "current_python_version", lambda: "3.14.999")
+    assert not condition_log_matches(directory, Condition.A, cell)
+
+
+@pytest.mark.invariant
+def test_a_malformed_kept_log_is_set_aside_and_run_again(tmp_path: Path) -> None:
+    """A kept log that finished but cannot be read whole fails like the gate, not forever."""
+    from rpg_economy import integrity
+    from rpg_economy.campaign.runner import condition_log_matches, execute_trio, trio_is_complete
+
+    config = campaign_config()
+    plan, trio, cell = _one_trio(config)
+    directory = trio_directory(tmp_path / "runs", trio)
+    run_campaign(config, plan, tmp_path / "runs")
+    (directory / integrity.INTEGRITY_MARKER).unlink()
+
+    log = directory / "B.jsonl"
+    lines = log.read_text(encoding="utf-8").splitlines(keepends=True)
+    lines[len(lines) // 2] = "not an event\n"
+    log.write_text("".join(lines), encoding="utf-8")
+    # Its first and last events are intact, so it is kept rather than re-run.
+    assert condition_log_matches(directory, Condition.B, cell)
+
+    ran = execute_trio(cell, directory)
+
+    assert ran == (Condition.A, Condition.B, Condition.C)
+    assert {p.name for p in (directory / "previous-1").iterdir()} == {
+        "A.jsonl",
+        "B.jsonl",
+        "C.jsonl",
+    }
+    assert trio_is_complete(directory, cell)
+
+
+# ---------------------------------------------------------------------------
+# The worst case under Experiment 2
+# ---------------------------------------------------------------------------
+def _per_call_profile(inputs: dict[str, int], calls: int) -> TokenProfile:
+    profile = TokenProfile()
+    for name, total_input in inputs.items():
+        profile.record(
+            RunTokens(
+                condition=Condition(name),
+                scenario=Scenario.RESOURCE_SCARCITY,
+                experiment=ExperimentRegime.EQUAL_ACTIVITY,
+                seed=1,
+                input_tokens=total_input,
+                output_tokens=0,
+                calls=calls,
+            )
+        )
+    return profile
+
+
+def _by_experiment(plan, experiment: ExperimentRegime):
+    return dataclasses.replace(plan, trios=[t for t in plan.trios if t.experiment is experiment])
+
+
+def test_the_experiment_2_worst_case_prices_calls_at_their_uncapped_input() -> None:
+    """The cap shortens a run, never a call: capping must not shrink per-call input."""
+    from rpg_economy.campaign.cost import MEASURED_OUTPUT_PER_CALL, _worst_case_run
+
+    calls = 1_000
+    inputs = {"A": 1_000_000, "B": 1_000_000, "C": 1_000_000}
+    profile = _per_call_profile(inputs, calls)
+    loose = campaign_config(budget={"experiment_2_total_tokens": 1})
+    # A budget below every run's projection, so the headline is capped, but
+    # above every run's worst case, so the worst case is not.
+    cap = max(
+        sum(_worst_case_run(loose, Condition(name), total / calls, None))
+        for name, total in inputs.items()
+    )
+    assert cap < min(total + calls * MEASURED_OUTPUT_PER_CALL for total in inputs.values())
+    config = campaign_config(budget={"experiment_2_total_tokens": cap})
+    plan = build_plan(config, phase="final", scenarios=(Scenario.RESOURCE_SCARCITY,))
+
+    exp1 = estimate_cost(
+        _by_experiment(plan, ExperimentRegime.EQUAL_ACTIVITY),
+        profile,
+        PRICING,
+        model="m",
+        config=config,
+    )
+    exp2 = estimate_cost(
+        _by_experiment(plan, ExperimentRegime.EQUAL_COST),
+        profile,
+        PRICING,
+        model="m",
+        config=config,
+    )
+
+    assert exp2.total_cost < exp1.total_cost, "the headline is capped"
+    assert exp2.worst_case == exp1.worst_case, "per-call input was taken from the capped run"
+
+
+def test_the_experiment_2_worst_case_is_bounded_by_its_budget() -> None:
+    """A run stops calling at its budget, overshooting by at most the call that crossed it."""
+    from decimal import Decimal
+
+    cap = 50_000
+    calls = 100
+    inputs = {"A": 3_000_000, "B": 1_000_000, "C": 2_000_000}
+    config = campaign_config(budget={"experiment_2_total_tokens": cap})
+    plan = _by_experiment(
+        build_plan(config, phase="final", scenarios=(Scenario.RESOURCE_SCARCITY,)),
+        ExperimentRegime.EQUAL_COST,
+    )
+
+    estimate = estimate_cost(
+        plan, _per_call_profile(inputs, calls), PRICING, model="m", config=config
+    )
+
+    ceiling = Decimal(0)
+    for trio in plan.trios:
+        for condition in trio.conditions:
+            bound = cap + inputs[condition.value] // calls + config.llm.max_output_tokens
+            # Every token of it at the dearer output price.
+            ceiling += Decimal(bound) / 1_000_000 * PRICING.output_per_1m_tokens
+    assert estimate.worst_case is not None
+    assert estimate.worst_case <= ceiling.quantize(Decimal("0.01")) + Decimal("0.01")
+    assert estimate.worst_case >= estimate.total_cost
+
+
+# ---------------------------------------------------------------------------
+# A trio whose transient failures outlast every attempt
+# ---------------------------------------------------------------------------
+def test_a_trio_that_fails_on_every_attempt_stops_at_the_ceiling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from rpg_economy.campaign import parallel
+    from rpg_economy.llm import ProviderError
+
+    config = campaign_config()
+    plan, trio, _ = _one_trio(config)
+    attempts: list[bool] = []
+
+    def always_failing(cell, destination, *, reuse=True, **kwargs):
+        attempts.append(reuse)
+        raise ProviderError("503 after retries", transient=True)
+
+    monkeypatch.setattr(parallel, "execute_trio", always_failing)
+    monkeypatch.setattr(parallel, "backoff_delay", lambda attempt, *, rng: 0.0)
+
+    outcome = parallel._run_one(config, trio, tmp_path / "trio", rng_seed=0)
+
+    assert outcome.status == "failed"
+    assert outcome.attempts == parallel.MAX_PROVIDER_ATTEMPTS
+    assert len(attempts) == parallel.MAX_PROVIDER_ATTEMPTS
+    assert "503 after retries" in outcome.detail
