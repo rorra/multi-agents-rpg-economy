@@ -8,7 +8,12 @@ from pathlib import Path
 
 import pytest
 
-from rpg_economy.campaign import build_plan, estimate_cost, measure_profile, scenario_tier
+from rpg_economy.campaign import (
+    build_plan,
+    estimate_cost,
+    measure_profile,
+    scenario_tier,
+)
 from rpg_economy.campaign.cost import CostError, RunTokens, TokenProfile
 from rpg_economy.campaign.plan import (
     CampaignPhase,
@@ -2221,3 +2226,163 @@ def test_the_gate_refuses_a_trio_run_by_different_code_or_setups(
     _tamper_metadata(directory / "B.jsonl", **{field: value})
     with pytest.raises(TrioIntegrityError, match=field):
         verify_trio_logs(directory)
+
+
+def test_the_integrity_marker_records_the_common_active_horizon(tmp_path: Path) -> None:
+    from rpg_economy.integrity import INTEGRITY_MARKER
+    from rpg_economy.logging_ import EventType, read_events
+
+    config = campaign_config()
+    plan, trio, _ = _one_trio(config)
+    run_campaign(config, plan, tmp_path)
+    directory = trio_directory(tmp_path, trio)
+    horizon = json.loads((directory / INTEGRITY_MARKER).read_text(encoding="utf-8"))["horizon"]
+
+    assert horizon["planned_horizon"] == config.time.horizon_ticks
+    # Experiment 1 has no cap: nothing exhausts, the full horizon is common.
+    assert horizon["common_active_horizon"] == config.time.horizon_ticks
+    for condition in ("A", "B", "C"):
+        assert horizon["conditions"][condition] == {
+            "exhaustion_tick": None,
+            "post_exhaustion_ticks": 0,
+        }
+
+    # An exhaustion in one log sets the trio's horizon, and the ticks after it
+    # are counted as mechanical.
+    path = directory / "B.jsonl"
+    events = path.read_text(encoding="utf-8").splitlines(keepends=True)
+    ticks = [i for i, line in enumerate(events) if json.loads(line)["type"] == "tick"]
+    at = ticks[4]
+    exhausted = {**json.loads(events[at]), "type": EventType.BUDGET_EXHAUSTED.value}
+    exhausted["payload"] = {}
+    events.insert(at + 1, json.dumps(exhausted) + "\n")
+    path.write_text("".join(events), encoding="utf-8")
+    after = sum(
+        1 for e in read_events(path) if e.type is EventType.TICK and e.seq > exhausted["seq"]
+    )
+
+    from rpg_economy.integrity import active_horizons
+
+    recorded = active_horizons(directory)
+    assert recorded["common_active_horizon"] == exhausted["tick"]
+    assert recorded["conditions"]["B"]["exhaustion_tick"] == exhausted["tick"]
+    assert recorded["conditions"]["B"]["post_exhaustion_ticks"] == after > 0
+    assert recorded["conditions"]["A"]["exhaustion_tick"] is None
+
+
+# ---------------------------------------------------------------------------
+# Run phase: planned runs say whether they were pilot or final runs
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("phase", ["pilot", "final"])
+def test_planned_cells_carry_the_campaign_phase(phase: str) -> None:
+    from rpg_economy.campaign.plan import cell_config
+
+    config = campaign_config(budget={"experiment_2_total_tokens": 1000})
+    assert config.run.phase == "adhoc"
+    plan = build_plan(config, phase=phase)
+    for trio in plan.trios[:3]:
+        assert plan.cell(config, trio).run.phase == phase
+        assert cell_config(config, trio, phase).run.phase == phase
+    # Without a phase the configured one is kept.
+    assert cell_config(config, plan.trios[0], None).run.phase == "adhoc"
+
+
+def test_both_pilot_stages_plan_pilot_cells() -> None:
+    from rpg_economy.campaign.pilot import STAGES, stage_config, stage_plan
+
+    config = campaign_config()
+    for stage in STAGES.values():
+        plan = stage_plan(config, stage)
+        derived = stage_config(config, stage)
+        assert {plan.cell(derived, trio).run.phase for trio in plan.trios} == {"pilot"}
+
+
+def test_a_campaign_records_its_phase_in_every_run_log(tmp_path: Path) -> None:
+    from rpg_economy.campaign.parallel import run_campaign_parallel
+    from rpg_economy.logging_ import read_metadata
+
+    config = campaign_config()
+    plan, trio, _ = _one_trio(config)
+    run_campaign_parallel(config, plan, tmp_path, workers=1)
+    for condition in ("A", "B", "C"):
+        metadata = read_metadata(trio_directory(tmp_path, trio) / f"{condition}.jsonl")
+        assert metadata.phase == "pilot"
+
+
+def test_build_metadata_records_the_configured_phase() -> None:
+    from rpg_economy.cli_support import build_metadata
+
+    config = campaign_config(budget={"experiment_2_total_tokens": 1000})
+    assert build_metadata(config).phase == "adhoc"
+    plan = build_plan(config, phase="final")
+    assert build_metadata(plan.cell(config, plan.trios[0])).phase == "final"
+
+
+@pytest.mark.invariant
+def test_a_pilot_and_a_final_run_of_one_cell_share_their_hashes() -> None:
+    """The phase is recorded in the metadata, never in the run's identity."""
+    from rpg_economy.campaign.plan import cell_config
+    from rpg_economy.config import config_hash, setup_hash
+
+    config = campaign_config()
+    trio = build_plan(config, phase="pilot").trios[0]
+    pilot = cell_config(config, trio, "pilot")
+    final = cell_config(config, trio, "final")
+    adhoc = cell_config(config, trio, None)
+    assert {pilot.run.phase, final.run.phase, adhoc.run.phase} == {"pilot", "final", "adhoc"}
+    assert config_hash(pilot) == config_hash(final) == config_hash(adhoc)
+    assert setup_hash(pilot) == setup_hash(final) == setup_hash(adhoc)
+
+
+@pytest.mark.parametrize("horizon", [340, 400])
+def test_a_calibration_horizon_that_does_not_fit_is_refused(horizon: int) -> None:
+    """A calibration stage must be shorter than the full run."""
+    from rpg_economy.campaign.pilot import CALIBRATION, stage_config
+    from rpg_economy.config import load_config
+    from tests.conftest import BASE_CONFIG
+
+    base = load_config(BASE_CONFIG)
+    payload = base.model_dump(mode="python")
+    payload["campaign"] = {**payload["campaign"], "pilot_calibration_horizon": horizon}
+    config = type(base).model_validate(payload)
+    with pytest.raises(PlanError) as refused:
+        stage_config(config, CALIBRATION)
+    assert refused.value.key == "error.pilot.bad_horizon"
+
+
+def test_the_calibration_stage_runs_the_configured_horizon() -> None:
+    from rpg_economy.campaign.pilot import CALIBRATION, stage_config
+
+    for horizon in (6, 8):
+        base = campaign_config(
+            campaign={"secondary_scenarios": [], "pilot_calibration_horizon": horizon}
+        )
+        assert stage_config(base, CALIBRATION).time.horizon_ticks == horizon
+
+
+def test_a_trio_can_run_one_condition_at_a_time(tmp_path: Path) -> None:
+    """B, then C, then A: verified and marked only once all three have run."""
+    from rpg_economy.campaign.runner import execute_trio
+    from rpg_economy.integrity import has_integrity_marker
+
+    config = campaign_config()
+    _, trio, cell = _one_trio(config)
+    directory = tmp_path / "trio"
+
+    assert execute_trio(cell, directory, only=Condition.B) == (Condition.B,)
+    assert (directory / "B.jsonl").exists() and not (directory / "A.jsonl").exists()
+    assert not has_integrity_marker(directory)
+    # B again is already there: nothing runs.
+    assert execute_trio(cell, directory, only=Condition.B) == ()
+    assert execute_trio(cell, directory, only=Condition.C) == (Condition.C,)
+    assert not has_integrity_marker(directory)
+    assert execute_trio(cell, directory, only=Condition.A) == (Condition.A,)
+    assert has_integrity_marker(directory)
+
+
+def test_a_one_condition_trio_is_priced_for_that_condition_only() -> None:
+    plan_trio = PlannedTrio(Scenario.RESOURCE_SCARCITY, ExperimentRegime.EQUAL_ACTIVITY, 1001)
+    narrowed = dataclasses.replace(plan_trio, only=Condition.B)
+    assert narrowed.conditions == (Condition.B,)
+    assert narrowed.runs == 1
+    assert plan_trio.runs == 3
