@@ -560,3 +560,553 @@ def _billed_log(path: Path, *, tokens: int = 100) -> None:
         {"type": "run_end", "payload": {}},
     ]
     path.write_text("".join(json.dumps(e) + "\n" for e in events), encoding="utf-8")
+
+
+def test_pilot_verify_only_passes_a_complete_stage(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from rpg_economy.campaign.pilot import CALIBRATION, stage_plan
+    from rpg_economy.campaign.runner import trio_directory
+    from rpg_economy.config import load_config
+
+    plan = stage_plan(load_config(BASE_CONFIG), CALIBRATION)
+    for trio in plan.trios:
+        for condition in trio.conditions:
+            _billed_log(trio_directory(tmp_path / "calibration", trio) / f"{condition.value}.jsonl")
+
+    code = main(["pilot", "--stage", "calibration", "--out", str(tmp_path), "--verify-only"])
+
+    assert code == 0
+    printed = capsys.readouterr().out
+    report = json.loads(printed[printed.index("{") :])
+    assert report["complete"] is True
+    assert report["runs"] == report["expected_runs"] == plan.total_runs
+    assert report["all_real"] is True
+    assert report["all_fully_billed"] is True
+
+
+def test_the_billing_line_is_localized(capsys: pytest.CaptureFixture[str]) -> None:
+    from rpg_economy.cli import _print_billing
+    from rpg_economy.i18n import set_locale
+
+    set_locale("es")
+    _print_billing(
+        {
+            "runs": 3,
+            "all_real": True,
+            "all_fully_billed": False,
+            "billed_total": 1234567,
+            "set_aside": {"logs": 1, "billed_total": 2500},
+        }
+    )
+    out = capsys.readouterr().out
+    assert "1.234.567" in out
+    assert "2.500" in out
+    assert "sí" in out
+    assert "True" not in out and "False" not in out
+
+
+def test_pilot_header_prints_the_stage_purpose_translated(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    main(
+        [
+            "--locale",
+            "es",
+            "pilot",
+            "--stage",
+            "calibration",
+            "--out",
+            str(tmp_path),
+            "--verify-only",
+        ]
+    )
+    out = capsys.readouterr().out
+    assert t("pilot.purpose.calibration", locale="es") in out
+    assert "verify the configuration" not in out
+
+
+# ---------------------------------------------------------------------------
+# smoke and derisk reruns: set aside or kept, never a traceback
+# ---------------------------------------------------------------------------
+def _write_once(path: Path) -> None:
+    """Stands in for a run: refuses a non-empty log, as the real writer does."""
+    from rpg_economy.logging_ import LogError
+
+    path = Path(path)
+    if path.exists() and path.stat().st_size:
+        raise LogError(f"refusing to append to non-empty run log {path}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('{"stand_in": true}\n', encoding="utf-8")
+
+
+def _fake_smoke(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Both smoke runs and their verification replaced: nothing here reaches a provider."""
+    from types import SimpleNamespace
+
+    from rpg_economy import runner
+    from rpg_economy.campaign import smoke
+
+    def run_trio(config, directory, *, seed=None, **kwargs):
+        for condition in "ABC":
+            _write_once(Path(directory) / f"{condition}.jsonl")
+
+    def run_condition(config, log_path, **kwargs):
+        _write_once(log_path)
+
+    def verify_smoke(path, *, label, planned_horizon, expect_exhaustion):
+        return SimpleNamespace(
+            label=label,
+            model="stand-in",
+            llm_calls=1200,
+            provider_input=1_500_000,
+            provider_output=20_000,
+            ledger_total=1_520_000,
+            provider_total=1_520_000,
+            checks=[SimpleNamespace(passed=True, name="usage", detail="-")],
+            passed=True,
+            to_payload=lambda: {"label": label},
+        )
+
+    monkeypatch.setattr(runner, "run_trio", run_trio)
+    monkeypatch.setattr(runner, "run_condition", run_condition)
+    monkeypatch.setattr(smoke, "verify_smoke", verify_smoke)
+
+
+def _smoke_argv(out: Path) -> list[str]:
+    return ["smoke", "--out", str(out), "--spend-limit-set", "--confirm-cost", _smoke_total()]
+
+
+def test_a_smoke_rerun_sets_the_earlier_runs_aside(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _fake_smoke(monkeypatch)
+    out = tmp_path / "smoke"
+
+    assert main(_smoke_argv(out)) == 0
+    assert main(["--locale", "es", *_smoke_argv(out)]) == 0
+
+    assert {p.name for p in (out / "smoke1" / "previous-1").iterdir()} == {
+        "A.jsonl",
+        "B.jsonl",
+        "C.jsonl",
+    }
+    assert [p.name for p in (out / "smoke2" / "previous-1").iterdir()] == ["A.jsonl"]
+    printed = capsys.readouterr()
+    assert "[PASS] usage" in printed.out
+    assert "1.500.000" in printed.out
+    assert "Traceback" not in printed.err
+
+
+def test_a_smoke_log_that_cannot_be_written_is_reported_cleanly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from rpg_economy import runner
+    from rpg_economy.logging_ import LogError
+
+    _fake_smoke(monkeypatch)
+
+    def refuses(*args: object, **kwargs: object) -> None:
+        raise LogError("refusing to append to non-empty run log")
+
+    monkeypatch.setattr(runner, "run_trio", refuses)
+
+    assert main(_smoke_argv(tmp_path / "smoke")) == 6
+    err = capsys.readouterr().err
+    assert str(tmp_path / "smoke" / "smoke1") in err
+    assert "Traceback" not in err
+
+
+def test_smoke_report_only_without_runs_is_refused_cleanly(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert main(["smoke", "--out", str(tmp_path / "smoke"), "--report-only"]) == 6
+    err = capsys.readouterr().err
+    assert "SMOKE-1" in err
+    assert "Traceback" not in err
+
+
+def test_smoke_report_only_with_a_malformed_log_is_refused_cleanly(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    for step in ("smoke1", "smoke2"):
+        (tmp_path / step).mkdir()
+        (tmp_path / step / "A.jsonl").write_text("not an event\n", encoding="utf-8")
+
+    assert main(["smoke", "--out", str(tmp_path), "--report-only"]) == 6
+    err = capsys.readouterr().err
+    assert str(tmp_path / "smoke1" / "A.jsonl") in err
+    assert "Traceback" not in err
+
+
+def _mock_arms(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every de-risk arm replaced by a short mock configuration: offline, and free."""
+    from rpg_economy.campaign import derisk
+    from tests.conftest import make_config
+
+    def mock_arm(base, *, model, horizon):
+        return make_config(
+            phases={"base_ticks": 4, "shock_ticks": 4, "recovery_ticks": 4},
+            time={"horizon_ticks": 12},
+            metrics={"volatility_window_w": 2, "recovery_hold_ticks_m": 2},
+            llm={"model": model},
+        )
+
+    monkeypatch.setattr(derisk, "derisk_config", mock_arm)
+
+
+DERISK_PRICING = "gpt-5-mini=0.25/2.00"
+
+
+def _derisk_total(
+    mock_profile: Path,
+    *,
+    seed: int = 1001,
+    models: tuple[str, ...] = ("gpt-5-nano", "gpt-5-mini"),
+) -> str:
+    from rpg_economy.cli import _derisk_estimate, _parse_model_pricing
+    from rpg_economy.config import load_config
+
+    config = load_config(BASE_CONFIG, overrides={"run": {"seed": seed}})
+    estimate = _derisk_estimate(
+        config,
+        models,
+        mock_profile,
+        horizon=120,
+        seed=seed,
+        pricing_overrides=_parse_model_pricing(DERISK_PRICING),
+    )
+    return str(estimate.total_cost)
+
+
+def test_a_derisk_rerun_keeps_finished_arms_and_sets_aside_the_rest(
+    tmp_path: Path,
+    mock_profile: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _mock_arms(monkeypatch)
+    out = tmp_path / "derisk"
+    argv = [
+        "derisk",
+        "--out",
+        str(out),
+        "--seed",
+        "1001",
+        "--profile-logs",
+        str(mock_profile),
+        "--model-pricing",
+        DERISK_PRICING,
+        "--spend-limit-set",
+        "--confirm-cost",
+        _derisk_total(mock_profile),
+    ]
+
+    assert main(argv) == 0
+    capsys.readouterr()
+
+    # Everything finished: a rerun runs nothing, so it prices and confirms
+    # nothing either, and reports again.
+    assert main(argv[: argv.index("--spend-limit-set")]) == 0
+    printed = capsys.readouterr()
+    assert printed.out.count("gpt-5-") >= 2
+    assert not list(out.rglob("previous-*"))
+
+    # One arm cut short: only that arm runs again, its old logs set aside, and
+    # only that arm is priced -- the whole comparison's total is refused.
+    log = out / "gpt-5-mini" / "A.jsonl"
+    log.write_bytes(b"".join(log.read_bytes().splitlines(keepends=True)[:-1]))
+    assert main(argv) == 5
+    capsys.readouterr()
+    rerun = [*argv[:-1], _derisk_total(mock_profile, models=("gpt-5-mini",))]
+    assert main(rerun) == 0
+    assert {p.name for p in (out / "gpt-5-mini" / "previous-1").iterdir()} == {
+        "A.jsonl",
+        "B.jsonl",
+        "C.jsonl",
+    }
+    assert not (out / "gpt-5-nano" / "previous-1").exists()
+    assert "Traceback" not in capsys.readouterr().err
+
+
+def test_derisk_report_only_with_a_malformed_log_is_refused_cleanly(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    arm = tmp_path / "gpt-5-nano"
+    arm.mkdir()
+    (arm / "A.jsonl").write_text("not an event\n", encoding="utf-8")
+
+    assert main(["derisk", "--out", str(tmp_path), "--report-only"]) == 6
+    assert "Traceback" not in capsys.readouterr().err
+
+
+def test_the_derisk_estimate_prices_each_arm_as_a_one_trio_plan(mock_profile: Path) -> None:
+    """Per cell, with the worst case and the retry multiplier, not pooled across cells."""
+    from rpg_economy.campaign.derisk import derisk_config
+    from rpg_economy.campaign.parallel import MAX_PROVIDER_ATTEMPTS
+    from rpg_economy.cli import _derisk_estimate, _trio_estimate
+    from rpg_economy.config import load_config
+
+    config = load_config(BASE_CONFIG, overrides={"run": {"seed": 1001}})
+    estimate = _derisk_estimate(
+        config,
+        (config.llm.model,),
+        mock_profile,
+        horizon=120,
+        seed=1001,
+    )
+
+    arm = derisk_config(config, model=config.llm.model, horizon=120)
+    arm = arm.for_cell(scenario=arm.run.scenario, experiment=arm.run.experiment, seed=1001)
+    one_trio = _trio_estimate(arm, mock_profile)
+
+    assert estimate.total_runs == 3
+    assert estimate.total_cost == one_trio.total_cost
+    assert estimate.worst_case == one_trio.worst_case
+    assert estimate.worst_case is not None
+    assert estimate.retry_attempts == MAX_PROVIDER_ATTEMPTS
+    assert estimate.worst_case_with_retries == estimate.worst_case * MAX_PROVIDER_ATTEMPTS
+
+
+# ---------------------------------------------------------------------------
+# A budget derived from mock runs never reaches a real batch
+# ---------------------------------------------------------------------------
+def test_derive_budget_marks_a_mock_budget_in_its_layer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from types import SimpleNamespace
+
+    from rpg_economy.analysis import budget_derivation
+    from rpg_economy.config import load_config
+
+    derivation = SimpleNamespace(budget=123_456, runs=[1, 2, 3], to_payload=lambda: {})
+    monkeypatch.setattr(budget_derivation, "find_logs", lambda path: [])
+    monkeypatch.setattr(
+        budget_derivation, "derive_budget", lambda logs, *, config, allow_mock: derivation
+    )
+
+    for allow_mock in (True, False):
+        layer = tmp_path / f"budget-{allow_mock}.yaml"
+        argv = ["derive-budget", "--pilot-logs", str(tmp_path), "--layer-out", str(layer)]
+        assert main([*argv, "--allow-mock"] if allow_mock else argv) == 0
+        loaded = load_config(BASE_CONFIG, layers=[layer])
+        assert loaded.budget.experiment_2_total_tokens == 123_456
+        assert loaded.budget.derived_from_mock is allow_mock
+        # The code it was derived under travels with it.
+        from rpg_economy.logging_.metadata import code_digest
+
+        assert loaded.budget.derived_code_digest == code_digest()
+
+
+MOCK_BUDGET_LAYER = "budget: {experiment_2_total_tokens: 50000, derived_from_mock: true}\n"
+
+
+def test_a_real_campaign_refuses_a_budget_derived_under_other_code(
+    tmp_path: Path,
+    mock_profile: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from rpg_economy.campaign import parallel
+
+    monkeypatch.setattr(
+        parallel, "run_campaign_parallel", lambda *a, **k: pytest.fail("a stale budget ran")
+    )
+    layer = tmp_path / "budget.yaml"
+    layer.write_text(
+        "budget: {experiment_2_total_tokens: 50000, derived_code_digest: not-this-code}\n",
+        encoding="utf-8",
+    )
+    code = main(
+        [
+            "campaign-run",
+            "--real",
+            "--config",
+            str(_short_config_file(tmp_path)),
+            "--layer",
+            str(layer),
+            "--phase",
+            "pilot",
+            "--out",
+            str(tmp_path / "runs"),
+            "--profile-logs",
+            str(mock_profile),
+            "--spend-limit-set",
+            "--confirm-cost",
+            "0.01",
+        ]
+    )
+    assert code == 5
+    assert t("error.budget.code_changed") in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("locale", ["en", "es"])
+def test_a_real_campaign_refuses_a_mock_derived_budget(
+    tmp_path: Path,
+    mock_profile: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    locale: str,
+) -> None:
+    from rpg_economy.campaign import parallel
+
+    monkeypatch.setattr(
+        parallel, "run_campaign_parallel", lambda *a, **k: pytest.fail("a mock budget ran")
+    )
+    layer = tmp_path / "budget.yaml"
+    layer.write_text(MOCK_BUDGET_LAYER, encoding="utf-8")
+
+    code = main(
+        [
+            "--locale",
+            locale,
+            "campaign-run",
+            "--real",
+            "--config",
+            str(_short_config_file(tmp_path)),
+            "--layer",
+            str(layer),
+            "--phase",
+            "pilot",
+            "--out",
+            str(tmp_path / "runs"),
+            "--profile-logs",
+            str(mock_profile),
+            "--spend-limit-set",
+            "--confirm-cost",
+            "0.01",
+        ]
+    )
+
+    assert code == 5
+    assert t("error.budget.mock_derived", locale=locale) in capsys.readouterr().err
+    assert not (tmp_path / "runs").exists()
+
+
+def test_a_real_pilot_refuses_a_mock_derived_budget(
+    tmp_path: Path, mock_profile: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    layer = tmp_path / "budget.yaml"
+    layer.write_text(MOCK_BUDGET_LAYER, encoding="utf-8")
+
+    code = main(
+        [
+            "pilot",
+            "--real",
+            "--layer",
+            str(layer),
+            "--stage",
+            "calibration",
+            "--out",
+            str(tmp_path / "pilot"),
+            "--profile-logs",
+            str(mock_profile),
+            "--spend-limit-set",
+            "--confirm-cost",
+            "0.01",
+        ]
+    )
+
+    assert code == 5
+    assert t("error.budget.mock_derived") in capsys.readouterr().err
+    assert not (tmp_path / "pilot").exists()
+
+
+def test_the_mock_budget_gate_reads_the_budget_field(tmp_path: Path) -> None:
+    from rpg_economy.cli import _refuse_mock_budget
+    from rpg_economy.config import load_config
+
+    layer = tmp_path / "budget.yaml"
+    layer.write_text(MOCK_BUDGET_LAYER, encoding="utf-8")
+    assert _refuse_mock_budget(load_config(BASE_CONFIG, layers=[layer])) is True
+    assert _refuse_mock_budget(load_config(BASE_CONFIG)) is False
+
+
+# ---------------------------------------------------------------------------
+# The pilot's progress and failures, in the reader's language
+# ---------------------------------------------------------------------------
+def _confirmed_total(argv: list[str], capsys: pytest.CaptureFixture[str]) -> str:
+    """The total a real command asks to be confirmed, read from its refusal."""
+    import re
+
+    assert main([*argv, "--confirm-cost", "0"]) == 5
+    return re.search(r"--confirm-cost (\S+)", capsys.readouterr().err).group(1)
+
+
+def _pilot_argv(out: Path, mock_profile: Path) -> list[str]:
+    return [
+        "pilot",
+        "--real",
+        "--stage",
+        "calibration",
+        "--out",
+        str(out),
+        "--profile-logs",
+        str(mock_profile),
+        "--spend-limit-set",
+    ]
+
+
+def test_pilot_progress_and_failures_are_localized(
+    tmp_path: Path,
+    mock_profile: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from rpg_economy.campaign import parallel
+    from rpg_economy.campaign.parallel import ParallelResult, TrioOutcome
+
+    def fake_run(config, plan, directory, *, workers, resume, progress, **kwargs):
+        result = ParallelResult(directory=Path(directory), workers=workers)
+        for index, trio in enumerate(plan.trios[:2]):
+            outcome = TrioOutcome(
+                trio=trio,
+                status="failed" if index else "completed",
+                detail="ProviderError: 401 invalid_api_key" if index else "",
+            )
+            result.outcomes.append(outcome)
+            progress(outcome, index + 1, 2)
+        return result
+
+    monkeypatch.setattr(parallel, "run_campaign_parallel", fake_run)
+    argv = ["--locale", "es", *_pilot_argv(tmp_path / "pilot", mock_profile)]
+    total = _confirmed_total(argv, capsys)
+
+    assert main([*argv, "--confirm-cost", total]) == 7
+
+    printed = capsys.readouterr()
+    progress = [line for line in printed.out.splitlines() if line.startswith(("[1/2]", "[2/2]"))]
+    assert len(progress) == 2
+    assert all(t("scenario.resource_scarcity", locale="es") in line for line in progress)
+    assert t("campaign.status.completed", locale="es") in progress[0]
+    assert t("campaign.status.failed", locale="es") in progress[1]
+    assert not any("resource_scarcity" in line or "failed" in line for line in progress)
+    assert "401 invalid_api_key" in printed.err
+    assert "Traceback" not in printed.err
+
+
+def test_pilot_refuses_a_stage_directory_another_run_holds(
+    tmp_path: Path,
+    mock_profile: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import os
+
+    from rpg_economy.campaign import parallel
+    from rpg_economy.campaign.lock import campaign_lock
+
+    monkeypatch.setattr(
+        parallel, "run_campaign_parallel", lambda *a, **k: pytest.fail("a locked stage ran")
+    )
+    stage = tmp_path / "pilot" / "calibration"
+    argv = _pilot_argv(tmp_path / "pilot", mock_profile)
+    total = _confirmed_total(argv, capsys)
+
+    # Held for real: another open file description holds the flock.
+    with campaign_lock(stage) as held:
+        assert main([*argv, "--confirm-cost", total]) == 10
+        assert held.path.exists()
+    err = capsys.readouterr().err
+    assert f"pid {os.getpid()}" in err
+    assert "Traceback" not in err
