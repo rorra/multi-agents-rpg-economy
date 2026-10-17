@@ -1,0 +1,292 @@
+Experimental results: orchestration architectures in a simulated RPG economy
+Scenario: Resource scarcity — Experiment 1 — equal economic activity — 8 seeds
+
+WARNING: these runs used the offline mock, not a language model. The numbers exercise the pipeline and are not results.
+
+EXPLORATION ONLY: this analysis includes pilot seeds. Pilot seeds are for calibration and are never used for inference (design s11.4); the tests below describe the pilot, not the experiment.
+
+Metric parameters applied: W = 20, X = 0.1, M = 10, T = 20, D = 10.
+
+Primary metrics (Iron)
+Metric                                 Centralized (Director)  Decentralized  Decentralized + global bulletin  n
+-------------------------------------  ----------------------  -------------  -------------------------------  -
+Volatility (shock phase)               0.207                   0.265          0.265                            8
+Volatility (shock phase, phase-level)  0.341                   0.436          0.436                            8
+Stockout ticks (shock phase)           50.5                    52             52                               8
+
+Secondary metrics
+Metric                                                                           Centralized (Director)  Decentralized  Decentralized + global bulletin  n
+-------------------------------------------------------------------------------  ----------------------  -------------  -------------------------------  -
+Traded value (shock phase)                                                       2,963                   3,072          3,072                            8
+Useful production (fraction)                                                     0.751                   0.745          0.745                            8
+Gini                                                                             0.161                   0.14           0.14                             8
+Coordination efficiency                                                          0.679                   0.791          0.791                            8
+Activation concentration (HHI)                                                   0.083                   0.083          0.083                            8
+Unanswered requests                                                              0                       0              0                                8
+Tokens (total)                                                                   10,799,624              5,433,956      6,062,829                        8
+LLM calls                                                                        4,080                   1,775          1,775                            8
+Stockout ticks, no world inventory (shock phase)                                 3                       2              2                                8
+Volatility, all goods (shock / base, median across goods)                        0.809                   0.766          0.766                            8
+Units traded per tick, all goods (shock / base, median across goods)             1.089                   1.061          1.061                            8
+Share of ticks without offer, all goods (shock minus base, median across goods)  -0.108                  -0.1           -0.1                             8
+Propagated product: mean price (shock phase)                                     33.4                    33.717         33.717                           8
+Propagated product: stockout ticks (shock phase)                                 41                      43             43                               8
+
+Medians are taken over the n seeds with a usable value in every condition; measurability per condition is reported below.
+
+Companion outcome: measurability
+A market too thin to price is an effect of the architecture, not a gap in the data about it. Reported as an outcome in its own right and tested on the pairing, like recovery within the horizon.
+
+Outcome                                                                Centralized (Director)  Decentralized  Decentralized + global bulletin
+---------------------------------------------------------------------  ----------------------  -------------  -------------------------------
+Volatility (shock phase): measurable                                   8/8                     8/8            8/8
+Volatility (shock phase, phase-level): measurable                      8/8                     8/8            8/8
+Propagated product: mean price (shock phase): measurable               8/8                     8/8            8/8
+Volatility, all goods (shock / base, median across goods): measurable  8/8                     8/8            8/8
+
+Paired binary (measurable), McNemar exact
+Metric                                                     Contrast                                                  Discordant  p      p (Holm)
+---------------------------------------------------------  --------------------------------------------------------  ----------  -----  --------
+Volatility (shock phase)                                   Centralized (Director) / Decentralized                    0           1.000  1.000
+Volatility (shock phase)                                   Centralized (Director) / Decentralized + global bulletin  0           1.000  1.000
+Volatility (shock phase)                                   Decentralized / Decentralized + global bulletin           0           1.000  1.000
+Volatility (shock phase, phase-level)                      Centralized (Director) / Decentralized                    0           1.000  1.000
+Volatility (shock phase, phase-level)                      Centralized (Director) / Decentralized + global bulletin  0           1.000  1.000
+Volatility (shock phase, phase-level)                      Decentralized / Decentralized + global bulletin           0           1.000  1.000
+Propagated product: mean price (shock phase)               Centralized (Director) / Decentralized                    0           1.000  1.000
+Propagated product: mean price (shock phase)               Centralized (Director) / Decentralized + global bulletin  0           1.000  1.000
+Propagated product: mean price (shock phase)               Decentralized / Decentralized + global bulletin           0           1.000  1.000
+Volatility, all goods (shock / base, median across goods)  Centralized (Director) / Decentralized                    0           1.000  1.000
+Volatility, all goods (shock / base, median across goods)  Centralized (Director) / Decentralized + global bulletin  0           1.000  1.000
+Volatility, all goods (shock / base, median across goods)  Decentralized / Decentralized + global bulletin           0           1.000  1.000
+
+Primary contrast: A vs. B. A–C and B–C are secondary.
+Holm correction applied per metric within this scenario.
+
+Contrasts: Volatility (shock phase)
+Contrast                                                  n  Dropped  Median diff.  Effect (rb)  p      p (Holm)  95% CI
+--------------------------------------------------------  -  -------  ------------  -----------  -----  --------  ---------------
+Centralized (Director) / Decentralized                    8  0        -0.044        -0.39        0.383  1.000     [-0.158; 0.053]
+Centralized (Director) / Decentralized + global bulletin  8  0        -0.044        -0.39        0.383  1.000     [-0.158; 0.053]
+Decentralized / Decentralized + global bulletin           8  0        0             0            1.000  1.000     [0; 0]
+
+Contrasts: Volatility (shock phase, phase-level)
+Contrast                                                  n  Dropped  Median diff.  Effect (rb)  p      p (Holm)  95% CI
+--------------------------------------------------------  -  -------  ------------  -----------  -----  --------  --------------
+Centralized (Director) / Decentralized                    8  0        -0.137        -0.33        0.461  1.000     [-0.264; 0.16]
+Centralized (Director) / Decentralized + global bulletin  8  0        -0.137        -0.33        0.461  1.000     [-0.264; 0.16]
+Decentralized / Decentralized + global bulletin           8  0        0             0            1.000  1.000     [0; 0]
+
+Contrasts: Stockout ticks (shock phase)
+Contrast                                                  n  Dropped  Median diff.  Effect (rb)  p      p (Holm)  95% CI
+--------------------------------------------------------  -  -------  ------------  -----------  -----  --------  ---------
+Centralized (Director) / Decentralized                    8  0        0.5           -0.22        0.609  1.000     [-31; 23]
+Centralized (Director) / Decentralized + global bulletin  8  0        0.5           -0.22        0.609  1.000     [-31; 23]
+Decentralized / Decentralized + global bulletin           8  0        0             0            1.000  1.000     [0; 0]
+
+Contrasts: Traded value (shock phase)
+Contrast                                                  n  Dropped  Median diff.  Effect (rb)  p      p (Holm)  95% CI
+--------------------------------------------------------  -  -------  ------------  -----------  -----  --------  -----------------
+Centralized (Director) / Decentralized                    8  0        -51.025       -0.22        0.641  1.000     [-319.68; 151.36]
+Centralized (Director) / Decentralized + global bulletin  8  0        -51.025       -0.22        0.641  1.000     [-319.68; 151.36]
+Decentralized / Decentralized + global bulletin           8  0        0             0            1.000  1.000     [0; 0]
+
+Contrasts: Useful production (fraction)
+Contrast                                                  n  Dropped  Median diff.  Effect (rb)  p      p (Holm)  95% CI
+--------------------------------------------------------  -  -------  ------------  -----------  -----  --------  ---------------
+Centralized (Director) / Decentralized                    8  0        0.005         0            1.000  1.000     [-0.072; 0.054]
+Centralized (Director) / Decentralized + global bulletin  8  0        0.005         0            1.000  1.000     [-0.072; 0.054]
+Decentralized / Decentralized + global bulletin           8  0        0             0            1.000  1.000     [0; 0]
+
+Contrasts: Gini
+Contrast                                                  n  Dropped  Median diff.  Effect (rb)  p      p (Holm)  95% CI
+--------------------------------------------------------  -  -------  ------------  -----------  -----  --------  ---------------
+Centralized (Director) / Decentralized                    8  0        0.03          0.5          0.250  0.750     [-0.025; 0.075]
+Centralized (Director) / Decentralized + global bulletin  8  0        0.03          0.5          0.250  0.750     [-0.025; 0.075]
+Decentralized / Decentralized + global bulletin           8  0        0             0            1.000  1.000     [0; 0]
+
+Contrasts: Coordination efficiency
+Contrast                                                  n  Dropped  Median diff.  Effect (rb)  p      p (Holm)  95% CI
+--------------------------------------------------------  -  -------  ------------  -----------  -----  --------  ----------------
+Centralized (Director) / Decentralized                    8  0        -0.119        -1           0.008  0.023     [-0.162; -0.092]
+Centralized (Director) / Decentralized + global bulletin  8  0        -0.119        -1           0.008  0.023     [-0.162; -0.092]
+Decentralized / Decentralized + global bulletin           8  0        0             0            1.000  1.000     [0; 0]
+
+Contrasts: Activation concentration (HHI)
+Contrast                                                  n  Dropped  Median diff.  Effect (rb)  p      p (Holm)  95% CI
+--------------------------------------------------------  -  -------  ------------  -----------  -----  --------  ------
+Centralized (Director) / Decentralized                    8  0        0             -1           0.008  0.023     [0; 0]
+Centralized (Director) / Decentralized + global bulletin  8  0        0             -1           0.008  0.023     [0; 0]
+Decentralized / Decentralized + global bulletin           8  0        0             0            1.000  1.000     [0; 0]
+
+Contrasts: Unanswered requests
+Contrast                                         n  Dropped  Median diff.  Effect (rb)  p      p (Holm)  95% CI
+-----------------------------------------------  -  -------  ------------  -----------  -----  --------  ------
+Decentralized / Decentralized + global bulletin  8  0        0             0            1.000  1.000     [0; 0]
+
+Contrasts: Tokens (total)
+Contrast                                                  n  Dropped  Median diff.  Effect (rb)  p      p (Holm)  95% CI
+--------------------------------------------------------  -  -------  ------------  -----------  -----  --------  ----------------------
+Centralized (Director) / Decentralized                    8  0        5,361,982     1            0.008  0.023     [5,307,191; 5,401,278]
+Centralized (Director) / Decentralized + global bulletin  8  0        4,728,430     1            0.008  0.023     [4,672,680; 4,774,550]
+Decentralized / Decentralized + global bulletin           8  0        -629,680      -1           0.008  0.023     [-634,511; -623,472]
+
+Contrasts: LLM calls
+Contrast                                                  n  Dropped  Median diff.  Effect (rb)  p      p (Holm)  95% CI
+--------------------------------------------------------  -  -------  ------------  -----------  -----  --------  --------------
+Centralized (Director) / Decentralized                    8  0        2,305         1            0.008  0.023     [2,290; 2,321]
+Centralized (Director) / Decentralized + global bulletin  8  0        2,305         1            0.008  0.023     [2,290; 2,321]
+Decentralized / Decentralized + global bulletin           8  0        0             0            1.000  1.000     [0; 0]
+
+Contrasts: Stockout ticks, no world inventory (shock phase)
+Contrast                                                  n  Dropped  Median diff.  Effect (rb)  p      p (Holm)  95% CI
+--------------------------------------------------------  -  -------  ------------  -----------  -----  --------  -------
+Centralized (Director) / Decentralized                    8  0        1             0.43         0.406  1.000     [-1; 3]
+Centralized (Director) / Decentralized + global bulletin  8  0        1             0.43         0.406  1.000     [-1; 3]
+Decentralized / Decentralized + global bulletin           8  0        0             0            1.000  1.000     [0; 0]
+
+Contrasts: Volatility, all goods (shock / base, median across goods)
+Contrast                                                  n  Dropped  Median diff.  Effect (rb)  p      p (Holm)  95% CI
+--------------------------------------------------------  -  -------  ------------  -----------  -----  --------  ---------------
+Centralized (Director) / Decentralized                    8  0        -0.003        0.17         0.742  1.000     [-0.127; 0.516]
+Centralized (Director) / Decentralized + global bulletin  8  0        -0.003        0.17         0.742  1.000     [-0.127; 0.516]
+Decentralized / Decentralized + global bulletin           8  0        0             0            1.000  1.000     [0; 0]
+
+Contrasts: Units traded per tick, all goods (shock / base, median across goods)
+Contrast                                                  n  Dropped  Median diff.  Effect (rb)  p      p (Holm)  95% CI
+--------------------------------------------------------  -  -------  ------------  -----------  -----  --------  ---------------
+Centralized (Director) / Decentralized                    8  0        -0.044        -0.29        0.578  1.000     [-0.144; 0.127]
+Centralized (Director) / Decentralized + global bulletin  8  0        -0.044        -0.29        0.578  1.000     [-0.144; 0.127]
+Decentralized / Decentralized + global bulletin           8  0        0             0            1.000  1.000     [0; 0]
+
+Contrasts: Share of ticks without offer, all goods (shock minus base, median across goods)
+Contrast                                                  n  Dropped  Median diff.  Effect (rb)  p      p (Holm)  95% CI
+--------------------------------------------------------  -  -------  ------------  -----------  -----  --------  ---------------
+Centralized (Director) / Decentralized                    8  0        -0.001        -0.11        0.844  1.000     [-0.096; 0.094]
+Centralized (Director) / Decentralized + global bulletin  8  0        -0.001        -0.11        0.844  1.000     [-0.096; 0.094]
+Decentralized / Decentralized + global bulletin           8  0        0             0            1.000  1.000     [0; 0]
+
+Contrasts: Propagated product: mean price (shock phase)
+Contrast                                                  n  Dropped  Median diff.  Effect (rb)  p      p (Holm)  95% CI
+--------------------------------------------------------  -  -------  ------------  -----------  -----  --------  -------------
+Centralized (Director) / Decentralized                    8  0        -0.178        -0.17        0.742  1.000     [-0.36; 1.37]
+Centralized (Director) / Decentralized + global bulletin  8  0        -0.178        -0.17        0.742  1.000     [-0.36; 1.37]
+Decentralized / Decentralized + global bulletin           8  0        0             0            1.000  1.000     [0; 0]
+
+Contrasts: Propagated product: stockout ticks (shock phase)
+Contrast                                                  n  Dropped  Median diff.  Effect (rb)  p      p (Holm)  95% CI
+--------------------------------------------------------  -  -------  ------------  -----------  -----  --------  ---------
+Centralized (Director) / Decentralized                    8  0        -1.5          -0.14        0.773  1.000     [-18; 10]
+Centralized (Director) / Decentralized + global bulletin  8  0        -1.5          -0.14        0.773  1.000     [-18; 10]
+Decentralized / Decentralized + global bulletin           8  0        0             0            1.000  1.000     [0; 0]
+
+Recovery time (censored analysis)
+Recovery time is analysed by survival methods, never by the paired Wilcoxon: a censored observation is a lower bound, not a measurement.
+
+Condition                        Recovered  Censored  Unmeasurable  Median time (Kaplan–Meier)
+-------------------------------  ---------  --------  ------------  --------------------------
+Centralized (Director)           8/8        0.0%      0             suppressed
+Decentralized                    7/7        0.0%      1             suppressed
+Decentralized + global bulletin  7/7        0.0%      1             suppressed
+
+Recovery tests withheld for Centralized (Director) / Decentralized, Centralized (Director) / Decentralized + global bulletin: whether recovery could be measured differs between the two conditions, so comparing only the measurable runs would condition the result on it. They stay in the Holm family; measurability, below, carries the comparison.
+
+Paired binary (recovery measurable), McNemar exact
+Contrast                                                  Discordant  p      p (Holm)
+--------------------------------------------------------  ----------  -----  --------
+Centralized (Director) / Decentralized                    1           1.000  1.000
+Centralized (Director) / Decentralized + global bulletin  1           1.000  1.000
+Decentralized / Decentralized + global bulletin           0           1.000  1.000
+
+Paired binary (recovered within horizon), McNemar exact
+Contrast                                         Discordant  p      p (Holm)
+-----------------------------------------------  ----------  -----  --------
+Decentralized / Decentralized + global bulletin  0           1.000  1.000
+
+Seed-stratified log-rank (secondary)
+Contrast                                         z  p      p (Holm)
+-----------------------------------------------  -  -----  --------
+Decentralized / Decentralized + global bulletin  0  1.000  1.000
+
+Propagation to Melee weapon, the main product of Iron: recovery time (secondary)
+Pre-registered secondary analysis: how the shock reaches the main finished product of the affected resource. Censored like the primary recovery; its price and stockouts are contrasted above.
+
+Condition                        Recovered  Censored  Unmeasurable  Median time (Kaplan–Meier)
+-------------------------------  ---------  --------  ------------  --------------------------
+Centralized (Director)           4/4        0.0%      4             suppressed
+Decentralized                    4/4        0.0%      4             suppressed
+Decentralized + global bulletin  4/4        0.0%      4             suppressed
+
+Recovery tests withheld for Centralized (Director) / Decentralized, Centralized (Director) / Decentralized + global bulletin: whether recovery could be measured differs between the two conditions, so comparing only the measurable runs would condition the result on it. They stay in the Holm family; measurability, below, carries the comparison.
+
+Paired binary (recovery measurable), McNemar exact
+Contrast                                                  Discordant  p      p (Holm)
+--------------------------------------------------------  ----------  -----  --------
+Centralized (Director) / Decentralized                    2           1.000  1.000
+Centralized (Director) / Decentralized + global bulletin  2           1.000  1.000
+Decentralized / Decentralized + global bulletin           0           1.000  1.000
+
+Paired binary (recovered within horizon), McNemar exact
+Contrast                                         Discordant  p      p (Holm)
+-----------------------------------------------  ----------  -----  --------
+Decentralized / Decentralized + global bulletin  0           1.000  1.000
+
+Seed-stratified log-rank (secondary)
+Contrast                                         z  p      p (Holm)
+-----------------------------------------------  -  -----  --------
+Decentralized / Decentralized + global bulletin  0  1.000  1.000
+
+Volume by good: median units traded per run, shock phase / base phase
+
+Good                    Centralized (Director)  Decentralized  Decentralized + global bulletin
+----------------------  ----------------------  -------------  -------------------------------
+Arcane crystal          20 / 20                 21.5 / 16.5    21.5 / 16.5
+Armor                   11 / 12.5               11 / 12        11 / 12
+Bow / exploration gear  5.5 / 6                 6 / 6          6 / 6
+Health potion           50 / 49.5               51.5 / 49.5    51.5 / 49.5
+Herbs                   33.5 / 32               34.5 / 34      34.5 / 34
+Iron                    23 / 38                 23.5 / 38      23.5 / 38
+Leather                 37.5 / 37.5             37 / 39        37 / 39
+Mana potion             17 / 17.5               15.5 / 18.5    15.5 / 18.5
+Melee weapon            5 / 6                   5 / 6.5        5 / 6.5
+Staff / magic focus     5 / 5                   5.5 / 5        5.5 / 5
+Wood                    23.5 / 22               24 / 22.5      24 / 22.5
+
+Coordination and system metrics
+
+Metric                                                   Centralized (Director)  Decentralized  Decentralized + global bulletin
+-------------------------------------------------------  ----------------------  -------------  -------------------------------
+Activations per run (median)                             2,040                   1,775          1,775
+Wasted activations per run (median)                      654                     371            371
+Cycles using all K activations (median)                  100.0%                  56.8%          56.8%
+Invalid outputs (total)                                  0                       0              0
+Outputs cut off by the output cap (total)                0                       0              0
+Tokens per run, Agents (median)                          5,985,571               5,423,210      5,423,210
+Tokens per run, Bulletin (median)                        0                       0              629,680
+Tokens per run, Director (median)                        4,814,502               0              0
+Tokens per run, P2P content (median)                     0                       10,355         10,355
+Input tokens per run, Agents (median)                    5,827,198               5,276,386      5,276,386
+Input tokens per run, Bulletin (median)                  0                       0              629,680
+Input tokens per run, Director (median)                  4,720,662               0              0
+Input tokens per run, P2P content (median)               0                       10,355         10,355
+Output tokens per run, Agents (median)                   158,458                 146,126        146,126
+Output tokens per run, Director (median)                 93,840                  0              0
+LLM calls per run, Agents (median)                       2,040                   1,775          1,775
+LLM calls per run, Director (median)                     2,040                   0              0
+Share of the token budget used (median)                  n/m                     n/m            n/m
+TASKs assigned: Evaluate expedition (total across runs)  8,157                   0              0
+TASKs assigned: Evaluate production (total across runs)  8,163                   0              0
+ACK messages (total across runs)                         0                       169            169
+OFFER messages (total across runs)                       0                       164            164
+REJECT messages (total across runs)                      0                       173            173
+REQUEST messages (total across runs)                     0                       179            179
+Unanswered requests (total across runs)                  0                       0              0
+Activation latency (ticks, median of run means)          0                       0.1            0.1
+Director retries (total across runs)                     0                       0              0
+Cycles closed by the K+1 cap (total across runs)         0                       0              0
+Director error rate (median)                             0.0%                    n/m            n/m
+Runs that exhausted the budget                           0/8                     0/8            0/8
+Exhaustion tick (median)                                 n/m                     n/m            n/m
+
+[paired] paired_differences.png
+[price] price_trajectory.png
