@@ -1110,3 +1110,574 @@ def test_pilot_refuses_a_stage_directory_another_run_holds(
     err = capsys.readouterr().err
     assert f"pid {os.getpid()}" in err
     assert "Traceback" not in err
+
+
+# ---------------------------------------------------------------------------
+# One-off real runs: locked, and a broken log or trio reported cleanly
+# ---------------------------------------------------------------------------
+def _one_off_argv(command: str, out: Path) -> list[str]:
+    if command == "trio":
+        layer = out.parent / "short.yaml"
+        layer.write_text(SHORT_LAYER, encoding="utf-8")
+        return ["trio", "--layer", str(layer), "--seed", "3", "--no-replay", "--out", str(out)]
+    return _smoke_argv(out)
+
+
+@pytest.mark.parametrize("command", ["trio", "smoke"])
+def test_one_off_runs_refuse_a_directory_another_run_holds(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    command: str,
+) -> None:
+    import os
+
+    from rpg_economy import runner
+    from rpg_economy.campaign import parallel
+    from rpg_economy.campaign.lock import campaign_lock
+
+    def never(*args: object, **kwargs: object) -> None:
+        pytest.fail("a locked directory was run")
+
+    monkeypatch.setattr(parallel, "run_trio_parallel", never)
+    monkeypatch.setattr(runner, "run_trio", never)
+    monkeypatch.setattr(runner, "run_condition", never)
+    out = tmp_path / "out"
+    out.mkdir()
+    argv = _one_off_argv(command, out)
+
+    # Held for real: another open file description holds the flock.
+    with campaign_lock(out) as held:
+        assert main(argv) == 10
+        assert held.path.exists()
+    assert f"pid {os.getpid()}" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("command", ["trio", "smoke", "derisk"])
+@pytest.mark.parametrize("failure", ["log", "integrity"])
+def test_one_off_runs_report_a_broken_run_without_a_traceback(
+    tmp_path: Path,
+    mock_profile: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    command: str,
+    failure: str,
+) -> None:
+    from rpg_economy import runner
+    from rpg_economy.campaign import parallel
+    from rpg_economy.campaign.lock import LOCK_NAME
+    from rpg_economy.integrity import TrioIntegrityError
+    from rpg_economy.logging_ import LogError
+
+    def broken(*args: object, **kwargs: object) -> None:
+        if failure == "log":
+            raise LogError("refusing to append to non-empty run log")
+        raise TrioIntegrityError("B and C share an activation stream")
+
+    monkeypatch.setattr(parallel, "run_trio_parallel", broken)
+    monkeypatch.setattr(runner, "run_trio", broken)
+    out = tmp_path / "out"
+    if command == "derisk":
+        _mock_arms(monkeypatch)
+        argv = [
+            "derisk",
+            "--out",
+            str(out),
+            "--profile-logs",
+            str(mock_profile),
+            "--model-pricing",
+            DERISK_PRICING,
+            "--spend-limit-set",
+        ]
+        argv = [*argv, "--confirm-cost", _confirmed_total(argv, capsys)]
+    else:
+        argv = _one_off_argv(command, out)
+
+    code = main(["--locale", "es", *argv])
+
+    err = capsys.readouterr().err
+    assert "Traceback" not in err
+    where = {"trio": out, "smoke": out / "smoke1", "derisk": out / "gpt-5-nano"}[command]
+    if failure == "log":
+        assert code == 6
+        assert t("error.run.log_unusable", locale="es", path=str(where)) in err
+    else:
+        assert code == 7
+        detail = "B and C share an activation stream"
+        assert t("error.trio.integrity", locale="es", path=str(where), detail=detail) in err
+    assert not (out / LOCK_NAME).exists(), "the lock outlived the run"
+
+
+def test_the_smoke_prints_a_worst_case_above_its_typical_price(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from rpg_economy.cli import _smoke_estimate, _smoke_worst_case
+    from rpg_economy.config import load_config
+
+    config = load_config(BASE_CONFIG)
+    typical, worst = _smoke_estimate(config), _smoke_worst_case(config)
+    assert worst > typical
+
+    assert main(["smoke", "--out", str(tmp_path / "smoke"), "--confirm-cost", str(typical)]) == 5
+    out = capsys.readouterr().out
+    assert str(typical) in out
+    assert str(worst) in out
+
+
+# ---------------------------------------------------------------------------
+# The locale: SIM_LOCALE reaches every renderer, and a bad one exits cleanly
+# ---------------------------------------------------------------------------
+def test_sim_locale_reaches_the_replay_and_the_dashboard(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import rpg_economy.cli as cli
+
+    seen: list[str] = []
+    monkeypatch.setattr(cli, "_replay", lambda *a, locale, **k: seen.append(locale) or 0)
+    monkeypatch.setattr(cli, "_dashboard", lambda *a, locale: seen.append(locale) or 0)
+    monkeypatch.setattr(cli, "_trio", lambda *a, locale, **k: seen.append(locale) or 0)
+    monkeypatch.setenv("SIM_LOCALE", "es")
+
+    assert main(["replay", str(tmp_path)]) == 0
+    assert main(["dashboard", str(tmp_path / "A.jsonl")]) == 0
+    assert main(["trio", "--out", str(tmp_path)]) == 0
+    assert main(["--locale", "en", "dashboard", str(tmp_path / "A.jsonl")]) == 0
+    assert seen == ["es", "es", "es", "en"]
+
+
+@pytest.mark.parametrize("source", ["env", "flag"])
+def test_an_unsupported_locale_exits_cleanly(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], source: str
+) -> None:
+    if source == "env":
+        monkeypatch.setenv("SIM_LOCALE", "fr")
+        argv = ["config-show"]
+    else:
+        monkeypatch.delenv("SIM_LOCALE", raising=False)
+        argv = ["--locale", "fr", "config-show"]
+
+    assert main(argv) == 2
+    err = capsys.readouterr().err
+    assert t("error.locale.unsupported", locale="en", lang="'fr'", supported="en, es") in err
+    assert "Traceback" not in err
+
+
+# ---------------------------------------------------------------------------
+# Real reruns with nothing pending, billing on failure, Ctrl-C
+# ---------------------------------------------------------------------------
+def _nothing_pending(monkeypatch: pytest.MonkeyPatch) -> None:
+    import dataclasses
+
+    from rpg_economy.campaign import runner
+
+    monkeypatch.setattr(
+        runner,
+        "pending_trios",
+        lambda config, plan, directory, *, resume: dataclasses.replace(plan, trios=[]),
+    )
+
+
+def test_a_real_pilot_rerun_with_nothing_pending_needs_no_confirmation_but_bills(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from rpg_economy.campaign import parallel
+    from rpg_economy.campaign.parallel import ParallelResult, TrioOutcome
+    from rpg_economy.campaign.pilot import CALIBRATION, stage_plan
+    from rpg_economy.campaign.runner import trio_directory
+    from rpg_economy.config import load_config
+
+    plan = stage_plan(load_config(BASE_CONFIG), CALIBRATION)
+    for trio in plan.trios:
+        for condition in trio.conditions:
+            _billed_log(trio_directory(tmp_path / "calibration", trio) / f"{condition.value}.jsonl")
+    _nothing_pending(monkeypatch)
+
+    def skipped(config, plan, directory, **kwargs):
+        result = ParallelResult(directory=Path(directory), workers=1)
+        result.outcomes = [TrioOutcome(trio=trio, status="skipped") for trio in plan.trios]
+        return result
+
+    monkeypatch.setattr(parallel, "run_campaign_parallel", skipped)
+
+    code = main(["pilot", "--stage", "calibration", "--out", str(tmp_path), "--real"])
+
+    assert code == 0, capsys.readouterr().err
+    billing = json.loads((tmp_path / "calibration" / "billing.json").read_text(encoding="utf-8"))
+    assert billing["complete"] is True
+
+
+@pytest.mark.parametrize("locale", ["en", "es"])
+def test_a_real_campaign_rerun_writes_its_billing_report_even_when_a_trio_failed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    locale: str,
+) -> None:
+    from rpg_economy.campaign import parallel
+    from rpg_economy.campaign.parallel import ParallelResult, TrioOutcome
+
+    _nothing_pending(monkeypatch)
+
+    from rpg_economy.campaign.plan import PlannedTrio
+    from rpg_economy.domain import ExperimentRegime, Scenario
+
+    # Nothing is pending, so the runner is handed no trio; one fails all the same.
+    trio = PlannedTrio(Scenario.RESOURCE_SCARCITY, ExperimentRegime.EQUAL_ACTIVITY, 1)
+
+    def one_failed(config, plan, directory, **kwargs):
+        result = ParallelResult(directory=Path(directory), workers=1)
+        result.outcomes = [TrioOutcome(trio=trio, status="failed", detail="boom")]
+        return result
+
+    monkeypatch.setattr(parallel, "run_campaign_parallel", one_failed)
+    out = tmp_path / "runs"
+    argv = ["--locale", locale, "campaign-run", "--config", str(_short_config_file(tmp_path))]
+
+    # No --confirm-cost and no --spend-limit-set: nothing is pending, so
+    # nothing is priced or confirmed.
+    code = main([*argv, "--phase", "pilot", "--out", str(out), "--real"])
+
+    assert code == 7
+    assert (out / "billing.json").exists(), "returned before writing the billing report"
+    assert "Traceback" not in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("locale", ["en", "es"])
+def test_a_stopped_campaign_says_so_and_exits_130(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    locale: str,
+) -> None:
+    from rpg_economy.campaign import parallel
+    from rpg_economy.campaign.lock import LOCK_NAME
+    from rpg_economy.campaign.parallel import ParallelResult
+
+    seen: list[object] = []
+
+    def stopped(config, plan, directory, *, interrupt, **kwargs):
+        seen.append(interrupt)
+        interrupt.request_stop()  # a Ctrl-C while trios ran
+        return ParallelResult(directory=Path(directory), workers=1)
+
+    monkeypatch.setattr(parallel, "run_campaign_parallel", stopped)
+    out = tmp_path / "runs"
+    argv = ["--locale", locale, "campaign-run", "--config", str(_short_config_file(tmp_path))]
+
+    assert main([*argv, "--phase", "pilot", "--out", str(out)]) == 130
+    assert seen, "the campaign got no interrupt to watch"
+    err = capsys.readouterr().err
+    assert t("cli.interrupt.stopped", locale=locale, path=str(out)) in err
+    assert not (out / LOCK_NAME).exists()
+
+
+def test_a_trio_stopped_by_ctrl_c_is_kept_and_not_replayed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from rpg_economy.campaign import parallel
+    from rpg_economy.runner import INTERRUPT_ABORT, RunInterrupted
+
+    def aborted(config, directory, *, seed=None, interrupt=None):
+        assert interrupt is not None
+        raise RunInterrupted(reason=INTERRUPT_ABORT)
+
+    monkeypatch.setattr(parallel, "run_trio_parallel", aborted)
+    out = tmp_path / "trio"
+
+    assert main(["trio", "--out", str(out)]) == 130
+    assert not (out / "replay").exists()
+    assert t("cli.interrupt.stopped", locale="en", path=str(out)) in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# derive-budget outputs
+# ---------------------------------------------------------------------------
+def test_derive_budget_marks_a_mock_budget_in_its_json_and_keeps_an_existing_layer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from types import SimpleNamespace
+
+    from rpg_economy.analysis import budget_derivation
+
+    derivation = SimpleNamespace(budget=123_456, runs=[1], to_payload=lambda: {"budget": 123_456})
+    monkeypatch.setattr(budget_derivation, "find_logs", lambda path: [])
+    monkeypatch.setattr(
+        budget_derivation, "derive_budget", lambda logs, *, config, allow_mock: derivation
+    )
+
+    out = tmp_path / "budget.json"
+    argv = ["derive-budget", "--pilot-logs", str(tmp_path), "--out", str(out)]
+    assert main([*argv, "--allow-mock"]) == 0
+    assert json.loads(out.read_text(encoding="utf-8"))["derived_from_mock"] is True
+    assert main(argv) == 0
+    assert json.loads(out.read_text(encoding="utf-8"))["derived_from_mock"] is False
+
+    layer = tmp_path / "budget.yaml"
+    layer.write_text("budget: {experiment_2_total_tokens: 1}\n", encoding="utf-8")
+    layered = ["derive-budget", "--pilot-logs", str(tmp_path), "--layer-out", str(layer)]
+    capsys.readouterr()
+    assert main(["--locale", "es", *layered]) == 4
+    err = capsys.readouterr().err
+    assert t("error.budget.layer_exists", locale="es", path=str(layer)) in err
+    assert layer.read_text(encoding="utf-8") == "budget: {experiment_2_total_tokens: 1}\n"
+
+    assert main([*layered, "--force"]) == 0
+    assert "123456" in layer.read_text(encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# derisk arguments
+# ---------------------------------------------------------------------------
+def test_derisk_runs_a_model_listed_twice_once(
+    tmp_path: Path, mock_profile: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _mock_arms(monkeypatch)
+    out = tmp_path / "derisk"
+    argv = [
+        "derisk",
+        "--out",
+        str(out),
+        "--models",
+        "gpt-5-nano, gpt-5-nano,gpt-5-nano",
+        "--profile-logs",
+        str(mock_profile),
+        "--spend-limit-set",
+        "--confirm-cost",
+        _derisk_total(mock_profile, models=("gpt-5-nano",)),
+    ]
+
+    assert main(argv) == 0
+    assert [p.name for p in out.iterdir() if p.is_dir()] == ["gpt-5-nano"]
+    comparison = json.loads((out / "derisk.json").read_text(encoding="utf-8"))
+    assert json.dumps(comparison).count('"gpt-5-nano"') == 3  # one per condition
+
+
+@pytest.mark.parametrize("horizon", ["0", "-5", "2"])
+def test_derisk_refuses_an_invalid_horizon_without_a_traceback(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], horizon: str
+) -> None:
+    code = main(["--locale", "es", "derisk", "--out", str(tmp_path / "d"), "--horizon", horizon])
+
+    assert code == 2
+    err = capsys.readouterr().err
+    assert "Traceback" not in err
+    prefix = t("error.derisk.invalid_horizon", locale="es", horizon=horizon, detail="")
+    assert err.startswith(prefix.strip()[:20])
+    assert not (tmp_path / "d").exists()
+
+
+def test_derisk_checks_its_pending_arms_again_under_the_lock(
+    tmp_path: Path, mock_profile: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An arm another run finished between pricing and locking is not run again."""
+    from rpg_economy.campaign import parallel, runner
+    from rpg_economy.campaign.lock import LOCK_NAME
+
+    _mock_arms(monkeypatch)
+    out = tmp_path / "derisk"
+    checks: list[bool] = []
+
+    def finished_meanwhile(directory, config=None):
+        locked = (out / LOCK_NAME).exists()
+        checks.append(locked)
+        return locked  # pending when priced, finished once the lock is held
+
+    monkeypatch.setattr(runner, "trio_is_complete", finished_meanwhile)
+    monkeypatch.setattr(
+        parallel, "run_trio_parallel", lambda *a, **k: pytest.fail("a finished arm ran again")
+    )
+    argv = [
+        "derisk",
+        "--out",
+        str(out),
+        "--models",
+        "gpt-5-nano",
+        "--profile-logs",
+        str(mock_profile),
+        "--spend-limit-set",
+        "--confirm-cost",
+        _derisk_total(mock_profile, models=("gpt-5-nano",)),
+    ]
+
+    main(argv)
+    assert checks == [False, True]
+
+
+# ---------------------------------------------------------------------------
+# Billing after an exception
+# ---------------------------------------------------------------------------
+def test_a_campaign_that_raises_still_writes_its_billing_report(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from rpg_economy.campaign import parallel
+
+    _nothing_pending(monkeypatch)
+
+    def crash(config, plan, directory, **kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(parallel, "run_campaign_parallel", crash)
+    out = tmp_path / "runs"
+    argv = ["campaign-run", "--config", str(_short_config_file(tmp_path)), "--phase", "pilot"]
+
+    with pytest.raises(RuntimeError, match="boom"):
+        main([*argv, "--out", str(out), "--real"])
+    assert (out / "billing.json").exists(), "the exception skipped the billing report"
+
+
+def test_a_pilot_that_raises_still_writes_its_billing_report(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from rpg_economy.campaign import parallel
+
+    _nothing_pending(monkeypatch)
+
+    def crash(config, plan, directory, **kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(parallel, "run_campaign_parallel", crash)
+
+    with pytest.raises(RuntimeError, match="boom"):
+        main(["pilot", "--stage", "calibration", "--out", str(tmp_path), "--real"])
+    assert (tmp_path / "calibration" / "billing.json").exists()
+
+
+def test_the_billing_lines_include_unfinished_spend_and_the_total(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from rpg_economy.cli import _print_billing
+
+    _print_billing(
+        {
+            "runs": 3,
+            "all_real": True,
+            "all_fully_billed": True,
+            "billed_total": 1000,
+            "unfinished_spend": {"logs": 2, "llm_calls": 5, "billed_total": 300},
+            "set_aside": {"logs": 1, "llm_calls": 1, "billed_total": 20},
+            "billed_total_all": 1320,
+        }
+    )
+    out = capsys.readouterr().out
+    assert t("cli.pilot.billing_unfinished", locale="en", logs=2, total="300") in out
+    assert t("cli.pilot.billing_total", locale="en", total="1,320") in out
+
+
+# ---------------------------------------------------------------------------
+# Only the confirmed trios run
+# ---------------------------------------------------------------------------
+def _shifting_pending(monkeypatch: pytest.MonkeyPatch, before: slice, under_lock: slice) -> None:
+    """``pending_trios`` answering ``before`` until the lock is taken, then ``under_lock``."""
+    import dataclasses
+
+    from rpg_economy.campaign import runner
+    from rpg_economy.campaign.lock import campaign_lock
+
+    locked = {"now": False}
+
+    def pending(config, plan, directory, *, resume):
+        window = under_lock if locked["now"] else before
+        return dataclasses.replace(plan, trios=plan.trios[window])
+
+    real_lock = campaign_lock
+
+    from contextlib import contextmanager
+
+    @contextmanager
+    def watched(directory, **kwargs):
+        with real_lock(directory, **kwargs) as lock:
+            locked["now"] = True
+            try:
+                yield lock
+            finally:
+                locked["now"] = False
+
+    from rpg_economy.campaign import lock as lock_module
+
+    monkeypatch.setattr(runner, "pending_trios", pending)
+    monkeypatch.setattr(lock_module, "campaign_lock", watched)
+
+
+@pytest.mark.parametrize("locale", ["en", "es"])
+def test_a_campaign_refuses_trios_it_did_not_confirm(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    locale: str,
+) -> None:
+    from rpg_economy.campaign import parallel
+
+    ran: list[object] = []
+    monkeypatch.setattr(parallel, "run_campaign_parallel", lambda *a, **k: ran.append(a))
+    _shifting_pending(monkeypatch, before=slice(0, 1), under_lock=slice(0, 2))
+    out = tmp_path / "runs"
+    argv = ["--locale", locale, "campaign-run", "--config", str(_short_config_file(tmp_path))]
+
+    assert main([*argv, "--phase", "pilot", "--out", str(out)]) == 5
+    assert not ran, "unconfirmed trios were run"
+    err = capsys.readouterr().err
+    expected = t(
+        "error.campaign.pending_changed",
+        locale=locale,
+        path=str(out),
+        confirmed=1,
+        pending=2,
+        unconfirmed=1,
+    )
+    assert expected in err
+    assert not (out / "billing.json").exists(), "nothing ran, so nothing was billed"
+
+
+def test_a_campaign_runs_only_the_confirmed_trios(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from rpg_economy.campaign import parallel
+    from rpg_economy.campaign.parallel import ParallelResult
+    from rpg_economy.campaign.plan import build_plan
+    from rpg_economy.config import load_config
+
+    seen: list[list[object]] = []
+
+    def run(config, plan, directory, **kwargs):
+        seen.append(list(plan.trios))
+        return ParallelResult(directory=Path(directory), workers=1)
+
+    monkeypatch.setattr(parallel, "run_campaign_parallel", run)
+    # One of the two confirmed trios finished meanwhile: still a subset.
+    _shifting_pending(monkeypatch, before=slice(0, 2), under_lock=slice(1, 2))
+    config_file = _short_config_file(tmp_path)
+    argv = ["campaign-run", "--config", str(config_file), "--phase", "pilot"]
+
+    assert main([*argv, "--out", str(tmp_path / "runs")]) == 0, capsys.readouterr().err
+    full = build_plan(load_config(config_file), phase="pilot")
+    assert seen == [full.trios[:2]], "the runner was handed more than was confirmed"
+
+
+def test_a_pilot_refuses_trios_it_did_not_confirm(
+    tmp_path: Path,
+    mock_profile: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from rpg_economy.campaign import parallel
+
+    ran: list[object] = []
+    monkeypatch.setattr(parallel, "run_campaign_parallel", lambda *a, **k: ran.append(a))
+    _shifting_pending(monkeypatch, before=slice(0, 1), under_lock=slice(0, 3))
+    argv = _pilot_argv(tmp_path, mock_profile)
+    total = _confirmed_total(argv, capsys)
+
+    assert main([*argv, "--confirm-cost", total]) == 5
+    assert not ran
+    err = capsys.readouterr().err
+    assert (
+        t(
+            "error.campaign.pending_changed",
+            locale="en",
+            path=str(tmp_path / "calibration"),
+            confirmed=1,
+            pending=3,
+            unconfirmed=2,
+        )
+        in err
+    )
