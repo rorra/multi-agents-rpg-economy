@@ -1681,3 +1681,217 @@ def test_a_pilot_refuses_trios_it_did_not_confirm(
         )
         in err
     )
+
+
+# ---------------------------------------------------------------------------
+# Localized analysis errors, and the report's own --allow-mock help
+# ---------------------------------------------------------------------------
+def test_a_report_error_is_printed_from_its_catalog_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from rpg_economy.analysis import pipeline
+    from rpg_economy.analysis.errors import AnalysisError
+
+    def refuse(*args, **kwargs):
+        raise AnalysisError("English only", key="report.written", path="X")
+
+    monkeypatch.setattr(pipeline, "analyse", refuse)
+    assert main(["--locale", "es", "report", str(tmp_path)]) == 2
+    err = capsys.readouterr().err
+    detail = t("report.written", locale="es", path="X")
+    assert t("error.report.invalid", locale="es", detail=detail) in err
+    assert "English only" not in err
+
+
+def test_a_keyless_report_error_keeps_its_text(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from rpg_economy.analysis import pipeline
+
+    def refuse(*args, **kwargs):
+        raise ValueError("plain text")
+
+    monkeypatch.setattr(pipeline, "analyse", refuse)
+    assert main(["report", str(tmp_path)]) == 2
+    assert t("error.report.invalid", locale="en", detail="plain text") in capsys.readouterr().err
+
+
+def test_a_budget_derivation_error_is_printed_from_its_catalog_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from rpg_economy.analysis import budget_derivation
+    from rpg_economy.analysis.budget_derivation import BudgetDerivationError
+
+    def refuse(logs, *, config, allow_mock):
+        raise BudgetDerivationError("English only", key="report.written", path="X")
+
+    monkeypatch.setattr(budget_derivation, "find_logs", lambda path: [])
+    monkeypatch.setattr(budget_derivation, "derive_budget", refuse)
+    argv = ["--locale", "es", "derive-budget", "--pilot-logs", str(tmp_path)]
+    assert main(argv) == 4
+    err = capsys.readouterr().err
+    detail = t("report.written", locale="es", path="X")
+    assert t("error.budget.underivable", locale="es", detail=detail) in err
+    assert "English only" not in err
+
+
+def test_report_and_derive_budget_explain_allow_mock_separately(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import re
+
+    def help_of(command: str) -> str:
+        with pytest.raises(SystemExit):
+            main([command, "--help"])
+        # argparse wraps help text; compare with whitespace collapsed.
+        return re.sub(r"\s+", " ", capsys.readouterr().out)
+
+    report_help = help_of("report")
+    budget_help = help_of("derive-budget")
+    assert t("cli.help.report_allow_mock", locale="en") != t("cli.help.allow_mock", locale="en")
+    assert t("cli.help.report_allow_mock", locale="en") in report_help
+    assert t("cli.help.allow_mock", locale="en") in budget_help
+
+
+# ---------------------------------------------------------------------------
+# argparse's own words, translated
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("argv", [["--help"], ["pilot", "--help"], ["report", "--help"]])
+def test_spanish_help_has_no_english_argparse_chrome(
+    argv: list[str], capsys: pytest.CaptureFixture[str]
+) -> None:
+    with pytest.raises(SystemExit) as info:
+        main(["--locale", "es", *argv])
+    assert info.value.code == 0
+    out = capsys.readouterr().out
+    for english in ("usage:", "positional arguments", "options:", "show this help message"):
+        assert english not in out
+    assert out.startswith(t("cli.argparse.usage", locale="es"))
+    assert t("cli.argparse.options", locale="es") + ":" in out
+    assert t("cli.argparse.help", locale="es") in out.replace("\n", " ").replace("  ", " ")
+
+
+def test_spanish_usage_errors_use_the_translated_prefix(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with pytest.raises(SystemExit):
+        main(["--locale", "es", "campaign-run"])
+    err = capsys.readouterr().err
+    assert err.startswith(t("cli.argparse.usage", locale="es"))
+    assert "usage:" not in err
+
+
+def test_english_help_keeps_its_argparse_chrome(capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit):
+        main(["--locale", "en", "--help"])
+    out = capsys.readouterr().out
+    assert out.startswith("usage: ")
+    assert "positional arguments:" in out and "options:" in out
+    assert "show this help message and exit" in out
+
+
+@pytest.mark.parametrize("flag", [False, True])
+def test_shock_efficacy_from_logs_passes_allow_mock_through(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, flag: bool
+) -> None:
+    from rpg_economy.analysis import shock_efficacy
+
+    seen: list[bool] = []
+
+    def from_logs(logs, config, *, allow_mock=False):
+        seen.append(allow_mock)
+        return {}, []
+
+    monkeypatch.setattr(shock_efficacy, "from_logs", from_logs)
+    argv = ["economy-check", "--shock-efficacy", "--pilot-logs", str(tmp_path)]
+    assert main([*argv, "--allow-mock"] if flag else argv) == 2  # no groups
+    assert seen == [flag]
+
+
+def test_analysis_error_params_are_translated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Scenario and experiment values become labels; a list becomes a comma list."""
+    from rpg_economy.analysis import pipeline
+    from rpg_economy.analysis.errors import AnalysisError
+    from rpg_economy.cli import _localized
+
+    error = AnalysisError(
+        "English only",
+        key="cli.report.skipped_cell",
+        scenario="resource_scarcity",
+        experiment="experiment_1",
+        conditions=["A", "B"],
+    )
+    rendered = _localized(error)
+    assert rendered == t(
+        "cli.report.skipped_cell",
+        scenario=t("scenario.resource_scarcity"),
+        experiment=t("experiment.experiment_1"),
+        conditions="A, B",
+    )
+
+    def refuse(*args, **kwargs):
+        raise error
+
+    monkeypatch.setattr(pipeline, "analyse", refuse)
+    assert main(["report", str(tmp_path)]) == 2
+    assert rendered in capsys.readouterr().err
+
+
+def test_the_report_names_its_exclusions_on_stderr(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from types import SimpleNamespace
+
+    from rpg_economy.analysis import pipeline
+
+    analysis = SimpleNamespace(
+        skipped_seeds=[],
+        incomplete_trios={},
+        skipped_cells={},
+        results={},
+        skipped_logs=[{"reason": "phase_pilot"}, {"reason": "phase_pilot"}],
+        rejected_trios={
+            ("resource_scarcity", "experiment_1"): [{"seed": 7, "reason": "integrity_marker"}]
+        },
+        refused_cells={("demand_surge", "experiment_1"): ["code_digest"]},
+    )
+    monkeypatch.setattr(pipeline, "analyse", lambda *a, **k: analysis)
+
+    assert main(["--locale", "es", "report", str(tmp_path)]) == 0
+    err = capsys.readouterr().err
+    reason = t("report.skip_reason.phase_pilot", locale="es")
+    assert t("report.note.skipped_logs", locale="es", count="2", reasons=f"{reason}: 2") in err
+    assert t("report.reject_reason.integrity_marker", locale="es") in err
+    assert "code_digest" in err
+    assert t("scenario.demand_surge", locale="es") in err
+
+
+def test_a_pilot_can_be_narrowed_to_one_seed_and_scenario(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A first check runs as part of the stage: one trio, the stage's folder."""
+    code = main(
+        [
+            "pilot",
+            "--stage",
+            "calibration",
+            "--seed",
+            "1001",
+            "--scenario",
+            "resource_scarcity",
+            "--out",
+            str(tmp_path),
+        ]
+    )
+    assert code == 0
+    assert "1 trios, 3 runs" in capsys.readouterr().out
+
+
+def test_a_pilot_seed_outside_the_stage_is_refused(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    code = main(["pilot", "--stage", "calibration", "--seed", "9999", "--out", str(tmp_path)])
+    assert code == 4
+    assert "9999" in capsys.readouterr().err
