@@ -1,0 +1,292 @@
+Resultados experimentales: arquitecturas de orquestación en una economía RPG simulada
+Escenario: Escasez de recurso — Experimento 1 — actividad económica igualada — 8 semillas
+
+ATENCIÓN: estas corridas usaron el cliente simulado sin conexión, no un modelo de lenguaje. Los números prueban el flujo de análisis y no son resultados.
+
+SOLO EXPLORACIÓN: este análisis incluye semillas piloto. Las semillas piloto son para calibración y nunca se usan para inferencia (diseño §11.4); las pruebas de abajo describen el piloto, no el experimento.
+
+Parámetros de métricas aplicados: W = 20, X = 0,1, M = 10, T = 20, D = 10.
+
+Métricas primarias (Hierro)
+Métrica                                            Centralizada (Director)  Descentralizada  Descentralizada + boletín global  n
+-------------------------------------------------  -----------------------  ---------------  --------------------------------  -
+Volatilidad (fase de perturbación)                 0,207                    0,265            0,265                             8
+Volatilidad (fase de perturbación, nivel de fase)  0,341                    0,436            0,436                             8
+Ticks de desabastecimiento (fase de perturbación)  50,5                     52               52                                8
+
+Métricas secundarias
+Métrica                                                                                           Centralizada (Director)  Descentralizada  Descentralizada + boletín global  n
+------------------------------------------------------------------------------------------------  -----------------------  ---------------  --------------------------------  -
+Valor transado (fase de perturbación)                                                             2.963                    3.072            3.072                             8
+Producción útil (fracción)                                                                        0,751                    0,745            0,745                             8
+Gini                                                                                              0,161                    0,14             0,14                              8
+Eficiencia de coordinación                                                                        0,679                    0,791            0,791                             8
+Concentración de activaciones (HHI)                                                               0,083                    0,083            0,083                             8
+Pedidos sin respuesta                                                                             0                        0                0                                 8
+Tokens (total)                                                                                    10.799.624               5.433.956        6.062.829                         8
+Llamadas al LLM                                                                                   4.080                    1.775            1.775                             8
+Ticks de desabastecimiento sin inventario en el mundo (fase de perturbación)                      3                        2                2                                 8
+Volatilidad, todos los bienes (perturbación / base, mediana entre bienes)                         0,809                    0,766            0,766                             8
+Unidades transadas por tick, todos los bienes (perturbación / base, mediana entre bienes)         1,089                    1,061            1,061                             8
+Proporción de ticks sin oferta, todos los bienes (perturbación menos base, mediana entre bienes)  -0,108                   -0,1             -0,1                              8
+Producto de propagación: precio medio (fase de perturbación)                                      33,4                     33,717           33,717                            8
+Producto de propagación: ticks de desabastecimiento (fase de perturbación)                        41                       43               43                                8
+
+Las medianas se calculan sobre las n semillas con valor utilizable en todas las condiciones; la mensurabilidad por condición se informa más abajo.
+
+Resultado acompañante: mensurabilidad
+Un mercado demasiado delgado para formar precio es un efecto de la arquitectura, no una laguna en los datos sobre ella. Se informa como resultado propio y se contrasta sobre el emparejamiento, igual que la recuperación dentro del horizonte.
+
+Resultado                                                                           Centralizada (Director)  Descentralizada  Descentralizada + boletín global
+----------------------------------------------------------------------------------  -----------------------  ---------------  --------------------------------
+Volatilidad (fase de perturbación): medible                                         8/8                      8/8              8/8
+Volatilidad (fase de perturbación, nivel de fase): medible                          8/8                      8/8              8/8
+Producto de propagación: precio medio (fase de perturbación): medible               8/8                      8/8              8/8
+Volatilidad, todos los bienes (perturbación / base, mediana entre bienes): medible  8/8                      8/8              8/8
+
+Binario emparejado (medible), McNemar exacto
+Métrica                                                                    Contraste                                                   Discordantes  p      p (Holm)
+-------------------------------------------------------------------------  ----------------------------------------------------------  ------------  -----  --------
+Volatilidad (fase de perturbación)                                         Centralizada (Director) / Descentralizada                   0             1,000  1,000
+Volatilidad (fase de perturbación)                                         Centralizada (Director) / Descentralizada + boletín global  0             1,000  1,000
+Volatilidad (fase de perturbación)                                         Descentralizada / Descentralizada + boletín global          0             1,000  1,000
+Volatilidad (fase de perturbación, nivel de fase)                          Centralizada (Director) / Descentralizada                   0             1,000  1,000
+Volatilidad (fase de perturbación, nivel de fase)                          Centralizada (Director) / Descentralizada + boletín global  0             1,000  1,000
+Volatilidad (fase de perturbación, nivel de fase)                          Descentralizada / Descentralizada + boletín global          0             1,000  1,000
+Producto de propagación: precio medio (fase de perturbación)               Centralizada (Director) / Descentralizada                   0             1,000  1,000
+Producto de propagación: precio medio (fase de perturbación)               Centralizada (Director) / Descentralizada + boletín global  0             1,000  1,000
+Producto de propagación: precio medio (fase de perturbación)               Descentralizada / Descentralizada + boletín global          0             1,000  1,000
+Volatilidad, todos los bienes (perturbación / base, mediana entre bienes)  Centralizada (Director) / Descentralizada                   0             1,000  1,000
+Volatilidad, todos los bienes (perturbación / base, mediana entre bienes)  Centralizada (Director) / Descentralizada + boletín global  0             1,000  1,000
+Volatilidad, todos los bienes (perturbación / base, mediana entre bienes)  Descentralizada / Descentralizada + boletín global          0             1,000  1,000
+
+Contraste principal: A vs. B. A–C y B–C son secundarios.
+Corrección de Holm aplicada por métrica dentro de este escenario.
+
+Contrastes: Volatilidad (fase de perturbación)
+Contraste                                                   n  Descartados  Dif. mediana  Efecto (rb)  p      p (Holm)  IC 95%
+----------------------------------------------------------  -  -----------  ------------  -----------  -----  --------  ---------------
+Centralizada (Director) / Descentralizada                   8  0            -0,044        -0,39        0,383  1,000     [-0,158; 0,053]
+Centralizada (Director) / Descentralizada + boletín global  8  0            -0,044        -0,39        0,383  1,000     [-0,158; 0,053]
+Descentralizada / Descentralizada + boletín global          8  0            0             0            1,000  1,000     [0; 0]
+
+Contrastes: Volatilidad (fase de perturbación, nivel de fase)
+Contraste                                                   n  Descartados  Dif. mediana  Efecto (rb)  p      p (Holm)  IC 95%
+----------------------------------------------------------  -  -----------  ------------  -----------  -----  --------  --------------
+Centralizada (Director) / Descentralizada                   8  0            -0,137        -0,33        0,461  1,000     [-0,264; 0,16]
+Centralizada (Director) / Descentralizada + boletín global  8  0            -0,137        -0,33        0,461  1,000     [-0,264; 0,16]
+Descentralizada / Descentralizada + boletín global          8  0            0             0            1,000  1,000     [0; 0]
+
+Contrastes: Ticks de desabastecimiento (fase de perturbación)
+Contraste                                                   n  Descartados  Dif. mediana  Efecto (rb)  p      p (Holm)  IC 95%
+----------------------------------------------------------  -  -----------  ------------  -----------  -----  --------  ---------
+Centralizada (Director) / Descentralizada                   8  0            0,5           -0,22        0,609  1,000     [-31; 23]
+Centralizada (Director) / Descentralizada + boletín global  8  0            0,5           -0,22        0,609  1,000     [-31; 23]
+Descentralizada / Descentralizada + boletín global          8  0            0             0            1,000  1,000     [0; 0]
+
+Contrastes: Valor transado (fase de perturbación)
+Contraste                                                   n  Descartados  Dif. mediana  Efecto (rb)  p      p (Holm)  IC 95%
+----------------------------------------------------------  -  -----------  ------------  -----------  -----  --------  -----------------
+Centralizada (Director) / Descentralizada                   8  0            -51,025       -0,22        0,641  1,000     [-319,68; 151,36]
+Centralizada (Director) / Descentralizada + boletín global  8  0            -51,025       -0,22        0,641  1,000     [-319,68; 151,36]
+Descentralizada / Descentralizada + boletín global          8  0            0             0            1,000  1,000     [0; 0]
+
+Contrastes: Producción útil (fracción)
+Contraste                                                   n  Descartados  Dif. mediana  Efecto (rb)  p      p (Holm)  IC 95%
+----------------------------------------------------------  -  -----------  ------------  -----------  -----  --------  ---------------
+Centralizada (Director) / Descentralizada                   8  0            0,005         0            1,000  1,000     [-0,072; 0,054]
+Centralizada (Director) / Descentralizada + boletín global  8  0            0,005         0            1,000  1,000     [-0,072; 0,054]
+Descentralizada / Descentralizada + boletín global          8  0            0             0            1,000  1,000     [0; 0]
+
+Contrastes: Gini
+Contraste                                                   n  Descartados  Dif. mediana  Efecto (rb)  p      p (Holm)  IC 95%
+----------------------------------------------------------  -  -----------  ------------  -----------  -----  --------  ---------------
+Centralizada (Director) / Descentralizada                   8  0            0,03          0,5          0,250  0,750     [-0,025; 0,075]
+Centralizada (Director) / Descentralizada + boletín global  8  0            0,03          0,5          0,250  0,750     [-0,025; 0,075]
+Descentralizada / Descentralizada + boletín global          8  0            0             0            1,000  1,000     [0; 0]
+
+Contrastes: Eficiencia de coordinación
+Contraste                                                   n  Descartados  Dif. mediana  Efecto (rb)  p      p (Holm)  IC 95%
+----------------------------------------------------------  -  -----------  ------------  -----------  -----  --------  ----------------
+Centralizada (Director) / Descentralizada                   8  0            -0,119        -1           0,008  0,023     [-0,162; -0,092]
+Centralizada (Director) / Descentralizada + boletín global  8  0            -0,119        -1           0,008  0,023     [-0,162; -0,092]
+Descentralizada / Descentralizada + boletín global          8  0            0             0            1,000  1,000     [0; 0]
+
+Contrastes: Concentración de activaciones (HHI)
+Contraste                                                   n  Descartados  Dif. mediana  Efecto (rb)  p      p (Holm)  IC 95%
+----------------------------------------------------------  -  -----------  ------------  -----------  -----  --------  ------
+Centralizada (Director) / Descentralizada                   8  0            0             -1           0,008  0,023     [0; 0]
+Centralizada (Director) / Descentralizada + boletín global  8  0            0             -1           0,008  0,023     [0; 0]
+Descentralizada / Descentralizada + boletín global          8  0            0             0            1,000  1,000     [0; 0]
+
+Contrastes: Pedidos sin respuesta
+Contraste                                           n  Descartados  Dif. mediana  Efecto (rb)  p      p (Holm)  IC 95%
+--------------------------------------------------  -  -----------  ------------  -----------  -----  --------  ------
+Descentralizada / Descentralizada + boletín global  8  0            0             0            1,000  1,000     [0; 0]
+
+Contrastes: Tokens (total)
+Contraste                                                   n  Descartados  Dif. mediana  Efecto (rb)  p      p (Holm)  IC 95%
+----------------------------------------------------------  -  -----------  ------------  -----------  -----  --------  ----------------------
+Centralizada (Director) / Descentralizada                   8  0            5.361.982     1            0,008  0,023     [5.307.191; 5.401.278]
+Centralizada (Director) / Descentralizada + boletín global  8  0            4.728.430     1            0,008  0,023     [4.672.680; 4.774.550]
+Descentralizada / Descentralizada + boletín global          8  0            -629.680      -1           0,008  0,023     [-634.511; -623.472]
+
+Contrastes: Llamadas al LLM
+Contraste                                                   n  Descartados  Dif. mediana  Efecto (rb)  p      p (Holm)  IC 95%
+----------------------------------------------------------  -  -----------  ------------  -----------  -----  --------  --------------
+Centralizada (Director) / Descentralizada                   8  0            2.305         1            0,008  0,023     [2.290; 2.321]
+Centralizada (Director) / Descentralizada + boletín global  8  0            2.305         1            0,008  0,023     [2.290; 2.321]
+Descentralizada / Descentralizada + boletín global          8  0            0             0            1,000  1,000     [0; 0]
+
+Contrastes: Ticks de desabastecimiento sin inventario en el mundo (fase de perturbación)
+Contraste                                                   n  Descartados  Dif. mediana  Efecto (rb)  p      p (Holm)  IC 95%
+----------------------------------------------------------  -  -----------  ------------  -----------  -----  --------  -------
+Centralizada (Director) / Descentralizada                   8  0            1             0,43         0,406  1,000     [-1; 3]
+Centralizada (Director) / Descentralizada + boletín global  8  0            1             0,43         0,406  1,000     [-1; 3]
+Descentralizada / Descentralizada + boletín global          8  0            0             0            1,000  1,000     [0; 0]
+
+Contrastes: Volatilidad, todos los bienes (perturbación / base, mediana entre bienes)
+Contraste                                                   n  Descartados  Dif. mediana  Efecto (rb)  p      p (Holm)  IC 95%
+----------------------------------------------------------  -  -----------  ------------  -----------  -----  --------  ---------------
+Centralizada (Director) / Descentralizada                   8  0            -0,003        0,17         0,742  1,000     [-0,127; 0,516]
+Centralizada (Director) / Descentralizada + boletín global  8  0            -0,003        0,17         0,742  1,000     [-0,127; 0,516]
+Descentralizada / Descentralizada + boletín global          8  0            0             0            1,000  1,000     [0; 0]
+
+Contrastes: Unidades transadas por tick, todos los bienes (perturbación / base, mediana entre bienes)
+Contraste                                                   n  Descartados  Dif. mediana  Efecto (rb)  p      p (Holm)  IC 95%
+----------------------------------------------------------  -  -----------  ------------  -----------  -----  --------  ---------------
+Centralizada (Director) / Descentralizada                   8  0            -0,044        -0,29        0,578  1,000     [-0,144; 0,127]
+Centralizada (Director) / Descentralizada + boletín global  8  0            -0,044        -0,29        0,578  1,000     [-0,144; 0,127]
+Descentralizada / Descentralizada + boletín global          8  0            0             0            1,000  1,000     [0; 0]
+
+Contrastes: Proporción de ticks sin oferta, todos los bienes (perturbación menos base, mediana entre bienes)
+Contraste                                                   n  Descartados  Dif. mediana  Efecto (rb)  p      p (Holm)  IC 95%
+----------------------------------------------------------  -  -----------  ------------  -----------  -----  --------  ---------------
+Centralizada (Director) / Descentralizada                   8  0            -0,001        -0,11        0,844  1,000     [-0,096; 0,094]
+Centralizada (Director) / Descentralizada + boletín global  8  0            -0,001        -0,11        0,844  1,000     [-0,096; 0,094]
+Descentralizada / Descentralizada + boletín global          8  0            0             0            1,000  1,000     [0; 0]
+
+Contrastes: Producto de propagación: precio medio (fase de perturbación)
+Contraste                                                   n  Descartados  Dif. mediana  Efecto (rb)  p      p (Holm)  IC 95%
+----------------------------------------------------------  -  -----------  ------------  -----------  -----  --------  -------------
+Centralizada (Director) / Descentralizada                   8  0            -0,178        -0,17        0,742  1,000     [-0,36; 1,37]
+Centralizada (Director) / Descentralizada + boletín global  8  0            -0,178        -0,17        0,742  1,000     [-0,36; 1,37]
+Descentralizada / Descentralizada + boletín global          8  0            0             0            1,000  1,000     [0; 0]
+
+Contrastes: Producto de propagación: ticks de desabastecimiento (fase de perturbación)
+Contraste                                                   n  Descartados  Dif. mediana  Efecto (rb)  p      p (Holm)  IC 95%
+----------------------------------------------------------  -  -----------  ------------  -----------  -----  --------  ---------
+Centralizada (Director) / Descentralizada                   8  0            -1,5          -0,14        0,773  1,000     [-18; 10]
+Centralizada (Director) / Descentralizada + boletín global  8  0            -1,5          -0,14        0,773  1,000     [-18; 10]
+Descentralizada / Descentralizada + boletín global          8  0            0             0            1,000  1,000     [0; 0]
+
+Tiempo de recuperación (análisis censurado)
+El tiempo de recuperación se analiza con métodos de supervivencia, nunca con el Wilcoxon emparejado: una observación censurada es una cota inferior, no una medición.
+
+Condición                         Recuperadas  Censuradas  No medible  Tiempo mediano (Kaplan–Meier)
+--------------------------------  -----------  ----------  ----------  -----------------------------
+Centralizada (Director)           8/8          0,0%        0           suprimido
+Descentralizada                   7/7          0,0%        1           suprimido
+Descentralizada + boletín global  7/7          0,0%        1           suprimido
+
+Pruebas de recuperación retenidas para Centralizada (Director) / Descentralizada, Centralizada (Director) / Descentralizada + boletín global: la mensurabilidad de la recuperación difiere entre las dos condiciones, así que comparar solo las corridas medibles condicionaría el resultado a ella. Siguen contando en la familia de Holm; la mensurabilidad, abajo, sostiene la comparación.
+
+Binario emparejado (recuperación medible), McNemar exacto
+Contraste                                                   Discordantes  p      p (Holm)
+----------------------------------------------------------  ------------  -----  --------
+Centralizada (Director) / Descentralizada                   1             1,000  1,000
+Centralizada (Director) / Descentralizada + boletín global  1             1,000  1,000
+Descentralizada / Descentralizada + boletín global          0             1,000  1,000
+
+Binario emparejado (recuperación dentro del horizonte), McNemar exacto
+Contraste                                           Discordantes  p      p (Holm)
+--------------------------------------------------  ------------  -----  --------
+Descentralizada / Descentralizada + boletín global  0             1,000  1,000
+
+Log-rank estratificado por semilla (secundario)
+Contraste                                           z  p      p (Holm)
+--------------------------------------------------  -  -----  --------
+Descentralizada / Descentralizada + boletín global  0  1,000  1,000
+
+Propagación a Arma cuerpo a cuerpo, producto principal de Hierro: tiempo de recuperación (secundario)
+Análisis secundario preregistrado: cómo llega la perturbación al producto terminado principal del recurso afectado. Se censura igual que la recuperación primaria; su precio y su desabastecimiento se contrastan más arriba.
+
+Condición                         Recuperadas  Censuradas  No medible  Tiempo mediano (Kaplan–Meier)
+--------------------------------  -----------  ----------  ----------  -----------------------------
+Centralizada (Director)           4/4          0,0%        4           suprimido
+Descentralizada                   4/4          0,0%        4           suprimido
+Descentralizada + boletín global  4/4          0,0%        4           suprimido
+
+Pruebas de recuperación retenidas para Centralizada (Director) / Descentralizada, Centralizada (Director) / Descentralizada + boletín global: la mensurabilidad de la recuperación difiere entre las dos condiciones, así que comparar solo las corridas medibles condicionaría el resultado a ella. Siguen contando en la familia de Holm; la mensurabilidad, abajo, sostiene la comparación.
+
+Binario emparejado (recuperación medible), McNemar exacto
+Contraste                                                   Discordantes  p      p (Holm)
+----------------------------------------------------------  ------------  -----  --------
+Centralizada (Director) / Descentralizada                   2             1,000  1,000
+Centralizada (Director) / Descentralizada + boletín global  2             1,000  1,000
+Descentralizada / Descentralizada + boletín global          0             1,000  1,000
+
+Binario emparejado (recuperación dentro del horizonte), McNemar exacto
+Contraste                                           Discordantes  p      p (Holm)
+--------------------------------------------------  ------------  -----  --------
+Descentralizada / Descentralizada + boletín global  0             1,000  1,000
+
+Log-rank estratificado por semilla (secundario)
+Contraste                                           z  p      p (Holm)
+--------------------------------------------------  -  -----  --------
+Descentralizada / Descentralizada + boletín global  0  1,000  1,000
+
+Volumen por bien: mediana de unidades transadas por corrida, fase de perturbación / fase base
+
+Bien                          Centralizada (Director)  Descentralizada  Descentralizada + boletín global
+----------------------------  -----------------------  ---------------  --------------------------------
+Arco / equipo de exploración  5,5 / 6                  6 / 6            6 / 6
+Arma cuerpo a cuerpo          5 / 6                    5 / 6,5          5 / 6,5
+Armadura                      11 / 12,5                11 / 12          11 / 12
+Bastón / foco mágico          5 / 5                    5,5 / 5          5,5 / 5
+Cristal arcano                20 / 20                  21,5 / 16,5      21,5 / 16,5
+Cuero                         37,5 / 37,5              37 / 39          37 / 39
+Hierbas                       33,5 / 32                34,5 / 34        34,5 / 34
+Hierro                        23 / 38                  23,5 / 38        23,5 / 38
+Madera                        23,5 / 22                24 / 22,5        24 / 22,5
+Poción de maná                17 / 17,5                15,5 / 18,5      15,5 / 18,5
+Poción de salud               50 / 49,5                51,5 / 49,5      51,5 / 49,5
+
+Métricas de coordinación y sistema
+
+Métrica                                                     Centralizada (Director)  Descentralizada  Descentralizada + boletín global
+----------------------------------------------------------  -----------------------  ---------------  --------------------------------
+Activaciones por corrida (mediana)                          2.040                    1.775            1.775
+Activaciones desperdiciadas por corrida (mediana)           654                      371              371
+Ciclos que usan las K activaciones (mediana)                100,0%                   56,8%            56,8%
+Salidas inválidas (total)                                   0                        0                0
+Salidas cortadas por el tope de salida (total)              0                        0                0
+Tokens por corrida, Agentes (mediana)                       5.985.571                5.423.210        5.423.210
+Tokens por corrida, Boletín (mediana)                       0                        0                629.680
+Tokens por corrida, Director (mediana)                      4.814.502                0                0
+Tokens por corrida, Contenido P2P (mediana)                 0                        10.355           10.355
+Tokens de entrada por corrida, Agentes (mediana)            5.827.198                5.276.386        5.276.386
+Tokens de entrada por corrida, Boletín (mediana)            0                        0                629.680
+Tokens de entrada por corrida, Director (mediana)           4.720.662                0                0
+Tokens de entrada por corrida, Contenido P2P (mediana)      0                        10.355           10.355
+Tokens de salida por corrida, Agentes (mediana)             158.458                  146.126          146.126
+Tokens de salida por corrida, Director (mediana)            93.840                   0                0
+Llamadas al LLM por corrida, Agentes (mediana)              2.040                    1.775            1.775
+Llamadas al LLM por corrida, Director (mediana)             2.040                    0                0
+Fracción del presupuesto de tokens usada (mediana)          n/m                      n/m              n/m
+TASKs asignadas: Evaluar expedición (total entre corridas)  8.157                    0                0
+TASKs asignadas: Evaluar producción (total entre corridas)  8.163                    0                0
+Mensajes ACUSE (total entre corridas)                       0                        169              169
+Mensajes OFERTA (total entre corridas)                      0                        164              164
+Mensajes RECHAZO (total entre corridas)                     0                        173              173
+Mensajes SOLICITUD (total entre corridas)                   0                        179              179
+Pedidos sin respuesta (total entre corridas)                0                        0                0
+Latencia de activación (ticks, mediana de las medias)       0                        0,1              0,1
+Reintentos del Director (total entre corridas)              0                        0                0
+Ciclos cerrados por el tope K+1 (total entre corridas)      0                        0                0
+Tasa de error del Director (mediana)                        0,0%                     n/m              n/m
+Corridas que agotaron el presupuesto                        0/8                      0/8              0/8
+Tick de agotamiento (mediana)                               n/m                      n/m              n/m
+
+[paired] paired_differences.png
+[price] price_trajectory.png
